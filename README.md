@@ -5,7 +5,7 @@ First-party signed kind:transport plugin cdylib: the ws transport, packaged as a
 
 | kind | alias | crate | busbar | license |
 |---|---|---|---|---|
-| `transport` | `ws` | `busbar-transport-ws-plugin` | 1.6.0 (pinned in `.busbar-ref`) | Apache-2.0 |
+| `transport` | `ws` | `busbar-transport-ws-plugin` | 1.6.0 (pinned in `.busbar-ref`) | MIT |
 
 [![ci](https://github.com/GetBusbar/busbar-transport-ws/actions/workflows/ci.yml/badge.svg?branch=dev)](https://github.com/GetBusbar/busbar-transport-ws/actions/workflows/ci.yml)
 <!-- fleet:header:end -->
