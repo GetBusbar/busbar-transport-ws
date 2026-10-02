@@ -1,5 +1,5 @@
 # RENDERED by `busbar-release plugin sync` from GetBusbar/busbar-release template/ and busbar's
-# `.github/fleet/deps.toml` at 86904c800d802a69f15371c4d6e407483b495215; a hand edit is overwritten by the next sync. CI runs
+# `.github/fleet/deps.toml` at dd9637da0c849b811238e108cbafabcb4c7c22a2; a hand edit is overwritten by the next sync. CI runs
 # `cargo deny check` on it (busbar's plugin-ci.yml at the pin). The license allowlist is busbar's own;
 # the one reviewed git source is busbar itself, at the pin.
 [graph]
@@ -38,6 +38,13 @@ allow-wildcard-paths = true
 # BUSBAR USES (OWNER 2026-10-02): every version of a shared crate outside the line busbar's own
 # Cargo.lock resolves it to, at the pin.
 deny = [
+    # ONE Ed25519 = ed25519-dalek 2 (ARCHITECT ruling 2026-10-02; mirrors busbar deny.toml): no older
+    # dalek and no other Ed25519 implementation may enter a plugin's closure.
+    { crate = "ed25519-dalek@1", reason = "ONE Ed25519: ed25519-dalek 2" },
+    { crate = "ed25519-dalek@0", reason = "ONE Ed25519: ed25519-dalek 2" },
+    { crate = "ed25519-compact", reason = "ONE Ed25519: ed25519-dalek 2" },
+    { crate = "ed25519-zebra", reason = "ONE Ed25519: ed25519-dalek 2" },
+    { crate = "ed25519-consensus", reason = "ONE Ed25519: ed25519-dalek 2" },
     { crate = "openssl", reason = "TLS is rustls (core-only); no OpenSSL anywhere in the fleet" },
     { crate = "openssl-sys", reason = "TLS is rustls (core-only); no OpenSSL anywhere in the fleet" },
     { crate = "native-tls", reason = "TLS is rustls (core-only); no platform TLS anywhere in the fleet" },
