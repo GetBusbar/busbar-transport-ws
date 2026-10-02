@@ -7,16 +7,14 @@
 //! door, with the host carrying each one's wire bytes to the other exactly as a connector carries
 //! them over a socket. Every answer is judged by the kind's own `check_framer`. The exchange: the
 //! upgrade, one message each way, and an orderly close that ends the far side's stream and its
-//! connection. It runs through the linked door and through the cdylib `cargo test` built from
-//! `examples/ws_door.rs`, through a roomy sink and through one so small every op is re-called.
+//! connection. It runs through the linked door (the dropped-in cdylib is compared in the plugin crate's conformance),
+//! through a roomy sink and through one so small every op is re-called.
 
 use std::ffi::c_void;
 use std::mem::{size_of, zeroed};
 
 use busbar_contract::abi::mechanism::call::{AbiStr, InHead, Op, OutHead, Outcome};
-use busbar_contract::abi::mechanism::door::Door;
 use busbar_contract::abi::mechanism::lifecycle::{slot as life, OpenIn, OpenOut};
-use busbar_contract::abi::mechanism::DOOR_SYMBOL;
 use busbar_contract::abi::transport::check::check_framer;
 use busbar_contract::abi::transport::{
     slot, BeginIn, EmitIn, FinishIn, FramePiece, FramerOut, FramerSink, IngestIn, Ops,
@@ -269,52 +267,13 @@ fn linked() -> &'static Ops {
     unsafe { &*(*d).ops.cast::<Ops>() }
 }
 
-fn dropped() -> (&'static Ops, &'static libloading::Library) {
-    let exe = std::env::current_exe().expect("the test binary has a path");
-    let profile = exe
-        .parent()
-        .and_then(|d| d.parent())
-        .expect("target/<profile>");
-    let file = format!(
-        "{}ws_door{}",
-        std::env::consts::DLL_PREFIX,
-        std::env::consts::DLL_SUFFIX
-    );
-    let path = [
-        profile.join("examples").join(&file),
-        profile.join("examples").join("deps").join(&file),
-    ]
-    .into_iter()
-    .find(|p| p.exists())
-    .unwrap_or_else(|| panic!("the dropped-in image ({file}) is not built"));
-    // SAFETY: our own example, built by this `cargo test`.
-    let lib: &'static libloading::Library = Box::leak(Box::new(
-        unsafe { libloading::Library::new(path) }.expect("load"),
-    ));
-    // SAFETY: the one exported symbol, a `DoorFn`.
-    let door: libloading::Symbol<'_, extern "C" fn() -> *const Door> =
-        unsafe { lib.get(DOOR_SYMBOL) }.expect("the door symbol");
-    let d = door();
-    // SAFETY: the dropped-in door's `'static` table.
-    (unsafe { &*(*d).ops.cast::<Ops>() }, lib)
-}
-
 #[test]
-fn the_linked_and_the_dropped_in_door_frame_the_same() {
-    let (d, _lib) = dropped();
+fn a_recalled_exchange_answers_nothing_twice_and_drops_nothing() {
     let l = linked();
-    assert!(!std::ptr::eq(l, d), "two images");
-    for (image, ops) in [("linked", l), ("dropped", d)] {
-        let roomy = exchange(&format!("{image} roomy"), ops, (64 * 1024, 64 * 1024, 64));
-        let tight = exchange(&format!("{image} tight"), ops, (7, 3, 1));
-        println!(
-            "PROOF {image}: the re-called exchange answered the same {} frame bytes: {}",
-            roomy.len(),
-            roomy == tight
-        );
-        assert_eq!(
-            roomy, tight,
-            "a re-call answers nothing twice and drops nothing"
-        );
-    }
+    let roomy = exchange("linked roomy", l, (64 * 1024, 64 * 1024, 64));
+    let tight = exchange("linked tight", l, (7, 3, 1));
+    assert_eq!(
+        roomy, tight,
+        "a re-call answers nothing twice and drops nothing"
+    );
 }

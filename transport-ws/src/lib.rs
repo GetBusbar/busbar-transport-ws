@@ -39,8 +39,6 @@ mod meta;
 mod transport;
 
 pub use conn::StaticConfig;
-#[cfg(feature = "dropped-in")]
-pub use framer::exports;
 pub use framer::WsFramer;
 pub use transport::{WsTransport, MESSAGE_MAX_BYTES_KEY};
 
@@ -52,6 +50,8 @@ pub mod linked {
     use busbar_contract::transport::{Transport, TransportMeta, TransportSettings};
 
     use crate::WsTransport;
+
+    pub use crate::door::door;
 
     /// The row's registry key.
     pub const KEY: &str = <crate::WsFramer as TransportMeta>::KEY;

@@ -3,8 +3,8 @@
 
 //! THE FRAMER (TRANSPORT-STACK; #3, #30): `ws` as the contract's [`Framer`] — the one implementation
 //! both doors drive. A build that links this crate holds a [`WsFramer`] as its `Arc<dyn Framer>`
-//! (`crate::linked::framer`); the `cdylib` built with the `dropped-in` feature lowers the same type
-//! to the HOT decl through the contract's `export_framer!` ([`exports`]).
+//! (`crate::linked::framer`); the sibling `busbar-transport-ws-plugin` cdylib exports the door
+//! over this same type (`crate::door`).
 //!
 //! SANS-IO. The framer holds no socket, no waker and no clock: core hands it the bytes the carrier
 //! read and sends the bytes it answers. Each framing state is the WebSocket protocol machine over an
@@ -476,13 +476,4 @@ impl Framer for WsFramer {
         self.ingest(state, leftover, false, out)?;
         Ok(state)
     }
-}
-
-/// The dropped-in door, compiled only into the dropped-in build (feature `dropped-in`): [`WsFramer`]
-/// lowered to the HOT decl and registered as this image's ONE door through the contract's
-/// `export_framer!`. The one module this crate's `#![deny(unsafe_code)]` allows.
-#[cfg(feature = "dropped-in")]
-#[allow(unsafe_code)]
-pub mod exports {
-    busbar_contract::export_framer!(super::WsFramer, super::WsFramer::built);
 }
