@@ -133,6 +133,7 @@ dependencies = [
  "busbar-contract",
  "busbar-plugin-loader",
  "busbar-transport-ws",
+ "busbar-transport-ws-plugin",
 ]
 
 [[package]]
