@@ -91,3 +91,7 @@ pub mod linked {
 #[cfg(test)]
 #[path = "tests/battery.rs"]
 mod battery;
+
+#[cfg(test)]
+#[path = "tests/framer_tests.rs"]
+mod framer_tests;
