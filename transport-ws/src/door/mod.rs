@@ -215,6 +215,27 @@ fn text(s: &AbiStr) -> &[u8] {
     unsafe { std::slice::from_raw_parts(s.ptr, s.len) }
 }
 
+/// A dial's opening head fields (`BeginIn::fields`), owned.
+fn opening_fields(
+    p: *const busbar_contract::abi::mechanism::call::Field,
+    n: usize,
+) -> Vec<(String, Vec<u8>)> {
+    if p.is_null() || n == 0 {
+        return Vec::new();
+    }
+    // SAFETY: host-borrowed for the call: `n` fields at `p`.
+    let fields = unsafe { std::slice::from_raw_parts(p, n) };
+    fields
+        .iter()
+        .map(|f| {
+            (
+                String::from_utf8_lossy(text(&f.name)).into_owned(),
+                text(&f.value).to_vec(),
+            )
+        })
+        .collect()
+}
+
 fn raw<'a>(p: *const u8, n: usize) -> &'a [u8] {
     if p.is_null() || n == 0 {
         return &[];
@@ -493,9 +514,10 @@ impl Slot for Begin {
             return Outcome::Failed;
         };
         let target = String::from_utf8_lossy(text(&i.target)).into_owned();
-        let facts = facts_of(i.facts);
+        let _ = facts_of(i.facts);
+        let fields = opening_fields(i.fields, i.fields_len);
         opening(p, &i.sink, o, |f, c| {
-            f.open(side, &target, &facts, c)
+            f.open_with(side, &target, &fields, c)
                 .map_err(|e| format!("{e:?}"))
         })
     }
@@ -551,7 +573,7 @@ impl Slot for Emit {
             if bytes.is_empty() && !eof {
                 return Ok(());
             }
-            f.emit(i.framing, StreamId(i.stream), bytes, eof, c)
+            f.emit_flagged(i.framing, bytes, eof, i.flags, c)
                 .map_err(|e| format!("{e:?}"))
         })
     }
