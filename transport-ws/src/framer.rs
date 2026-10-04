@@ -17,7 +17,10 @@
 //!   upgrade request for its target and completes when the response arrives.
 //! * A WebSocket MESSAGE is the frame unit: each binary or text message ingested is one frame, a text
 //!   one stated as text ([`Framed::text`]), and each frame emitted (its last piece marked) goes out
-//!   as one message, TEXT when the emit says so, else BINARY.
+//!   as one message, TEXT when the emit says so (`EMIT_TEXT`), else BINARY.
+//! * A DIALLED connection's upgrade request carries the dial's opening head fields (the bound
+//!   auth's `Authorization` among them), the WebSocket handshake's own fields excepted; a message
+//!   written before the handshake completes is held and goes out, in order, the moment it does.
 //! * A ping is answered with its pong on the next bytes out; a close is answered and ends the frames.
 //! * A close carries the RFC 6455 code its reason names ([`close_code_for`]).
 //! * The message ceiling is the deployment's body cap, for a whole message and for a single frame.
@@ -37,9 +40,11 @@ use busbar_contract::transport::{
     BytesOut, ConnFacts, Framed, Framer, FramerOut, Located, Side, TransportSettings,
 };
 use busbar_contract::{AbiVersion, Kind, Plugin};
+use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::handshake::client::ClientHandshake;
 use tokio_tungstenite::tungstenite::handshake::server::{NoCallback, ServerHandshake};
 use tokio_tungstenite::tungstenite::handshake::{HandshakeError, MidHandshake};
+use tokio_tungstenite::tungstenite::http::{HeaderName, HeaderValue};
 use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
 use tokio_tungstenite::tungstenite::protocol::{CloseFrame, WebSocketConfig};
 use tokio_tungstenite::tungstenite::{Error as WsError, Message, WebSocket};
@@ -89,8 +94,14 @@ impl Write for Pipe {
 enum Phase {
     /// An accepted connection waiting for (the rest of) the upgrade request.
     Accepting(MidHandshake<ServerHandshake<Pipe, NoCallback>>),
-    /// A dialled connection waiting for (the rest of) the upgrade response.
-    Dialling(MidHandshake<ClientHandshake<Pipe>>),
+    /// A dialled connection waiting for (the rest of) the upgrade response, with the messages
+    /// written before it completes (each with its text flag) and the pieces of one not yet marked
+    /// complete.
+    Dialling {
+        mid: MidHandshake<ClientHandshake<Pipe>>,
+        held: Vec<(Vec<u8>, bool)>,
+        message: Vec<u8>,
+    },
     /// The session: the protocol machine, and the pieces of a message not yet marked complete.
     Open {
         ws: Box<WebSocket<Pipe>>,
@@ -102,7 +113,7 @@ impl Phase {
     fn pipe(&mut self) -> &mut Pipe {
         match self {
             Phase::Accepting(mid) => mid.get_mut().get_mut(),
-            Phase::Dialling(mid) => mid.get_mut().get_mut(),
+            Phase::Dialling { mid, .. } => mid.get_mut().get_mut(),
             Phase::Open { ws, .. } => ws.get_mut(),
         }
     }
@@ -148,6 +159,33 @@ fn read_error(e: &WsError) -> TransportError {
     }
 }
 
+/// The upgrade request's own fields, which the handshake writes itself: an opening field of one of
+/// these names is not copied onto it.
+const HANDSHAKE_FIELDS: &[&str] = &[
+    "host",
+    "connection",
+    "upgrade",
+    "content-length",
+    "transfer-encoding",
+];
+
+/// Whether an opening field may ride the upgrade request.
+fn rides_upgrade(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    !HANDSHAKE_FIELDS.contains(&lower.as_str()) && !lower.starts_with("sec-websocket-")
+}
+
+/// One message as the protocol machine sends it.
+fn message_of(bytes: Vec<u8>, text: bool) -> Result<Message, WsError> {
+    if text {
+        String::from_utf8(bytes)
+            .map(|t| Message::Text(t.into()))
+            .map_err(|_| WsError::Utf8(String::new()))
+    } else {
+        Ok(Message::Binary(bytes.into()))
+    }
+}
+
 /// Hand whatever the machine wrote to core.
 fn drain(phase: &mut Phase, out: &mut dyn FramerOut) {
     let pipe = phase.pipe();
@@ -183,6 +221,58 @@ impl WsFramer {
         })
     }
 
+    /// [`Framer::open`], a dialled connection's upgrade request carrying `fields` (the dial's
+    /// opening head fields, `BeginIn::fields`).
+    ///
+    /// # Errors
+    ///
+    /// The target is not a WebSocket URL, or a field is not a valid header.
+    pub fn open_with(
+        &self,
+        side: Side,
+        target: &str,
+        fields: &[(String, Vec<u8>)],
+        out: &mut dyn FramerOut,
+    ) -> Result<u64, TransportError> {
+        let phase = self.start(side, target, fields, out)?;
+        Ok(self.hold(phase))
+    }
+
+    /// [`Framer::emit`]: with `text` (the emit's `EMIT_TEXT`) the message goes out as a text
+    /// message, under the TEXT opcode, which promises UTF-8 (RFC 6455 §8.1): bytes that are not fail
+    /// the write rather than go out under a promise they break. On a dialled connection whose
+    /// handshake has not completed, the message is held and goes out the moment it does.
+    ///
+    /// # Errors
+    ///
+    /// The state is gone, a text message is not UTF-8, or the machine refused it.
+    pub fn emit_text(
+        &self,
+        state: u64,
+        bytes: &[u8],
+        end_of_frame: bool,
+        text: bool,
+        out: &mut dyn FramerOut,
+    ) -> Result<(), TransportError> {
+        {
+            let mut states = self.states.lock().expect("framing states poisoned");
+            if let Some(Phase::Dialling { held, message, .. }) = states.get_mut(&state) {
+                message.extend_from_slice(bytes);
+                if end_of_frame {
+                    held.push((std::mem::take(message), text));
+                }
+                return Ok(());
+            }
+        }
+        self.with_open(state, out, |ws, message| {
+            message.extend_from_slice(bytes);
+            if !end_of_frame {
+                return Ok(());
+            }
+            ws.send(message_of(std::mem::take(message), text)?)
+        })
+    }
+
     fn hold(&self, phase: Phase) -> u64 {
         let id = self.next.fetch_add(1, Ordering::Relaxed);
         self.states
@@ -197,6 +287,7 @@ impl WsFramer {
         &self,
         side: Side,
         target: &str,
+        fields: &[(String, Vec<u8>)],
         out: &mut dyn FramerOut,
     ) -> Result<Phase, TransportError> {
         let mut phase = match side {
@@ -218,12 +309,29 @@ impl WsFramer {
                     "{}://{host}:{port}{path}",
                     if secure { "wss" } else { "ws" }
                 );
+                let mut request = url
+                    .as_str()
+                    .into_client_request()
+                    .map_err(|_| TransportError::AddressRefused)?;
+                for (name, value) in fields.iter().filter(|(n, _)| rides_upgrade(n)) {
+                    let (Ok(name), Ok(value)) = (
+                        HeaderName::from_bytes(name.as_bytes()),
+                        HeaderValue::from_bytes(value),
+                    ) else {
+                        return Err(TransportError::HandshakeFailed);
+                    };
+                    request.headers_mut().append(name, value);
+                }
                 match tokio_tungstenite::tungstenite::client::client_with_config(
-                    url.as_str(),
+                    request,
                     Pipe::default(),
                     self.config(),
                 ) {
-                    Err(HandshakeError::Interrupted(mid)) => Phase::Dialling(mid),
+                    Err(HandshakeError::Interrupted(mid)) => Phase::Dialling {
+                        mid,
+                        held: Vec::new(),
+                        message: Vec::new(),
+                    },
                     Ok(_) | Err(HandshakeError::Failure(_)) => {
                         return Err(TransportError::HandshakeFailed)
                     }
@@ -246,12 +354,21 @@ impl WsFramer {
                 Err(HandshakeError::Interrupted(mid)) => return Ok((Phase::Accepting(mid), false)),
                 Err(HandshakeError::Failure(_)) => return Err(TransportError::HandshakeFailed),
             },
-            Phase::Dialling(mid) => match mid.handshake() {
-                Ok((ws, _response)) => Phase::Open {
-                    ws: Box::new(ws),
-                    message: Vec::new(),
-                },
-                Err(HandshakeError::Interrupted(mid)) => return Ok((Phase::Dialling(mid), false)),
+            Phase::Dialling { mid, held, message } => match mid.handshake() {
+                Ok((mut ws, _response)) => {
+                    // What was written before the handshake completed goes out now, in order.
+                    for (bytes, text) in held {
+                        let m = message_of(bytes, text).map_err(|e| read_error(&e))?;
+                        ws.write(m).map_err(|e| read_error(&e))?;
+                    }
+                    Phase::Open {
+                        ws: Box::new(ws),
+                        message,
+                    }
+                }
+                Err(HandshakeError::Interrupted(mid)) => {
+                    return Ok((Phase::Dialling { mid, held, message }, false))
+                }
                 Err(HandshakeError::Failure(_)) => return Err(TransportError::HandshakeFailed),
             },
             open => open,
@@ -352,8 +469,7 @@ impl Framer for WsFramer {
         _facts: &ConnFacts,
         out: &mut dyn FramerOut,
     ) -> Result<u64, TransportError> {
-        let phase = self.start(side, target, out)?;
-        Ok(self.hold(phase))
+        self.open_with(side, target, &[], out)
     }
 
     fn ingest(
@@ -391,20 +507,7 @@ impl Framer for WsFramer {
         text: bool,
         out: &mut dyn FramerOut,
     ) -> Result<(), TransportError> {
-        self.with_open(state, out, |ws, message| {
-            message.extend_from_slice(bytes);
-            if !end_of_frame {
-                return Ok(());
-            }
-            let message = std::mem::take(message);
-            // A text frame goes out under the TEXT opcode, which promises UTF-8: bytes that are not
-            // fail the write (RFC 6455 §8.1) rather than go out under a promise they break.
-            ws.send(if text {
-                Message::Text(String::from_utf8(message)?.into())
-            } else {
-                Message::Binary(message.into())
-            })
-        })
+        self.emit_text(state, bytes, end_of_frame, text, out)
     }
 
     /// A WebSocket message is its payload: the envelope belonged to the upgrade request, which is
