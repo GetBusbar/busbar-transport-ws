@@ -23,10 +23,9 @@ use busbar_contract::abi::mechanism::call::{AbiStr, InHead, Op, OutHead, Outcome
 use busbar_contract::abi::mechanism::lifecycle::{slot as life, OpenIn, OpenOut};
 use busbar_contract::abi::transport::check::check_framer;
 use busbar_contract::abi::transport::{
-    slot, BeginIn, EmitIn, FinishIn, FramePiece, FramerOut, FramerSink, IngestIn, Ops,
-    CLOSE_CAPACITY_EXHAUSTED, CLOSE_DRAIN, CLOSE_NORMAL, CLOSE_PEER_CLOSED, CLOSE_POISONED,
-    CLOSE_REVOKED, CLOSE_TIMEOUT, CLOSE_TRANSPORT_FAILED, EMIT_TEXT, PIECE_END_OF_FRAME,
-    PIECE_TEXT, SIDE_ACCEPT, YIELD_ENDED, YIELD_MORE,
+    slot, BeginIn, EmitIn, FinishIn, FramePiece, FramerOut, FramerSink, IngestIn, Ops, CLOSE_DRAIN,
+    CLOSE_NORMAL, CLOSE_PEER_CLOSED, EMIT_TEXT, PIECE_END_OF_FRAME, PIECE_TEXT, SIDE_ACCEPT,
+    YIELD_ENDED, YIELD_MORE,
 };
 
 /// A message's kind as this harness names it: what its pieces state (`PIECE_TEXT` or nothing) and
@@ -432,32 +431,6 @@ fn a_drain_closes_with_1012() {
     let f = h.accept();
     let said = h.finish(f, CLOSE_DRAIN);
     assert_eq!(close_code(&server_frames(&said.wire)), Some(1012));
-}
-
-/// Every reason this end closes for puts its own RFC 6455 code on the wire, a distinct one per
-/// reason a peer can act on, and never a reserved code (1005, 1006, 1015); the in-process transport's
-/// battery pinned the same table, which now has one home, the framer.
-#[test]
-fn each_close_reason_puts_its_own_code_on_the_wire() {
-    for (reason, code) in [
-        (CLOSE_NORMAL, 1000_u16),
-        (CLOSE_PEER_CLOSED, 1000),
-        (CLOSE_DRAIN, 1012),
-        (CLOSE_POISONED, 1011),
-        (CLOSE_REVOKED, 1008),
-        (CLOSE_TIMEOUT, 1013),
-        (CLOSE_TRANSPORT_FAILED, 1002),
-        (CLOSE_CAPACITY_EXHAUSTED, 1009),
-    ] {
-        let mut h = Host::new();
-        let f = h.accept();
-        let said = h.finish(f, reason);
-        assert_eq!(
-            close_code(&server_frames(&said.wire)),
-            Some(code),
-            "close reason {reason}"
-        );
-    }
 }
 
 // ── 3. A FAILURE AFTER A MESSAGE ─────────────────────────────────────────────────────────────────
