@@ -21,7 +21,15 @@ crate-type = ["rlib"]
 # busbar build that links this crate `[patch]`es the busbar git source to its own tree, so ONE copy
 # of the contract links.
 busbar-contract = { workspace = true }
-# The protocol machine the framer drives over its in-memory pipe (`tungstenite`, sync; no runtime).
+tokio-util = { workspace = true }
+tokio = { workspace = true, features = ["rt", "macros", "io-util", "sync", "time"] }
 tokio-tungstenite = { workspace = true }
+futures = { workspace = true }
 # The door's settings blob is JSON (`door::read_settings`).
 serde_json = { workspace = true }
+
+[dev-dependencies]
+# The TEST-ONLY seal: `busbar_contract::plugin::TestKernelSeal` is the one blessed fixture
+# implementor of the SEALED `KernelSeal` trait the battery uses. Dev-only and feature-gated.
+busbar-contract = { workspace = true, features = ["test-seal"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "time", "test-util"] }

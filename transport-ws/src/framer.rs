@@ -57,6 +57,8 @@ use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
 use tokio_tungstenite::tungstenite::protocol::{CloseFrame, WebSocketConfig};
 use tokio_tungstenite::tungstenite::{Error as WsError, Message, WebSocket};
 
+use crate::transport::split_ws_url;
+
 /// The in-memory stream one framing state's protocol machine reads and writes: what core ingested
 /// and the machine has not consumed, whether the carrier's clean end followed it, what the
 /// machine wrote and core has not been handed yet, and what arrived during the handshake.
@@ -663,26 +665,6 @@ impl WsFramer {
             _ => TransportError::Reset,
         })
     }
-}
-
-/// One `ws://`/`wss://` URL, read into `(secure, host, port, path)`. Strict over the scheme, with
-/// the authority read by the contract's one URL reader ([`busbar_contract::net::parse_url`], WHATWG
-/// rules): it ends at `/`, `?`, `#` or `\` exactly where the handshake's parser ends it, the host
-/// comes back unbracketed, and a userinfo is refused. The path always opens with `/`.
-pub(crate) fn split_ws_url(url: &str) -> Result<(bool, String, u16, String), TransportError> {
-    let secure = if url.starts_with("wss://") {
-        true
-    } else if url.starts_with("ws://") {
-        false
-    } else {
-        return Err(TransportError::AddressRefused);
-    };
-    let parts = busbar_contract::net::parse_url(url).map_err(|_| TransportError::AddressRefused)?;
-    if parts.userinfo {
-        return Err(TransportError::AddressRefused);
-    }
-    let port = parts.port.unwrap_or(if secure { 443 } else { 80 });
-    Ok((secure, parts.host, port, parts.path))
 }
 
 impl Default for WsFramer {

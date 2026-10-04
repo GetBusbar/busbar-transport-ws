@@ -11,18 +11,33 @@
 use busbar_contract::grammar::SelectorForm;
 use busbar_contract::transport::registry::facts as tfacts;
 use busbar_contract::transport::wire::Unit0Trigger;
-use busbar_contract::TransportMeta;
+use busbar_contract::transport::AbiVersion;
+use busbar_contract::{Kind, Plugin, TransportMeta};
 
 use crate::claims;
+use crate::transport::WsTransport;
+
+impl Plugin for WsTransport {
+    fn key(&self) -> &'static str {
+        <crate::WsFramer as TransportMeta>::KEY
+    }
+    fn kind(&self) -> Kind {
+        Kind::Transport
+    }
+    fn abi(&self) -> AbiVersion {
+        busbar_contract::transport::registry::TRANSPORT_ABI
+    }
+}
 
 impl TransportMeta for crate::WsFramer {
     const KEY: &'static str = "ws";
     const SELECTOR_FORMS: &'static [SelectorForm] = claims::SELECTOR_FORMS;
     const EGRESS_SELECTOR_FORMS: &'static [SelectorForm] = claims::EGRESS_SELECTOR_FORMS;
     // The layers this one is actually built over: an inbound upgrade arrives on `http`, an
-    // outbound one is dialled through `tcp`. No transport encrypts: TLS is core's connection
-    // security, never a layer a transport composes over; a `wss://` target is located as one that
-    // asks the connector to secure its bytes before they leave.
+    // outbound one is dialled through `tcp` for a `ws://` target. No transport encrypts: TLS is
+    // core's connection security, never a layer a transport composes over,
+    // and this transport adds no encryption of its own, so `dial` refuses a `wss://` target rather
+    // than put a cleartext upgrade on a wire the destination said was secure.
     const COMPOSES_OVER: &'static [&'static str] = &["http", "tcp"];
     const HANDOFF: Option<busbar_contract::transport::wire::Handoff> = None;
     const FRAMING: busbar_contract::transport::wire::Framing =

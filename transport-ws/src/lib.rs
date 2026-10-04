@@ -9,36 +9,47 @@
 //! no protocol meaning — no verbs, no ids, no JSON. That belongs to whichever plane rides this
 //! transport.
 //!
-//! ## One entry: the door
+//! ## The lower layer
 //!
-//! The crate's one entry is its memory-ABI door (`door::door`), the same table compiled in (a busbar
-//! build's `transport-door` row) and dropped in (the sibling `busbar-transport-ws-plugin` cdylib),
-//! single-entry and door-only as ARCHITECT ruling (A) shaped the stdio row. There is no in-process
-//! `Transport`: the host's connector owns the socket and connection security, and frames a ws
-//! connection with this door, whether it is accepted on the data listener's upgrade or dialled
-//! through `tcp`. No transport encrypts: TLS is core's connection security, applied host-side and
-//! never composed as a layer.
+//! The architecture composes `ws` OVER `http` (itself over `tcp`), and states the top
+//! transport in a stack owns claims while lower layers only yield frames. That is literally what
+//! happens here: this crate opens no socket, binds no address and resolves no name. It is built
+//! [`WsTransport::over`] a lower transport, and every byte reaches it as a stream that layer gives
+//! up — an inbound upgrade arrives on `http`, an outbound one is dialled through `tcp`. No
+//! transport encrypts: TLS is core's connection security, applied
+//! host-side and never composed as a layer. This crate encrypts nothing either, so a `wss://`
+//! target dialled through a transport is refused rather than downgraded onto the wire.
+//!
+//! Two things follow from that, and both are the point. The composed chain an arrival reports is
+//! the one it actually stands on, because it is the layer below's chain plus this one. And the
+//! resolve-then-pin network guard sits in front of the dial, in the trust unit, once for the whole
+//! stack — not inside each transport, where a new carrier would have to remember to grow one.
 
 #![deny(unsafe_code)]
 #![deny(missing_docs)]
 
 mod claims;
+mod conn;
 mod framer;
 // THE ABI BOUNDARY: the door reads and writes the host's C buffers, so it is one of the modules
 // this crate's `#![deny(unsafe_code)]` allows; every block in it states the host buffer it relies on.
 #[allow(unsafe_code)]
 pub mod door;
 mod meta;
+mod transport;
 
+pub use conn::StaticConfig;
 pub use framer::WsFramer;
+pub use transport::{WsTransport, MESSAGE_MAX_BYTES_KEY};
 
 /// THE TRANSPORT AXIS ENTRY (#3, #30): what the composition root folds for this wire — its key, the
-/// layers it declares, and its door, which the root builds the wire from (the `transport-door`
-/// axis) and opens on the one connector (the `connector-door` axis). The root names none of them.
+/// layers it declares, and how it is built. The root names none of them.
 pub mod linked {
     use std::sync::Arc;
 
-    use busbar_contract::transport::{TransportMeta, TransportSettings};
+    use busbar_contract::transport::{Transport, TransportMeta, TransportSettings};
+
+    use crate::WsTransport;
 
     pub use crate::door::door;
 
@@ -58,7 +69,28 @@ pub mod linked {
     pub fn framer(settings: &TransportSettings) -> Arc<dyn busbar_contract::transport::Framer> {
         Arc::new(crate::WsFramer::built(settings))
     }
+
+    /// Built over `lower` — never over nothing, which yields a transport that refuses every
+    /// connection — with the deployment's body cap as its message ceiling: a message is assembled
+    /// from frames before anything above the transport sees it, so the ceiling is stated at the
+    /// handshake or not at all. With no lower layer the boot check has already refused the stack.
+    #[must_use]
+    pub fn build(
+        lower: Option<Arc<dyn Transport>>,
+        settings: &TransportSettings,
+    ) -> Arc<dyn Transport> {
+        Arc::new(match lower {
+            Some(lower) => {
+                WsTransport::over_with_max_message_bytes(lower, settings.request_body_max_bytes)
+            }
+            None => WsTransport::new(),
+        })
+    }
 }
+
+#[cfg(test)]
+#[path = "tests/battery.rs"]
+mod battery;
 
 #[cfg(test)]
 #[path = "tests/framer_tests.rs"]
