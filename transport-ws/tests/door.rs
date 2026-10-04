@@ -350,21 +350,18 @@ fn written_as_text(label: &str, ops: &'static Ops, caps: (usize, usize, usize)) 
 }
 
 #[test]
-fn a_message_written_as_text_goes_out_as_text_through_both_doors() {
-    let (d, _lib) = dropped();
-    for (image, ops) in [("linked", linked()), ("dropped", d)] {
-        written_as_text(&format!("{image} roomy"), ops, (64 * 1024, 64 * 1024, 64));
-        written_as_text(&format!("{image} tight"), ops, (7, 3, 1));
-    }
+fn a_message_written_as_text_goes_out_as_text_through_the_door() {
+    // The linked door; the dropped-in cdylib is held equal to it by the plugin crate's conformance.
+    let ops = linked();
+    written_as_text("linked roomy", ops, (64 * 1024, 64 * 1024, 64));
+    written_as_text("linked tight", ops, (7, 3, 1));
 }
 
 #[test]
-fn a_text_message_arrives_as_text_through_both_doors() {
-    let (d, _lib) = dropped();
-    for (image, ops) in [("linked", linked()), ("dropped", d)] {
-        text_and_binary(&format!("{image} roomy"), ops, (64 * 1024, 64 * 1024, 64));
-        text_and_binary(&format!("{image} tight"), ops, (7, 3, 1));
-    }
+fn a_text_message_arrives_as_text_through_the_door() {
+    let ops = linked();
+    text_and_binary("linked roomy", ops, (64 * 1024, 64 * 1024, 64));
+    text_and_binary("linked tight", ops, (7, 3, 1));
 }
 
 fn linked() -> &'static Ops {
