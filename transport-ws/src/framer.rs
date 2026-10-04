@@ -21,8 +21,15 @@
 //! * A DIALLED connection's upgrade request carries the dial's opening head fields (the bound
 //!   auth's `Authorization` among them), the WebSocket handshake's own fields excepted; a message
 //!   written before the handshake completes is held and goes out, in order, the moment it does.
-//! * A ping is answered with its pong on the next bytes out; a close is answered and ends the frames.
-//! * A close carries the RFC 6455 code its reason names ([`close_code_for`]).
+//! * A ping is answered with its pong on the next bytes out; a peer's close is answered with the
+//!   peer's own code and ends the frames.
+//! * A close this end starts carries the RFC 6455 code its reason names ([`close_code_for`]).
+//! * Bytes that break the protocol FAIL the connection (RFC 6455 §7.1.7) the way the RFC orders it:
+//!   every message completed before them is handed up first, the frames end, the layer above may
+//!   still answer what it was handed, and the close then carries the failure's code (1002 a
+//!   protocol error, 1007 a text payload that is not UTF-8, 1009 a message over the ceiling).
+//!   A text payload is checked as its bytes arrive, so a bad sequence fails the connection at
+//!   once, not when its frame completes.
 //! * The message ceiling is the deployment's body cap, for a whole message and for a single frame.
 //!
 //! The upgrade INTO this framer is [`Framer::adopt`]: another framer gave up the stream with the
@@ -41,6 +48,7 @@ use busbar_contract::transport::{
 };
 use busbar_contract::{AbiVersion, Kind, Plugin};
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+use tokio_tungstenite::tungstenite::error::ProtocolError;
 use tokio_tungstenite::tungstenite::handshake::client::ClientHandshake;
 use tokio_tungstenite::tungstenite::handshake::server::{NoCallback, ServerHandshake};
 use tokio_tungstenite::tungstenite::handshake::{HandshakeError, MidHandshake};
@@ -52,13 +60,16 @@ use tokio_tungstenite::tungstenite::{Error as WsError, Message, WebSocket};
 use crate::transport::split_ws_url;
 
 /// The in-memory stream one framing state's protocol machine reads and writes: what core ingested
-/// and the machine has not consumed, whether the carrier's clean end followed it, and what the
-/// machine wrote and core has not been handed yet.
+/// and the machine has not consumed, whether the carrier's clean end followed it, what the
+/// machine wrote and core has not been handed yet, and what arrived during the handshake.
 #[derive(Default)]
 pub(crate) struct Pipe {
     inbound: VecDeque<u8>,
     ended: bool,
     outbound: Vec<u8>,
+    /// Every byte ingested while the opening handshake runs: the protocol machine keeps what
+    /// follows the handshake's head, and the fail-fast check reads it from here.
+    seen: Vec<u8>,
 }
 
 impl Read for Pipe {
@@ -102,11 +113,170 @@ enum Phase {
         held: Vec<(Vec<u8>, bool)>,
         message: Vec<u8>,
     },
-    /// The session: the protocol machine, and the pieces of a message not yet marked complete.
+    /// The session: the protocol machine, the pieces of an outbound message not yet marked
+    /// complete, the fail-fast check of inbound text, and the failure that ended the inbound frames
+    /// (its close code), if the far side broke the protocol.
     Open {
         ws: Box<WebSocket<Pipe>>,
         message: Vec<u8>,
+        scan: Scan,
+        failed: Option<CloseCode>,
     },
+}
+
+impl Phase {
+    /// The session over `ws`, its outbound message starting as `message`.
+    fn open(ws: WebSocket<Pipe>, message: Vec<u8>) -> Self {
+        Phase::Open {
+            ws: Box::new(ws),
+            message,
+            scan: Scan::default(),
+            failed: None,
+        }
+    }
+}
+
+/// THE FAIL-FAST CHECK of inbound text (RFC 6455 §8.1): the frame headers of the inbound stream,
+/// read as the bytes arrive, and the payload of every frame of a text message unmasked and checked
+/// as UTF-8 then, rather than when the protocol machine completes the frame. It only reads: the
+/// machine still parses every byte, and anything the check cannot follow (a header the machine will
+/// refuse) stops the check, never the connection.
+#[derive(Default)]
+pub(crate) struct Scan {
+    /// The header bytes of the frame being read, until it is whole.
+    head: Vec<u8>,
+    /// Payload bytes of the current frame still to come.
+    left: u64,
+    /// The current frame's mask and how far into its payload the check is.
+    mask: Option<[u8; 4]>,
+    at: u64,
+    /// The current frame ends its message.
+    fin: bool,
+    /// The current frame's payload belongs to a text message.
+    text: bool,
+    /// A text message is open (its continuations are text).
+    in_text: bool,
+    /// The start of a code point the last bytes split (at most three bytes).
+    carry: Vec<u8>,
+    /// The check stopped: a header it cannot follow, or a failure already found.
+    stopped: bool,
+}
+
+impl Scan {
+    /// Read `bytes` off the inbound stream: `false` = a text payload is not UTF-8.
+    fn feed(&mut self, mut bytes: &[u8]) -> bool {
+        while !bytes.is_empty() && !self.stopped {
+            if self.left == 0 && !self.header(&mut bytes) {
+                return true;
+            }
+            let n = usize::try_from(self.left).map_or(bytes.len(), |l| l.min(bytes.len()));
+            let (chunk, rest) = bytes.split_at(n);
+            bytes = rest;
+            if self.text && !self.check(chunk) {
+                self.stopped = true;
+                return false;
+            }
+            self.at += n as u64;
+            self.left -= n as u64;
+            if self.left == 0 && !self.end_of_frame() {
+                self.stopped = true;
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Take header bytes off `bytes` until the header is whole: `false` = it is not yet (or the
+    /// check stopped).
+    fn header(&mut self, bytes: &mut &[u8]) -> bool {
+        loop {
+            let need = match self.head.len() {
+                0 | 1 => 2,
+                _ => {
+                    let len7 = self.head[1] & 0x7f;
+                    let ext = match len7 {
+                        126 => 2,
+                        127 => 8,
+                        _ => 0,
+                    };
+                    2 + ext + if self.head[1] & 0x80 != 0 { 4 } else { 0 }
+                }
+            };
+            if self.head.len() >= need && self.head.len() >= 2 {
+                break;
+            }
+            let Some((&b, rest)) = bytes.split_first() else {
+                return false;
+            };
+            self.head.push(b);
+            *bytes = rest;
+        }
+        let head = std::mem::take(&mut self.head);
+        let (b0, b1) = (head[0], head[1]);
+        let (len, at) = match b1 & 0x7f {
+            126 => (u64::from(u16::from_be_bytes([head[2], head[3]])), 4),
+            127 => {
+                let mut l = [0_u8; 8];
+                l.copy_from_slice(&head[2..10]);
+                (u64::from_be_bytes(l), 10)
+            }
+            l => (u64::from(l), 2),
+        };
+        self.mask = (b1 & 0x80 != 0).then(|| [head[at], head[at + 1], head[at + 2], head[at + 3]]);
+        self.at = 0;
+        self.left = len;
+        self.fin = b0 & 0x80 != 0;
+        let opcode = b0 & 0x0f;
+        self.text = match opcode {
+            // A continuation is text when it continues a text message.
+            0x0 => self.in_text,
+            0x1 => {
+                self.in_text = true;
+                self.carry.clear();
+                true
+            }
+            0x2 => {
+                self.in_text = false;
+                false
+            }
+            // A control frame interleaves; it neither opens nor closes a message.
+            0x8..=0xa => false,
+            // A reserved opcode: the machine refuses it; the check has nothing more to follow.
+            _ => {
+                self.stopped = true;
+                return false;
+            }
+        };
+        true
+    }
+
+    /// The current frame's payload is all read: a text message it ends must end on a whole code
+    /// point.
+    fn end_of_frame(&mut self) -> bool {
+        if self.text && self.fin {
+            self.in_text = false;
+            return std::mem::take(&mut self.carry).is_empty();
+        }
+        true
+    }
+
+    /// Check `chunk` (still masked) as the next text bytes: `false` = not UTF-8.
+    fn check(&mut self, chunk: &[u8]) -> bool {
+        let mut bytes = std::mem::take(&mut self.carry);
+        bytes.extend(chunk.iter().enumerate().map(|(k, b)| match self.mask {
+            Some(m) => b ^ m[((self.at + k as u64) % 4) as usize],
+            None => *b,
+        }));
+        match std::str::from_utf8(&bytes) {
+            Ok(_) => true,
+            // Cut short inside a code point: its start waits for the bytes that finish it.
+            Err(e) if e.error_len().is_none() => {
+                self.carry = bytes[e.valid_up_to()..].to_vec();
+                true
+            }
+            Err(_) => false,
+        }
+    }
 }
 
 impl Phase {
@@ -134,17 +304,45 @@ impl std::fmt::Debug for WsFramer {
     }
 }
 
-/// The RFC 6455 close code a [`CloseReason`] puts on the wire (each a code an endpoint may send).
+/// The RFC 6455 close code a [`CloseReason`] puts on the wire.
+///
+/// Every arm is a code [`CloseCode::is_allowed`] accepts for sending: the reserved codes (1005
+/// Status, 1006 Abnormal, 1015 Tls) describe a condition to a *local* API caller and never appear
+/// in a frame an endpoint sends. A distinct code per reason, so a peer can tell the causes apart.
 pub(crate) fn close_code_for(reason: CloseReason) -> CloseCode {
     match reason {
+        // "An orderly close" is exactly what 1000 means.
         CloseReason::Normal => CloseCode::Normal,
-        CloseReason::PeerClosed => CloseCode::Away,
+        // THIS endpoint closing because its counterpart is gone. 1001 ("going away") is the code
+        // for THIS endpoint itself going away, which a peer leaving is not: the close is an
+        // orderly one, 1000. A close the peer started never reaches here: the machine answers the
+        // peer's Close frame itself, echoing the peer's own code (RFC 6455 §5.5.1).
+        CloseReason::PeerClosed => CloseCode::Normal,
+        // Node draining is a deliberate, orderly shutdown: "the server is restarting" is 1012's
+        // own definition, reconnect-elsewhere guidance included.
         CloseReason::Drain => CloseCode::Restart,
+        // A panic mid-codec is this endpoint's own unexpected condition: 1011.
         CloseReason::Poisoned => CloseCode::Error,
+        // Authority withdrawn is an access-control decision: 1008, policy violation.
         CloseReason::Revoked => CloseCode::Policy,
+        // No code names "a deadline expired"; 1013 ("Try Again Later") is the closest meaning.
         CloseReason::Timeout => CloseCode::Again,
+        // The transport layer failing is, from the wire's perspective, a protocol-level error.
         CloseReason::TransportFailed => CloseCode::Protocol,
+        // A resource ceiling was exceeded: 1009 (Message Too Big) is the closest meaning left.
         CloseReason::CapacityExhausted => CloseCode::Size,
+    }
+}
+
+/// The close code a read failure on a LIVE connection fails it with (RFC 6455 §7.4.1), or `None`
+/// when the connection itself is gone and there is no one to tell.
+fn failure_code(e: &WsError) -> Option<CloseCode> {
+    match e {
+        WsError::Protocol(ProtocolError::ResetWithoutClosingHandshake) => None,
+        WsError::Protocol(_) => Some(CloseCode::Protocol),
+        WsError::Utf8(_) => Some(CloseCode::Invalid),
+        WsError::Capacity(_) => Some(CloseCode::Size),
+        _ => None,
     }
 }
 
@@ -342,15 +540,18 @@ impl WsFramer {
         Ok(phase)
     }
 
-    /// Drive `phase` over what its pipe holds: finish the handshake if it can, then hand every
-    /// message it completes up as a frame. Answers whether the connection's frames ended.
-    fn drive(phase: Phase, out: &mut dyn FramerOut) -> Result<(Phase, bool), TransportError> {
+    /// Drive `phase` over what its pipe holds (`fresh` = the bytes this call ingested, for the
+    /// fail-fast check): finish the handshake if it can, then hand every message it completes up as
+    /// a frame. Answers whether the connection's frames ended.
+    fn drive(
+        phase: Phase,
+        fresh: &[u8],
+        out: &mut dyn FramerOut,
+    ) -> Result<(Phase, bool), TransportError> {
+        let shaking = !matches!(phase, Phase::Open { .. });
         let mut phase = match phase {
             Phase::Accepting(mid) => match mid.handshake() {
-                Ok(ws) => Phase::Open {
-                    ws: Box::new(ws),
-                    message: Vec::new(),
-                },
+                Ok(ws) => Phase::open(ws, Vec::new()),
                 Err(HandshakeError::Interrupted(mid)) => return Ok((Phase::Accepting(mid), false)),
                 Err(HandshakeError::Failure(_)) => return Err(TransportError::HandshakeFailed),
             },
@@ -361,10 +562,7 @@ impl WsFramer {
                         let m = message_of(bytes, text).map_err(|e| read_error(&e))?;
                         ws.write(m).map_err(|e| read_error(&e))?;
                     }
-                    Phase::Open {
-                        ws: Box::new(ws),
-                        message,
-                    }
+                    Phase::open(ws, message)
                 }
                 Err(HandshakeError::Interrupted(mid)) => {
                     return Ok((Phase::Dialling { mid, held, message }, false))
@@ -373,8 +571,27 @@ impl WsFramer {
             },
             open => open,
         };
-        let Phase::Open { ws, .. } = &mut phase else {
+        let Phase::Open {
+            ws, scan, failed, ..
+        } = &mut phase
+        else {
             unreachable!("every other phase returned above");
+        };
+        if failed.is_some() {
+            // The frames ended at the failure: what still arrives is nobody's.
+            ws.get_mut().inbound.clear();
+            return Ok((phase, false));
+        }
+        // The check reads the stream from the first byte after the handshake's head.
+        let text_ok = if shaking {
+            let seen = std::mem::take(&mut ws.get_mut().seen);
+            let at = seen
+                .windows(4)
+                .position(|w| w == b"\r\n\r\n")
+                .map_or(seen.len(), |p| p + 4);
+            scan.feed(&seen[at..])
+        } else {
+            scan.feed(fresh)
         };
         let mut ended = false;
         loop {
@@ -386,7 +603,8 @@ impl WsFramer {
                 // A ping's pong is queued by the machine and goes out with the next bytes; a pong and
                 // a raw frame carry nothing for the layer above.
                 Ok(Message::Ping(_) | Message::Pong(_) | Message::Frame(_)) => {}
-                // The peer closed: the machine queued the close answer, and no frame follows.
+                // The peer closed: the machine queued the close answer (the peer's own code), and
+                // no frame follows.
                 Ok(Message::Close(_)) => {
                     ended = true;
                     break;
@@ -396,8 +614,25 @@ impl WsFramer {
                     ended = true;
                     break;
                 }
-                Err(e) => return Err(read_error(&e)),
+                Err(e) => match failure_code(&e) {
+                    // The far side broke the protocol on a live connection: the frames end here,
+                    // and the close (written when this end closes) carries the failure's code.
+                    Some(code) => {
+                        *failed = Some(code);
+                        break;
+                    }
+                    None => return Err(read_error(&e)),
+                },
             }
+        }
+        // A text payload that is not UTF-8 fails the connection now, behind every message that
+        // completed before it.
+        if failed.is_none() && !text_ok {
+            *failed = Some(CloseCode::Invalid);
+        }
+        if failed.is_some() {
+            ws.get_mut().inbound.clear();
+            ended = true;
         }
         // Whatever the machine owes the far side (a pong, a close answer) goes out now.
         match ws.flush() {
@@ -419,7 +654,7 @@ impl WsFramer {
     ) -> Result<(), TransportError> {
         let mut states = self.states.lock().expect("framing states poisoned");
         let phase = states.get_mut(&state).ok_or(TransportError::Closed)?;
-        let Phase::Open { ws, message } = phase else {
+        let Phase::Open { ws, message, .. } = phase else {
             return Err(TransportError::Closed);
         };
         let done = op(ws, message);
@@ -481,10 +716,14 @@ impl Framer for WsFramer {
     ) -> Result<(), TransportError> {
         let mut states = self.states.lock().expect("framing states poisoned");
         let mut phase = states.remove(&state).ok_or(TransportError::Closed)?;
+        let shaking = !matches!(phase, Phase::Open { .. });
         let pipe = phase.pipe();
         pipe.inbound.extend(bytes);
         pipe.ended |= end;
-        match Self::drive(phase, out) {
+        if shaking {
+            pipe.seen.extend_from_slice(bytes);
+        }
+        match Self::drive(phase, bytes, out) {
             Ok((mut phase, ended)) => {
                 drain(&mut phase, out);
                 if ended {
@@ -545,11 +784,14 @@ impl Framer for WsFramer {
         else {
             return;
         };
-        if let Phase::Open { ws, .. } = &mut phase {
+        if let Phase::Open { ws, failed, .. } = &mut phase {
             // The close frame is a courtesy on a connection already finalised: what the machine
             // could write goes out, and a close it cannot write is not an error anyone can act on.
+            // A connection the far side failed closes with the failure's code, whatever the reason
+            // this end closes for; one the far side closed already carried the far side's code
+            // back (the machine's answer), and the machine writes nothing more here.
             let _ = ws.close(Some(CloseFrame {
-                code: close_code_for(reason),
+                code: failed.unwrap_or_else(|| close_code_for(reason)),
                 reason: "".into(),
             }));
             let _ = ws.flush();
