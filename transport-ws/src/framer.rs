@@ -15,8 +15,9 @@
 //! * The session opens at the upgrade (`Unit0Trigger::Upgrade`): an ACCEPTED connection answers the
 //!   upgrade request it ingests with the switching-protocols response; a DIALLED one opens with the
 //!   upgrade request for its target and completes when the response arrives.
-//! * A WebSocket MESSAGE is the frame unit: each binary or text message ingested is one frame, and
-//!   each frame emitted (its last piece marked) goes out as one binary message.
+//! * A WebSocket MESSAGE is the frame unit: each binary or text message ingested is one frame, a text
+//!   one stated as text ([`Framed::text`]), and each frame emitted (its last piece marked) goes out
+//!   as one message, TEXT when the emit says so, else BINARY.
 //! * A ping is answered with its pong on the next bytes out; a close is answered and ends the frames.
 //! * A close carries the RFC 6455 code its reason names ([`close_code_for`]).
 //! * The message ceiling is the deployment's body cap, for a whole message and for a single frame.
@@ -262,7 +263,9 @@ impl WsFramer {
         loop {
             match ws.read() {
                 Ok(Message::Binary(b)) => out.frame(Framed::plain(StreamId(0), &b, true)),
-                Ok(Message::Text(t)) => out.frame(Framed::plain(StreamId(0), t.as_bytes(), true)),
+                Ok(Message::Text(t)) => {
+                    out.frame(Framed::plain(StreamId(0), t.as_bytes(), true).text(true));
+                }
                 // A ping's pong is queued by the machine and goes out with the next bytes; a pong and
                 // a raw frame carry nothing for the layer above.
                 Ok(Message::Ping(_) | Message::Pong(_) | Message::Frame(_)) => {}
@@ -305,7 +308,7 @@ impl WsFramer {
         let done = op(ws, message);
         drain(phase, out);
         done.map_err(|e| match e {
-            WsError::Capacity(_) => TransportError::Framing,
+            WsError::Capacity(_) | WsError::Utf8(_) => TransportError::Framing,
             WsError::ConnectionClosed | WsError::AlreadyClosed => TransportError::Closed,
             _ => TransportError::Reset,
         })
@@ -385,6 +388,7 @@ impl Framer for WsFramer {
         _stream: StreamId,
         bytes: &[u8],
         end_of_frame: bool,
+        text: bool,
         out: &mut dyn FramerOut,
     ) -> Result<(), TransportError> {
         self.with_open(state, out, |ws, message| {
@@ -392,7 +396,14 @@ impl Framer for WsFramer {
             if !end_of_frame {
                 return Ok(());
             }
-            ws.send(Message::Binary(std::mem::take(message).into()))
+            let message = std::mem::take(message);
+            // A text frame goes out under the TEXT opcode, which promises UTF-8: bytes that are not
+            // fail the write (RFC 6455 §8.1) rather than go out under a promise they break.
+            ws.send(if text {
+                Message::Text(String::from_utf8(message)?.into())
+            } else {
+                Message::Binary(message.into())
+            })
         })
     }
 
@@ -417,7 +428,7 @@ impl Framer for WsFramer {
         bytes: &[u8],
         out: &mut dyn FramerOut,
     ) -> Result<(), TransportError> {
-        let sent = self.emit(state, StreamId(0), bytes, true, out);
+        let sent = self.emit(state, StreamId(0), bytes, true, false, out);
         self.close(state, CloseReason::Normal, out);
         sent
     }
