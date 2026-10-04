@@ -23,64 +23,17 @@ use busbar_contract::{
     Fut, ScratchBytes, SlabBytes, StreamId, Transport, TransportConfigView, TransportKeyHandle,
     TransportMeta,
 };
-use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
 use tokio_tungstenite::tungstenite::protocol::CloseFrame;
 use tokio_tungstenite::tungstenite::Message;
 
 use crate::conn::{ConnState, LowerFacts, LowerIo, Sock, WsConnHandle};
+use crate::framer::close_code_for;
 
 /// How long a courtesy Close frame may take to reach the peer before this transport gives up on
 /// it. A peer whose receive window is full can never accept one, and a send with no bound would
 /// hold the writer lock — and the socket — for the process's lifetime, because `close` has already
 /// dropped the only handle that could cancel it.
 pub(crate) const CLOSE_BUDGET: std::time::Duration = std::time::Duration::from_millis(250);
-
-/// The RFC 6455 close code a [`CloseReason`] puts on the wire.
-///
-/// `close` used to send a bare `Message::Close(None)` regardless of why: a peer that gets no code
-/// cannot tell an orderly shutdown from a policy revocation from a capacity limit, and one that
-/// gets 1009 (Message Too Big) can act on the specific cause — back off, split the payload, log it
-/// — where a bare close leaves it guessing. Every arm below is a code [`CloseCode::is_allowed`]
-/// accepts for sending: the reserved codes (1005 Status, 1006 Abnormal, 1015 Tls) describe a
-/// condition to a *local* API caller and must never appear in a frame an endpoint actually sends, so
-/// none of `busbar`'s own reasons are routed to them. Kept a distinct code per reason rather than
-/// folding several onto the closest match: a caller that later wants to distinguish, say, `Revoked`
-/// from `CapacityExhausted` on the wire should not find both already spent on the same number.
-fn close_code_for(reason: CloseReason) -> CloseCode {
-    match reason {
-        // "An orderly close" is exactly what 1000 means.
-        CloseReason::Normal => CloseCode::Normal,
-        // For an explicit `Transport::close(conn, PeerClosed)` call: THIS endpoint is closing
-        // `conn` because it learned, some way other than a Close frame arriving ON `conn` itself,
-        // that its counterpart is gone (e.g. a multiplexing layer tearing down a related
-        // connection). "Going away" is 1001's own definition.
-        //
-        // NOT the code for replying to a Close frame this transport reads directly off `conn`'s
-        // own wire — that reply is tungstenite's, not this function's: `frames()` below drives it
-        // out with a flush rather than building one, and it echoes the PEER's own code (1000 in
-        // the ordinary case), never a hardcoded 1001.
-        CloseReason::PeerClosed => CloseCode::Away,
-        // Node draining is a deliberate, orderly shutdown for maintenance/redeploy — "the server is
-        // restarting" is 1012's own definition, reconnect-elsewhere guidance included.
-        CloseReason::Drain => CloseCode::Restart,
-        // A panic mid-codec is this endpoint's own unexpected condition, not the peer's fault or the
-        // wire's: 1011 is the generic internal-error code the RFC reserves for exactly that.
-        CloseReason::Poisoned => CloseCode::Error,
-        // Authority withdrawn is an access-control decision, and 1008 is the RFC's policy-violation
-        // code for a termination with no more specific status to give.
-        CloseReason::Revoked => CloseCode::Policy,
-        // No RFC 6455 code names "a deadline expired"; 1013 ("Try Again Later") is the closest
-        // registered meaning — it tells the peer the same thing a timeout implies, that a retry may
-        // succeed where this attempt did not.
-        CloseReason::Timeout => CloseCode::Again,
-        // The transport layer failing is, from the wire's perspective, a protocol-level error.
-        CloseReason::TransportFailed => CloseCode::Protocol,
-        // No RFC 6455 code names "a spend/budget cap was hit" either; 1009 (Message Too Big) is the
-        // closest registered meaning — a resource ceiling was exceeded — of the codes left unclaimed
-        // by every other reason above.
-        CloseReason::CapacityExhausted => CloseCode::Size,
-    }
-}
 
 /// How long the WebSocket opening handshake may take before this transport gives the socket up.
 ///

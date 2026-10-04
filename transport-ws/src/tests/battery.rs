@@ -622,8 +622,8 @@ async fn close_maps_the_reason_to_its_rfc6455_code() {
     );
     assert_eq!(
         observed_close_code(&t, CloseReason::PeerClosed).await,
-        1001,
-        "completing a peer-initiated close is this endpoint going away too"
+        1000,
+        "closing because the peer is gone is an orderly close: 1001 is this endpoint going away"
     );
     assert_eq!(
         observed_close_code(&t, CloseReason::Poisoned).await,
