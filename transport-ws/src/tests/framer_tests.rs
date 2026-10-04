@@ -143,3 +143,72 @@ fn a_dial_carries_its_opening_fields_holds_early_messages_and_flags_text() {
         .emit_text(state, b"\xff\xfe", true, true, &mut bad)
         .is_err());
 }
+
+// ── the wire's declarations and its URL reading (from the in-process transport's battery, which
+// left with that transport when the crate went door-only) ──────────────────────────────────────
+
+#[allow(clippy::assertions_on_constants)]
+#[test]
+fn transport_meta_matches_the_architecture_row() {
+    use busbar_contract::transport::wire::Unit0Trigger;
+    use busbar_contract::TransportMeta;
+    assert_eq!(<crate::WsFramer as TransportMeta>::KEY, "ws");
+    assert!(<crate::WsFramer as TransportMeta>::SESSION);
+    assert!(<crate::WsFramer as TransportMeta>::SESSION_BOUND);
+    assert_eq!(
+        <crate::WsFramer as TransportMeta>::UNIT0_TRIGGER,
+        Some(Unit0Trigger::Upgrade)
+    );
+    // The layers this one is actually built over: an inbound upgrade on `http`, an outbound dial
+    // on `tcp`. No transport layer encrypts (TLS is core's connection security), so none is named
+    // for a `wss://` dial.
+    assert_eq!(
+        <crate::WsFramer as TransportMeta>::COMPOSES_OVER,
+        &["http", "tcp"]
+    );
+    assert!(<crate::WsFramer as TransportMeta>::UPGRADES_TO.is_empty());
+    assert_eq!(<crate::WsFramer as TransportMeta>::STATUS_CLASS, None);
+}
+
+/// `split_ws_url` on the bracketed-IPv6 shapes. A literal address with an explicit port is the one
+/// case the bracket rule exists to serve, and it must come back as the address without its brackets
+/// and the port the URL spelled — not as an authority that gets a default port stapled onto it.
+#[test]
+fn a_bracketed_ipv6_authority_parses_with_and_without_a_port() {
+    assert_eq!(
+        crate::framer::split_ws_url("wss://[::1]:8080/p").unwrap(),
+        (true, "::1".to_string(), 8080, "/p".to_string())
+    );
+    assert_eq!(
+        crate::framer::split_ws_url("ws://[::1]/p").unwrap(),
+        (false, "::1".to_string(), 80, "/p".to_string())
+    );
+    // The shapes the existing rule already got right stay right.
+    assert_eq!(
+        crate::framer::split_ws_url("ws://host:9000/p").unwrap(),
+        (false, "host".to_string(), 9000, "/p".to_string())
+    );
+    assert_eq!(
+        crate::framer::split_ws_url("wss://host/p").unwrap(),
+        (true, "host".to_string(), 443, "/p".to_string())
+    );
+}
+
+/// The authority ends at `?`, `#` or `\` as well as `/`, where the handshake's own parser ends it.
+/// RED on the `/`-only split, which read `ws://host?x=1` as the host `host?x=1`.
+#[test]
+fn a_ws_authority_ends_at_a_query_a_fragment_or_a_backslash() {
+    assert_eq!(
+        crate::framer::split_ws_url("ws://host?x=1").unwrap(),
+        (false, "host".to_string(), 80, "/?x=1".to_string())
+    );
+    assert_eq!(
+        crate::framer::split_ws_url("wss://127.0.0.1\\x/").unwrap(),
+        (true, "127.0.0.1".to_string(), 443, "/x/".to_string())
+    );
+    assert_eq!(
+        crate::framer::split_ws_url("wss://host:9443#f").unwrap(),
+        (true, "host".to_string(), 9443, "/#f".to_string())
+    );
+    assert!(crate::framer::split_ws_url("wss://u@host/").is_err());
+}
