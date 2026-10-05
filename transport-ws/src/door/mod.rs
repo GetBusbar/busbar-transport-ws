@@ -74,10 +74,6 @@ const CLAIMS: &[Claim] = &[Claim {
     _reserved: 0,
 }];
 
-/// What `ws` composes over, as the transport's own declaration states it.
-const OVER: &[&str] = <crate::WsFramer as busbar_contract::TransportMeta>::COMPOSES_OVER;
-const COMPOSES_OVER: &[AbiStr] = &[abi_str(OVER[0]), abi_str(OVER[1])];
-
 const SETTINGS: &[SettingDecl] = &[SettingDecl {
     path: abi_str(BODY_MAX_BYTES),
     kind: SETTING_COUNT,
@@ -94,8 +90,10 @@ const TAIL: TransportTail = TransportTail {
     framing: FRAMING_STREAM,
     facts: 0,
     handshake_max_steps: 0,
-    composes_over: COMPOSES_OVER.as_ptr(),
-    composes_over_len: COMPOSES_OVER.len(),
+    // No transport names another: the carrier is the connector's choice, and an upgrade reaches
+    // this framer by `adopt`, never by composition.
+    composes_over: std::ptr::null(),
+    composes_over_len: 0,
     claim_rows: CLAIMS.as_ptr(),
     claim_rows_len: CLAIMS.len(),
     upgrades_to: std::ptr::null(),

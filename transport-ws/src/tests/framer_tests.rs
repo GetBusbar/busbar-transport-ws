@@ -159,13 +159,9 @@ fn transport_meta_matches_the_architecture_row() {
         <crate::WsFramer as TransportMeta>::UNIT0_TRIGGER,
         Some(Unit0Trigger::Upgrade)
     );
-    // The layers this one is actually built over: an inbound upgrade on `http`, an outbound dial
-    // on `tcp`. No transport layer encrypts (TLS is core's connection security), so none is named
-    // for a `wss://` dial.
-    assert_eq!(
-        <crate::WsFramer as TransportMeta>::COMPOSES_OVER,
-        &["http", "tcp"]
-    );
+    // No transport names another: the carrier is the connector's choice and an upgrade is
+    // adopted, so ws composes over nothing.
+    assert!(<crate::WsFramer as TransportMeta>::COMPOSES_OVER.is_empty());
     assert!(<crate::WsFramer as TransportMeta>::UPGRADES_TO.is_empty());
     assert_eq!(<crate::WsFramer as TransportMeta>::STATUS_CLASS, None);
 }

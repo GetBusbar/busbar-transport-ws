@@ -19,11 +19,12 @@ impl TransportMeta for crate::WsFramer {
     const KEY: &'static str = "ws";
     const SELECTOR_FORMS: &'static [SelectorForm] = claims::SELECTOR_FORMS;
     const EGRESS_SELECTOR_FORMS: &'static [SelectorForm] = claims::EGRESS_SELECTOR_FORMS;
-    // The layers this one is actually built over: an inbound upgrade arrives on `http`, an
-    // outbound one is dialled through `tcp`. No transport encrypts: TLS is core's connection
-    // security, never a layer a transport composes over; a `wss://` target is located as one that
-    // asks the connector to secure its bytes before they leave.
-    const COMPOSES_OVER: &'static [&'static str] = &["http", "tcp"];
+    // NONE: no transport names another (`BUSBAR-1.6.0.md` TRANSPORT-STACK (2), :4721). The carrier
+    // is the connector's choice from the target's scheme, and an inbound upgrade reaches this
+    // framer by `adopt` of the leftover bytes the `http` framer's `detach` hands back, never by
+    // composition. No transport encrypts: TLS is core's connection security; a `wss://` target is
+    // located as one that asks the connector to secure its bytes before they leave.
+    const COMPOSES_OVER: &'static [&'static str] = &[];
     const HANDOFF: Option<busbar_contract::transport::wire::Handoff> = None;
     const FRAMING: busbar_contract::transport::wire::Framing =
         busbar_contract::transport::wire::Framing::Stream;
