@@ -44,7 +44,7 @@ use busbar_contract::transport::{
     BytesOut, ConnFacts, Framed, Framer, FramerOut as Out, HostTime, Side,
 };
 
-use crate::framer::WsFramer;
+use crate::transport::WsFramer;
 
 // ── the statement ────────────────────────────────────────────────────────────────────────────────
 
