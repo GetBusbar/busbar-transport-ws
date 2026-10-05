@@ -1,0 +1,58 @@
+{
+  "settings": {},
+  "transport": {
+    "locate": {
+      "reads": [
+        {
+          "target": "ws://peer.test:8080/echo",
+          "authority": "peer.test:8080",
+          "secure": false
+        }
+      ],
+      "refuses": [
+        "http://peer.test/echo"
+      ]
+    },
+    "dial": {
+      "target": "ws://peer.test:8080/echo",
+      "opening": "GET /echo HTTP/1.1\r\nHost: peer.test:8080\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n",
+      "answer": "HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n\r\n",
+      "emit": "hi",
+      "wire": {
+        "hex": "8282000000006869"
+      },
+      "ingest": {
+        "hex": "81026869880203e8"
+      },
+      "frames": [
+        "hi",
+        ""
+      ],
+      "ingest_wire": {
+        "hex": "88820000000003e8"
+      }
+    },
+    "encode": [
+      {
+        "body": "b",
+        "fields": [],
+        "wire": "b"
+      }
+    ],
+    "refuse": {
+      "opening": "GET /echo HTTP/1.1\r\nHost: peer.test:8080\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n",
+      "answer": "HTTP/1.1 101 Switching Protocols\r\nconnection: Upgrade\r\nupgrade: websocket\r\nsec-websocket-accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n\r\n",
+      "bytes": "no",
+      "wire": {
+        "hex": "82026e6f880203e8"
+      },
+      "ends": true
+    },
+    "detach": "refused",
+    "adopt": {
+      "leftover": "GET /echo HTTP/1.1\r\nHost: peer.test:8080\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n",
+      "frames": [],
+      "wire": "HTTP/1.1 101 Switching Protocols\r\nconnection: Upgrade\r\nupgrade: websocket\r\nsec-websocket-accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n\r\n"
+    }
+  }
+}

@@ -70,6 +70,8 @@ pub(crate) struct Pipe {
     /// Every byte ingested while the opening handshake runs: the protocol machine keeps what
     /// follows the handshake's head, and the fail-fast check reads it from here.
     seen: Vec<u8>,
+    /// This end dialled: its frames are masked (RFC 6455 section 5.3).
+    client: bool,
 }
 
 impl Read for Pipe {
@@ -386,9 +388,63 @@ fn message_of(bytes: Vec<u8>, text: bool) -> Result<Message, WsError> {
 
 /// Hand whatever the machine wrote to core.
 fn drain(phase: &mut Phase, out: &mut dyn FramerOut) {
+    #[cfg(feature = "test-seeded")]
+    let open = matches!(phase, Phase::Open { .. });
     let pipe = phase.pipe();
     if !pipe.outbound.is_empty() {
+        #[cfg(feature = "test-seeded")]
+        if open && pipe.client {
+            seeded::unmask(&mut pipe.outbound);
+        }
         out.send(&std::mem::take(&mut pipe.outbound));
+    }
+}
+
+/// THE TEST HARNESS'S SEED (`test-seeded`, a dev-dependency feature the published conformance
+/// suite builds with; never in a shipped build, where the handshake key and every frame's mask stay
+/// random as RFC 6455 section 5.3 requires): a dial's handshake key is fixed, and a dialled end's
+/// frames carry the all-zero mask, so the bytes a scripted dial writes are the same every run.
+#[cfg(feature = "test-seeded")]
+mod seeded {
+    /// The handshake key a seeded dial sends (RFC 6455 section 1.3's own example).
+    pub(super) const KEY: &str = "dGhlIHNhbXBsZSBub25jZQ==";
+
+    /// Rewrite each whole client frame in `wire` to the all-zero mask, its payload unmasked.
+    pub(super) fn unmask(wire: &mut [u8]) {
+        let mut at = 0;
+        while at + 2 <= wire.len() {
+            let masked = wire[at + 1] & 0x80 != 0;
+            let (len, head) = match wire[at + 1] & 0x7f {
+                126 if at + 4 <= wire.len() => (
+                    usize::from(u16::from_be_bytes([wire[at + 2], wire[at + 3]])),
+                    4,
+                ),
+                127 if at + 10 <= wire.len() => {
+                    let mut l = [0_u8; 8];
+                    l.copy_from_slice(&wire[at + 2..at + 10]);
+                    (
+                        usize::try_from(u64::from_be_bytes(l)).unwrap_or(usize::MAX),
+                        10,
+                    )
+                }
+                l @ 0..=125 => (usize::from(l), 2),
+                _ => return,
+            };
+            let key_at = at + head;
+            let body = key_at + if masked { 4 } else { 0 };
+            if body.saturating_add(len) > wire.len() {
+                return;
+            }
+            if masked {
+                let mut key = [0_u8; 4];
+                key.copy_from_slice(&wire[key_at..body]);
+                for (k, b) in wire[body..body + len].iter_mut().enumerate() {
+                    *b ^= key[k % 4];
+                }
+                wire[key_at..body].fill(0);
+            }
+            at = body + len;
+        }
     }
 }
 
@@ -520,9 +576,16 @@ impl WsFramer {
                     };
                     request.headers_mut().append(name, value);
                 }
+                #[cfg(feature = "test-seeded")]
+                request
+                    .headers_mut()
+                    .insert("sec-websocket-key", HeaderValue::from_static(seeded::KEY));
                 match tokio_tungstenite::tungstenite::client::client_with_config(
                     request,
-                    Pipe::default(),
+                    Pipe {
+                        client: true,
+                        ..Pipe::default()
+                    },
                     self.config(),
                 ) {
                     Err(HandshakeError::Interrupted(mid)) => Phase::Dialling {
