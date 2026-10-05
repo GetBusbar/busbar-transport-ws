@@ -18,7 +18,8 @@ use busbar_contract::abi::mechanism::lifecycle::{slot as life, OpenIn, OpenOut};
 use busbar_contract::abi::transport::check::check_framer;
 use busbar_contract::abi::transport::{
     slot, BeginIn, EmitIn, FinishIn, FramePiece, FramerOut, FramerSink, IngestIn, Ops,
-    CLOSE_NORMAL, PIECE_END_OF_FRAME, SIDE_ACCEPT, SIDE_DIAL, YIELD_ENDED, YIELD_MORE,
+    CLOSE_NORMAL, EMIT_TEXT, PIECE_END_OF_FRAME, PIECE_TEXT, SIDE_ACCEPT, SIDE_DIAL, YIELD_ENDED,
+    YIELD_MORE,
 };
 
 fn z<T>() -> T {
@@ -48,6 +49,8 @@ struct End {
     framing: u64,
     wire: Vec<u8>,
     frames: Vec<(Vec<u8>, bool)>,
+    /// Per frame in `frames`: every message-bearing piece of it carried `PIECE_TEXT`.
+    text: Vec<bool>,
     ended: bool,
 }
 
@@ -122,7 +125,13 @@ impl Host {
             self.log.extend_from_slice(b);
             match end.frames.last_mut() {
                 Some((open, false)) => open.extend_from_slice(b),
-                _ => end.frames.push((b.to_vec(), false)),
+                _ => {
+                    end.frames.push((b.to_vec(), false));
+                    end.text.push(true);
+                }
+            }
+            if !b.is_empty() {
+                *end.text.last_mut().expect("a frame") &= p.flags & PIECE_TEXT != 0;
             }
             if p.flags & PIECE_END_OF_FRAME != 0 {
                 end.frames.last_mut().expect("a frame").1 = true;
@@ -167,6 +176,11 @@ impl Host {
     /// Carry what `from` has written to `to`.
     fn carry(&mut self, from: &mut End, to: &mut End) {
         let bytes = std::mem::take(&mut from.wire);
+        self.hear(to, &bytes);
+    }
+
+    /// `to` ingests `bytes` off its wire.
+    fn hear(&mut self, to: &mut End, bytes: &[u8]) {
         if bytes.is_empty() {
             return;
         }
@@ -182,16 +196,23 @@ impl Host {
     }
 
     fn say(&mut self, end: &mut End, message: &'static str) {
+        let r = self.emit(end, message.as_bytes(), 0);
+        let more = self.take(r.0, &r.1, end);
+        self.again(more, end);
+    }
+
+    /// One whole message from `end`, its `EmitIn::flags` as given; the raw answer.
+    fn emit(&mut self, end: &End, message: &[u8], flags: u32) -> (Outcome, FramerOut) {
         let mut i: EmitIn = z();
         i.framing = end.framing;
         i.bytes = message.as_ptr();
         i.len = message.len();
         i.end_of_frame = 1;
+        i.flags = flags;
         i.sink = self.sink();
         let mut o: FramerOut = z();
         let r = call(self.ops.emit, self.inst, &mut i, &mut o, slot::EMIT);
-        let more = self.take(r, &o, end);
-        self.again(more, end);
+        (r, o)
     }
 
     fn finish(&mut self, end: &mut End) {
@@ -261,6 +282,88 @@ fn exchange(label: &str, ops: &'static Ops, caps: (usize, usize, usize)) -> Vec<
     log
 }
 
+/// One client message as the wire carries it: FIN, `opcode`, masked with the all-zero key (so the
+/// payload is its own masking), a payload under 126 bytes.
+fn client_message(opcode: u8, payload: &[u8]) -> Vec<u8> {
+    let mut m = vec![0x80 | opcode, 0x80 | payload.len() as u8, 0, 0, 0, 0];
+    m.extend_from_slice(payload);
+    m
+}
+
+/// RED (C19-TAIL U5): a TEXT message arrives as text (`PIECE_TEXT` on every piece of it) and a
+/// BINARY one as binary. On the parent the door stated no text bit, so a text frame arrived as
+/// binary.
+fn text_and_binary(label: &str, ops: &'static Ops, caps: (usize, usize, usize)) {
+    let mut host = Host::open(ops, caps);
+    let mut dial = host.begin(SIDE_DIAL, "ws://svc.test/stream");
+    let mut accept = host.begin(SIDE_ACCEPT, "");
+    host.carry(&mut dial, &mut accept);
+    host.carry(&mut accept, &mut dial);
+    host.hear(&mut accept, &client_message(0x1, b"{\"t\":1}"));
+    host.hear(&mut accept, &client_message(0x2, b"\x01\x02\x03"));
+    println!(
+        "PROOF {label}: frames {:?} text {:?}",
+        accept.frames, accept.text
+    );
+    assert_eq!(
+        accept.frames,
+        [
+            (b"{\"t\":1}".to_vec(), true),
+            (b"\x01\x02\x03".to_vec(), true)
+        ]
+    );
+    assert_eq!(
+        accept.text,
+        [true, false],
+        "the text message arrives as text, the binary one as binary"
+    );
+    host.close();
+}
+
+/// RED (C19-TAIL U5 write): a message emitted with `EMIT_TEXT` goes out under the TEXT opcode (the
+/// far end hears it as text), one without it as BINARY; text that is not UTF-8 is refused, never
+/// sent under a promise it breaks. On the parent every emit went out BINARY.
+fn written_as_text(label: &str, ops: &'static Ops, caps: (usize, usize, usize)) {
+    let mut host = Host::open(ops, caps);
+    let mut dial = host.begin(SIDE_DIAL, "ws://svc.test/stream");
+    let mut accept = host.begin(SIDE_ACCEPT, "");
+    host.carry(&mut dial, &mut accept);
+    host.carry(&mut accept, &mut dial);
+    for (message, flags) in [(&b"{\"t\":1}"[..], EMIT_TEXT), (&b"\x01\x02"[..], 0)] {
+        let (r, o) = host.emit(&dial, message, flags);
+        let more = host.take(r, &o, &mut dial);
+        host.again(more, &mut dial);
+        host.carry(&mut dial, &mut accept);
+    }
+    println!(
+        "PROOF {label}: heard {:?} text {:?}",
+        accept.frames, accept.text
+    );
+    assert_eq!(
+        accept.frames,
+        [(b"{\"t\":1}".to_vec(), true), (b"\x01\x02".to_vec(), true)]
+    );
+    assert_eq!(accept.text, [true, false], "written as text, heard as text");
+    let (r, _) = host.emit(&dial, b"\xff\xfe", EMIT_TEXT);
+    assert_ne!(r, Outcome::Ready, "text that is not UTF-8 is refused");
+    host.close();
+}
+
+#[test]
+fn a_message_written_as_text_goes_out_as_text_through_the_door() {
+    // The linked door; the dropped-in cdylib is held equal to it by the plugin crate's conformance.
+    let ops = linked();
+    written_as_text("linked roomy", ops, (64 * 1024, 64 * 1024, 64));
+    written_as_text("linked tight", ops, (7, 3, 1));
+}
+
+#[test]
+fn a_text_message_arrives_as_text_through_the_door() {
+    let ops = linked();
+    text_and_binary("linked roomy", ops, (64 * 1024, 64 * 1024, 64));
+    text_and_binary("linked tight", ops, (7, 3, 1));
+}
+
 fn linked() -> &'static Ops {
     let d = busbar_transport_ws::door::door();
     // SAFETY: the door's `'static` table.
@@ -276,4 +379,21 @@ fn a_recalled_exchange_answers_nothing_twice_and_drops_nothing() {
         roomy, tight,
         "a re-call answers nothing twice and drops nothing"
     );
+}
+
+/// THE UPGRADE IS STATED ON THE CLAIM ROW (busbar ARCHITECT ruling Q128 U7): the host reads a
+/// scheme's upgrade line off its claim row's `unit0_trigger`, never off a layer list, so ws's one
+/// claim states `UNIT0_UPGRADE` (as `meta.rs`'s `UNIT0_TRIGGER` does) and composes over nothing.
+#[test]
+fn the_ws_claim_opens_at_the_upgrade_and_composes_over_nothing() {
+    use busbar_contract::abi::transport::{Claim, TransportTail, UNIT0_UPGRADE};
+    let st = busbar_transport_ws::door::STATEMENT;
+    // SAFETY: the Statement's kind tail is this crate's `'static` `TransportTail`, and its claim
+    // rows are `claim_rows_len` `'static` rows.
+    let tail = unsafe { &*st.kind_tail.cast::<TransportTail>() };
+    let rows: &[Claim] =
+        unsafe { std::slice::from_raw_parts(tail.claim_rows, tail.claim_rows_len) };
+    assert_eq!(rows.len(), 1, "one entry, one claim");
+    assert_eq!(rows[0].unit0_trigger, UNIT0_UPGRADE);
+    assert_eq!(tail.composes_over_len, 0);
 }
