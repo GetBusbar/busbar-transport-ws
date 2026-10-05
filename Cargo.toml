@@ -29,8 +29,8 @@ publish = false
 repository = "https://github.com/GetBusbar/busbar-transport-ws"
 
 [workspace.dependencies]
-busbar-contract = { git = "https://github.com/GetBusbar/busbar", rev = "31c8e6df2ea0d6bd1bd8550f23e28745a118454e" }
-busbar-plugin-loader = { git = "https://github.com/GetBusbar/busbar", rev = "31c8e6df2ea0d6bd1bd8550f23e28745a118454e" }
+busbar-contract = { git = "https://github.com/GetBusbar/busbar", rev = "deb114df757ead77eaed0684769f792affb8c97a" }
+busbar-plugin-loader = { git = "https://github.com/GetBusbar/busbar", rev = "deb114df757ead77eaed0684769f792affb8c97a" }
 # busbar's root [workspace.dependencies], third-party rows, at 82d84777b8317f9ad365cb8ceb4956a43d7fbd41
 a2a-lf = "0.3.0"
 a2a-pb = "0.2.0"
