@@ -380,3 +380,20 @@ fn a_recalled_exchange_answers_nothing_twice_and_drops_nothing() {
         "a re-call answers nothing twice and drops nothing"
     );
 }
+
+/// THE UPGRADE IS STATED ON THE CLAIM ROW (busbar ARCHITECT ruling Q128 U7): the host reads a
+/// scheme's upgrade line off its claim row's `unit0_trigger`, never off a layer list, so ws's one
+/// claim states `UNIT0_UPGRADE` (as `meta.rs`'s `UNIT0_TRIGGER` does) and composes over nothing.
+#[test]
+fn the_ws_claim_opens_at_the_upgrade_and_composes_over_nothing() {
+    use busbar_contract::abi::transport::{Claim, TransportTail, UNIT0_UPGRADE};
+    let st = busbar_transport_ws::door::STATEMENT;
+    // SAFETY: the Statement's kind tail is this crate's `'static` `TransportTail`, and its claim
+    // rows are `claim_rows_len` `'static` rows.
+    let tail = unsafe { &*st.kind_tail.cast::<TransportTail>() };
+    let rows: &[Claim] =
+        unsafe { std::slice::from_raw_parts(tail.claim_rows, tail.claim_rows_len) };
+    assert_eq!(rows.len(), 1, "one entry, one claim");
+    assert_eq!(rows[0].unit0_trigger, UNIT0_UPGRADE);
+    assert_eq!(tail.composes_over_len, 0);
+}

@@ -34,7 +34,8 @@ use busbar_contract::abi::transport::{
     TransportTail, WriteIn, CANCEL_NOTHING_MOVED, CLOSE_CAPACITY_EXHAUSTED, CLOSE_DRAIN,
     CLOSE_PEER_CLOSED, CLOSE_POISONED, CLOSE_REVOKED, CLOSE_TIMEOUT, CLOSE_TRANSPORT_FAILED,
     EMIT_TEXT, FRAMING_STREAM, PIECE_END_OF_FRAME, PIECE_STREAM_FAILED, PIECE_TEXT, ROLE_FRAMER,
-    SETTING_COUNT, SIDE_ACCEPT, SIDE_DIAL, YIELD_ENDED, YIELD_HAS_DEADLINE, YIELD_MORE,
+    SETTING_COUNT, SIDE_ACCEPT, SIDE_DIAL, UNIT0_UPGRADE, YIELD_ENDED, YIELD_HAS_DEADLINE,
+    YIELD_MORE,
 };
 use busbar_contract::ids::StreamId;
 use busbar_contract::transport::registry::DEFAULT_REQUEST_BODY_MAX_BYTES;
@@ -69,7 +70,9 @@ const CLAIMS: &[Claim] = &[Claim {
     status_namespace: NONE,
     session: 1,
     session_bound: 0,
-    unit0_trigger: 0,
+    // A ws unit opens at the upgrade (meta.rs `UNIT0_TRIGGER`): the host reads its upgrade lines
+    // off this, never off a layer list (busbar ARCHITECT ruling Q128 U7).
+    unit0_trigger: UNIT0_UPGRADE,
     status_at: 0,
     _reserved: 0,
 }];
