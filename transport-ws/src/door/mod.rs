@@ -109,6 +109,8 @@ const TAIL: TransportTail = TransportTail {
     status_rows_len: 0,
     settings: SETTINGS.as_ptr(),
     settings_len: SETTINGS.len(),
+    fault_rows: std::ptr::null(),
+    fault_rows_len: 0,
 };
 
 /// The door's Statement: the `ws` framer.
@@ -707,7 +709,7 @@ fn fill(owed: &mut Owed, sink: &FramerSink, o: &mut FramerOut) {
                 } else {
                     0
                 },
-                _reserved: 0,
+                fault: 0,
                 retry_after_secs: 0,
             });
         }
