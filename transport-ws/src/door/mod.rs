@@ -33,8 +33,8 @@ use busbar_contract::abi::transport::{
     ListenIn, ListenOut, LocateIn, LocateOut, Ops, ReadIn, RefuseIn, SettingDecl, ShutIn,
     TransportTail, WriteIn, CANCEL_NOTHING_MOVED, CLOSE_CAPACITY_EXHAUSTED, CLOSE_DRAIN,
     CLOSE_PEER_CLOSED, CLOSE_POISONED, CLOSE_REVOKED, CLOSE_TIMEOUT, CLOSE_TRANSPORT_FAILED,
-    EMIT_TEXT, FRAMING_STREAM, PIECE_END_OF_FRAME, PIECE_TEXT, ROLE_FRAMER, SETTING_COUNT,
-    SIDE_ACCEPT, SIDE_DIAL, YIELD_ENDED, YIELD_HAS_DEADLINE, YIELD_MORE,
+    EMIT_TEXT, FRAMING_STREAM, PIECE_END_OF_FRAME, PIECE_STREAM_FAILED, PIECE_TEXT, ROLE_FRAMER,
+    SETTING_COUNT, SIDE_ACCEPT, SIDE_DIAL, YIELD_ENDED, YIELD_HAS_DEADLINE, YIELD_MORE,
 };
 use busbar_contract::ids::StreamId;
 use busbar_contract::transport::registry::DEFAULT_REQUEST_BODY_MAX_BYTES;
@@ -127,6 +127,9 @@ struct Piece {
     end_of_frame: bool,
     /// The bytes belong to a text message (`PIECE_TEXT`).
     text: bool,
+    /// The stream's end is a FAILURE (`PIECE_STREAM_FAILED`): the far side broke the protocol, sent
+    /// text that is not UTF-8 or a message over the ceiling. Only ever the empty end piece.
+    failed: bool,
 }
 
 /// What one framing owes the host and has not been able to hand it.
@@ -161,6 +164,7 @@ impl Out for Collect<'_> {
             bytes: piece.bytes.to_vec(),
             end_of_frame: piece.end_of_frame,
             text: piece.text,
+            failed: false,
         });
     }
     fn end(&mut self) {
@@ -171,6 +175,7 @@ impl Out for Collect<'_> {
                 bytes: Vec::new(),
                 end_of_frame: true,
                 text: false,
+                failed: false,
             });
         }
         self.owed.ended = true;
@@ -559,8 +564,19 @@ impl Slot for Ingest {
             if bytes.is_empty() && !end {
                 return Ok(());
             }
+            let ended_before = c.owed.ended;
             f.ingest(i.framing, bytes, end, c)
-                .map_err(|e| format!("{e:?}"))
+                .map_err(|e| format!("{e:?}"))?;
+            // A connection the far side FAILED ends its stream failed, not cleanly: the reader is
+            // told (`PIECE_STREAM_FAILED` on the empty end piece), and the close carries the code.
+            if !ended_before && c.owed.ended && f.failed(i.framing) {
+                if let Some(last) = c.owed.pieces.back_mut() {
+                    if last.bytes.is_empty() && last.end_of_frame {
+                        last.failed = true;
+                    }
+                }
+            }
+            Ok(())
         })
     }
 }
@@ -683,6 +699,10 @@ fn fill(owed: &mut Owed, sink: &FramerSink, o: &mut FramerOut) {
                     0
                 } | if piece.text && take > 0 {
                     PIECE_TEXT
+                } else {
+                    0
+                } | if piece.failed && whole {
+                    PIECE_STREAM_FAILED
                 } else {
                     0
                 },

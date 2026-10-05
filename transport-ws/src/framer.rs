@@ -748,6 +748,23 @@ pub(crate) fn split_ws_url(url: &str) -> Result<(bool, String, u16, String), Tra
     Ok((secure, parts.host, port, parts.path))
 }
 
+impl WsFramer {
+    /// Whether the far side FAILED the connection in `state` (a protocol violation, text that is
+    /// not UTF-8, a message over the ceiling): its frames ended failed, not cleanly.
+    pub(crate) fn failed(&self, state: u64) -> bool {
+        matches!(
+            self.states
+                .lock()
+                .expect("framing states poisoned")
+                .get(&state),
+            Some(Phase::Open {
+                failed: Some(_),
+                ..
+            })
+        )
+    }
+}
+
 impl Default for WsFramer {
     fn default() -> Self {
         Self::new(0)
