@@ -25,7 +25,7 @@ jobs:
     secrets: inherit
   release:
     needs: ci
-    uses: GetBusbar/busbar/.github/workflows/plugin-release.yml@160b0978c63f447412c7167853d908bd79c5ae28
+    uses: GetBusbar/busbar/.github/workflows/plugin-release.yml@31c8e6df2ea0d6bd1bd8550f23e28745a118454e
     with:
       plugin_crate: busbar-transport-ws-plugin
       manifest_name: busbar-transport-ws
@@ -41,7 +41,7 @@ jobs:
   consumer-verify:
     needs: release
     if: ${{ !cancelled() }}
-    uses: GetBusbar/busbar/.github/workflows/plugin-consumer-verify.yml@160b0978c63f447412c7167853d908bd79c5ae28
+    uses: GetBusbar/busbar/.github/workflows/plugin-consumer-verify.yml@31c8e6df2ea0d6bd1bd8550f23e28745a118454e
     with:
       version: ${{ github.ref_name }}
       asset_prefix: busbar-transport-ws
