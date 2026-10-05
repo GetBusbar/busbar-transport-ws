@@ -26,7 +26,7 @@ use busbar_contract::abi::transport::{
     slot, BeginIn, EmitIn, FinishIn, FramePiece, FramerOut, FramerSink, IngestIn, Ops,
     CLOSE_CAPACITY_EXHAUSTED, CLOSE_DRAIN, CLOSE_NORMAL, CLOSE_PEER_CLOSED, CLOSE_POISONED,
     CLOSE_REVOKED, CLOSE_TIMEOUT, CLOSE_TRANSPORT_FAILED, EMIT_TEXT, PIECE_END_OF_FRAME,
-    PIECE_TEXT, SIDE_ACCEPT, YIELD_ENDED, YIELD_MORE,
+    PIECE_STREAM_FAILED, PIECE_TEXT, SIDE_ACCEPT, YIELD_ENDED, YIELD_MORE,
 };
 
 /// A message's kind as this harness names it: what its pieces state (`PIECE_TEXT` or nothing) and
@@ -64,6 +64,8 @@ struct Said {
     wire: Vec<u8>,
     frames: Vec<(Vec<u8>, u8)>,
     stream_end: bool,
+    /// The stream ended FAILED (`PIECE_STREAM_FAILED` on its end piece), not cleanly.
+    failed: bool,
     ended: bool,
 }
 
@@ -148,6 +150,7 @@ impl Host {
                 // kind and completes its frame).
                 if bytes.is_empty() {
                     said.stream_end = true;
+                    said.failed |= p.flags & PIECE_STREAM_FAILED != 0;
                 } else {
                     said.frames.push((bytes, kind));
                 }
@@ -400,6 +403,7 @@ fn a_peer_close_is_answered_with_the_peer_code_after_a_message_exchange() {
         println!("PROOF close: the peer closed with {code}, the door answered {answered:?}");
         assert_eq!(answered, Some(code), "the peer's own code comes back");
         assert!(said.stream_end && said.ended, "and the frames end");
+        assert!(!said.failed, "a peer's close ends the stream cleanly");
         let after = h.finish(f, CLOSE_NORMAL);
         assert_eq!(
             close_code(&server_frames(&after.wire)),
@@ -484,6 +488,10 @@ fn answered_then_failed(case: &str, bytes: &[u8], code: u16) {
         said.stream_end && said.ended,
         "{case}: the frames end at the violation"
     );
+    assert!(
+        said.failed,
+        "{case}: and the stream ends FAILED, not cleanly"
+    );
     let (r, echo) = h.emit(f, OCTETS, b"Hello, world!");
     assert_eq!(
         r,
@@ -543,6 +551,7 @@ fn a_violation_alone_ends_the_frames_and_closes_with_1002() {
         "the violation ends the frames, it is no fault"
     );
     assert!(said.frames.is_empty() && said.stream_end && said.ended);
+    assert!(said.failed, "a violation ends the stream FAILED");
     let closed = h.finish(f, CLOSE_NORMAL);
     assert_eq!(close_code(&server_frames(&closed.wire)), Some(1002));
 }
@@ -576,7 +585,7 @@ fn invalid_utf8_inside_one_frame_fails_the_connection_as_it_arrives() {
             second.ended
         );
         assert!(
-            second.stream_end && second.ended,
+            second.stream_end && second.ended && second.failed,
             "{case}: the offending chop fails the connection at once"
         );
         let closed = h.finish(f, CLOSE_NORMAL);
