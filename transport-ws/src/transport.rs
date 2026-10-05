@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Busbar Inc and contributors
 
-//! THE FRAMER (TRANSPORT-STACK; #3, #30): `ws` as the contract's [`Framer`] — the one implementation
-//! both doors drive. A build that links this crate holds a [`WsFramer`] as its `Arc<dyn Framer>`
+//! THE FRAMER (TRANSPORT-STACK; #3, #30), as the kind's entry file (`BUSBAR-1.6.0.md` THE DESIGN,
+//! §2: meta, claims, and the kind-named entry): `ws` as the contract's [`Framer`] — the one
+//! implementation both doors drive. A build that links this crate holds a [`WsFramer`] as its `Arc<dyn Framer>`
 //! (`crate::linked::framer`); the sibling `busbar-transport-ws-plugin` cdylib exports the door
 //! over this same type (`crate::door`).
 //!

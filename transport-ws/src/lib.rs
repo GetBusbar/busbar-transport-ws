@@ -23,14 +23,14 @@
 #![deny(missing_docs)]
 
 mod claims;
-mod framer;
+mod transport;
 // THE ABI BOUNDARY: the door reads and writes the host's C buffers, so it is one of the modules
 // this crate's `#![deny(unsafe_code)]` allows; every block in it states the host buffer it relies on.
 #[allow(unsafe_code)]
 pub mod door;
 mod meta;
 
-pub use framer::WsFramer;
+pub use transport::WsFramer;
 
 /// THE TRANSPORT AXIS ENTRY (#3, #30): what the composition root folds for this wire — its key, the
 /// layers it declares, and its door, which the root builds the wire from (the `transport-door`

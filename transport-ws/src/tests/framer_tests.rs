@@ -172,20 +172,20 @@ fn transport_meta_matches_the_architecture_row() {
 #[test]
 fn a_bracketed_ipv6_authority_parses_with_and_without_a_port() {
     assert_eq!(
-        crate::framer::split_ws_url("wss://[::1]:8080/p").unwrap(),
+        crate::transport::split_ws_url("wss://[::1]:8080/p").unwrap(),
         (true, "::1".to_string(), 8080, "/p".to_string())
     );
     assert_eq!(
-        crate::framer::split_ws_url("ws://[::1]/p").unwrap(),
+        crate::transport::split_ws_url("ws://[::1]/p").unwrap(),
         (false, "::1".to_string(), 80, "/p".to_string())
     );
     // The shapes the existing rule already got right stay right.
     assert_eq!(
-        crate::framer::split_ws_url("ws://host:9000/p").unwrap(),
+        crate::transport::split_ws_url("ws://host:9000/p").unwrap(),
         (false, "host".to_string(), 9000, "/p".to_string())
     );
     assert_eq!(
-        crate::framer::split_ws_url("wss://host/p").unwrap(),
+        crate::transport::split_ws_url("wss://host/p").unwrap(),
         (true, "host".to_string(), 443, "/p".to_string())
     );
 }
@@ -195,16 +195,16 @@ fn a_bracketed_ipv6_authority_parses_with_and_without_a_port() {
 #[test]
 fn a_ws_authority_ends_at_a_query_a_fragment_or_a_backslash() {
     assert_eq!(
-        crate::framer::split_ws_url("ws://host?x=1").unwrap(),
+        crate::transport::split_ws_url("ws://host?x=1").unwrap(),
         (false, "host".to_string(), 80, "/?x=1".to_string())
     );
     assert_eq!(
-        crate::framer::split_ws_url("wss://127.0.0.1\\x/").unwrap(),
+        crate::transport::split_ws_url("wss://127.0.0.1\\x/").unwrap(),
         (true, "127.0.0.1".to_string(), 443, "/x/".to_string())
     );
     assert_eq!(
-        crate::framer::split_ws_url("wss://host:9443#f").unwrap(),
+        crate::transport::split_ws_url("wss://host:9443#f").unwrap(),
         (true, "host".to_string(), 9443, "/#f".to_string())
     );
-    assert!(crate::framer::split_ws_url("wss://u@host/").is_err());
+    assert!(crate::transport::split_ws_url("wss://u@host/").is_err());
 }
