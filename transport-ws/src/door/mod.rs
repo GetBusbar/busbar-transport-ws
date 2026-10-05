@@ -33,8 +33,9 @@ use busbar_contract::abi::transport::{
     ListenIn, ListenOut, LocateIn, LocateOut, Ops, ReadIn, RefuseIn, SettingDecl, ShutIn,
     TransportTail, WriteIn, CANCEL_NOTHING_MOVED, CLOSE_CAPACITY_EXHAUSTED, CLOSE_DRAIN,
     CLOSE_PEER_CLOSED, CLOSE_POISONED, CLOSE_REVOKED, CLOSE_TIMEOUT, CLOSE_TRANSPORT_FAILED,
-    FRAMING_STREAM, PIECE_END_OF_FRAME, ROLE_FRAMER, SETTING_COUNT, SIDE_ACCEPT, SIDE_DIAL,
-    YIELD_ENDED, YIELD_HAS_DEADLINE, YIELD_MORE,
+    EMIT_TEXT, FRAMING_STREAM, PIECE_END_OF_FRAME, PIECE_STREAM_FAILED, PIECE_TEXT, ROLE_FRAMER,
+    SETTING_COUNT, SIDE_ACCEPT, SIDE_DIAL, UNIT0_UPGRADE, YIELD_ENDED, YIELD_HAS_DEADLINE,
+    YIELD_MORE,
 };
 use busbar_contract::ids::StreamId;
 use busbar_contract::transport::registry::DEFAULT_REQUEST_BODY_MAX_BYTES;
@@ -43,7 +44,7 @@ use busbar_contract::transport::{
     BytesOut, ConnFacts, Framed, Framer, FramerOut as Out, HostTime, Side,
 };
 
-use crate::framer::WsFramer;
+use crate::transport::WsFramer;
 
 // ── the statement ────────────────────────────────────────────────────────────────────────────────
 
@@ -69,14 +70,12 @@ const CLAIMS: &[Claim] = &[Claim {
     status_namespace: NONE,
     session: 1,
     session_bound: 0,
-    unit0_trigger: 0,
+    // A ws unit opens at the upgrade (meta.rs `UNIT0_TRIGGER`): the host reads its upgrade lines
+    // off this, never off a layer list (busbar ARCHITECT ruling Q128 U7).
+    unit0_trigger: UNIT0_UPGRADE,
     status_at: 0,
     _reserved: 0,
 }];
-
-/// What `ws` composes over, as the transport's own declaration states it.
-const OVER: &[&str] = <crate::WsFramer as busbar_contract::TransportMeta>::COMPOSES_OVER;
-const COMPOSES_OVER: &[AbiStr] = &[abi_str(OVER[0]), abi_str(OVER[1])];
 
 const SETTINGS: &[SettingDecl] = &[SettingDecl {
     path: abi_str(BODY_MAX_BYTES),
@@ -94,8 +93,10 @@ const TAIL: TransportTail = TransportTail {
     framing: FRAMING_STREAM,
     facts: 0,
     handshake_max_steps: 0,
-    composes_over: COMPOSES_OVER.as_ptr(),
-    composes_over_len: COMPOSES_OVER.len(),
+    // No transport names another: the carrier is the connector's choice, and an upgrade reaches
+    // this framer by `adopt`, never by composition.
+    composes_over: std::ptr::null(),
+    composes_over_len: 0,
     claim_rows: CLAIMS.as_ptr(),
     claim_rows_len: CLAIMS.len(),
     upgrades_to: std::ptr::null(),
@@ -125,6 +126,11 @@ struct Piece {
     stream: u64,
     bytes: Vec<u8>,
     end_of_frame: bool,
+    /// The bytes belong to a text message (`PIECE_TEXT`).
+    text: bool,
+    /// The stream's end is a FAILURE (`PIECE_STREAM_FAILED`): the far side broke the protocol, sent
+    /// text that is not UTF-8 or a message over the ceiling. Only ever the empty end piece.
+    failed: bool,
 }
 
 /// What one framing owes the host and has not been able to hand it.
@@ -158,6 +164,8 @@ impl Out for Collect<'_> {
             stream: piece.stream.0,
             bytes: piece.bytes.to_vec(),
             end_of_frame: piece.end_of_frame,
+            text: piece.text,
+            failed: false,
         });
     }
     fn end(&mut self) {
@@ -167,6 +175,8 @@ impl Out for Collect<'_> {
                 stream: 0,
                 bytes: Vec::new(),
                 end_of_frame: true,
+                text: false,
+                failed: false,
             });
         }
         self.owed.ended = true;
@@ -213,6 +223,27 @@ fn text(s: &AbiStr) -> &[u8] {
     }
     // SAFETY: host-borrowed input, valid for the call.
     unsafe { std::slice::from_raw_parts(s.ptr, s.len) }
+}
+
+/// A dial's opening head fields (`BeginIn::fields`), owned.
+fn opening_fields(
+    p: *const busbar_contract::abi::mechanism::call::Field,
+    n: usize,
+) -> Vec<(String, Vec<u8>)> {
+    if p.is_null() || n == 0 {
+        return Vec::new();
+    }
+    // SAFETY: host-borrowed for the call: `n` fields at `p`.
+    let fields = unsafe { std::slice::from_raw_parts(p, n) };
+    fields
+        .iter()
+        .map(|f| {
+            (
+                String::from_utf8_lossy(text(&f.name)).into_owned(),
+                text(&f.value).to_vec(),
+            )
+        })
+        .collect()
 }
 
 fn raw<'a>(p: *const u8, n: usize) -> &'a [u8] {
@@ -493,9 +524,10 @@ impl Slot for Begin {
             return Outcome::Failed;
         };
         let target = String::from_utf8_lossy(text(&i.target)).into_owned();
-        let facts = facts_of(i.facts);
+        let _ = facts_of(i.facts);
+        let fields = opening_fields(i.fields, i.fields_len);
         opening(p, &i.sink, o, |f, c| {
-            f.open(side, &target, &facts, c)
+            f.open_with(side, &target, &fields, c)
                 .map_err(|e| format!("{e:?}"))
         })
     }
@@ -533,8 +565,19 @@ impl Slot for Ingest {
             if bytes.is_empty() && !end {
                 return Ok(());
             }
+            let ended_before = c.owed.ended;
             f.ingest(i.framing, bytes, end, c)
-                .map_err(|e| format!("{e:?}"))
+                .map_err(|e| format!("{e:?}"))?;
+            // A connection the far side FAILED ends its stream failed, not cleanly: the reader is
+            // told (`PIECE_STREAM_FAILED` on the empty end piece), and the close carries the code.
+            if !ended_before && c.owed.ended && f.failed(i.framing) {
+                if let Some(last) = c.owed.pieces.back_mut() {
+                    if last.bytes.is_empty() && last.end_of_frame {
+                        last.failed = true;
+                    }
+                }
+            }
+            Ok(())
         })
     }
 }
@@ -551,7 +594,7 @@ impl Slot for Emit {
             if bytes.is_empty() && !eof {
                 return Ok(());
             }
-            f.emit(i.framing, StreamId(i.stream), bytes, eof, c)
+            f.emit_text(i.framing, bytes, eof, i.flags & EMIT_TEXT != 0, c)
                 .map_err(|e| format!("{e:?}"))
         })
     }
@@ -653,6 +696,14 @@ fn fill(owed: &mut Owed, sink: &FramerSink, o: &mut FramerOut) {
                 status_class: 0,
                 flags: if whole && piece.end_of_frame {
                     PIECE_END_OF_FRAME
+                } else {
+                    0
+                } | if piece.text && take > 0 {
+                    PIECE_TEXT
+                } else {
+                    0
+                } | if piece.failed && whole {
+                    PIECE_STREAM_FAILED
                 } else {
                     0
                 },

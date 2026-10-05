@@ -1,168 +1,733 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Busbar Inc and contributors
 
-//! The [`busbar_contract::Transport`] implementation.
+//! THE FRAMER (TRANSPORT-STACK; #3, #30), as the kind's entry file (`BUSBAR-1.6.0.md` THE DESIGN,
+//! §2: meta, claims, and the kind-named entry): `ws` as the contract's [`Framer`] — the one
+//! implementation both doors drive. A build that links this crate holds a [`WsFramer`] as its `Arc<dyn Framer>`
+//! (`crate::linked::framer`); the sibling `busbar-transport-ws-plugin` cdylib exports the door
+//! over this same type (`crate::door`).
+//!
+//! SANS-IO. The framer holds no socket, no waker and no clock: core hands it the bytes the carrier
+//! read and sends the bytes it answers. Each framing state is the WebSocket protocol machine over an
+//! in-memory [`Pipe`] — what arrived waits in the pipe until the machine consumes it, what the
+//! machine writes collects in the pipe until the call hands it to core — so the handshake and every
+//! frame run exactly as they do over a socket, one call at a time.
+//!
+//! * The session opens at the upgrade (`Unit0Trigger::Upgrade`): an ACCEPTED connection answers the
+//!   upgrade request it ingests with the switching-protocols response; a DIALLED one opens with the
+//!   upgrade request for its target and completes when the response arrives.
+//! * A WebSocket MESSAGE is the frame unit: each binary or text message ingested is one frame, a text
+//!   one stated as text ([`Framed::text`]), and each frame emitted (its last piece marked) goes out
+//!   as one message, TEXT when the emit says so (`EMIT_TEXT`), else BINARY.
+//! * A DIALLED connection's upgrade request carries the dial's opening head fields (the bound
+//!   auth's `Authorization` among them), the WebSocket handshake's own fields excepted; a message
+//!   written before the handshake completes is held and goes out, in order, the moment it does.
+//! * A ping is answered with its pong on the next bytes out; a peer's close is answered with the
+//!   peer's own code and ends the frames.
+//! * A close this end starts carries the RFC 6455 code its reason names ([`close_code_for`]).
+//! * Bytes that break the protocol FAIL the connection (RFC 6455 §7.1.7) the way the RFC orders it:
+//!   every message completed before them is handed up first, the frames end, the layer above may
+//!   still answer what it was handed, and the close then carries the failure's code (1002 a
+//!   protocol error, 1007 a text payload that is not UTF-8, 1009 a message over the ceiling).
+//!   A text payload is checked as its bytes arrive, so a bad sequence fails the connection at
+//!   once, not when its frame completes.
+//! * The message ceiling is the deployment's body cap, for a whole message and for a single frame.
+//!
+//! The upgrade INTO this framer is [`Framer::adopt`]: another framer gave up the stream with the
+//! bytes it held (the upgrade request itself), and this one answers it. Nothing upgrades out of a
+//! WebSocket, so [`Framer::detach`] refuses.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
+use std::io::{Read, Write};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex as SyncMutex};
+use std::sync::Mutex;
 
-use futures::{Stream, StreamExt};
-
-use busbar_contract::dest::{DestinationFacts, VerifiedDestination};
-use busbar_contract::transport::wire::ArrivalRecord;
-use busbar_contract::transport::wire::CloseReason;
-use busbar_contract::transport::wire::Conn;
-use busbar_contract::transport::wire::Direction;
-use busbar_contract::transport::wire::FrameMeta;
-use busbar_contract::transport::wire::Listener;
-use busbar_contract::transport::wire::TransportError;
-use busbar_contract::unit::Refusal;
-use busbar_contract::wire::Frame;
-use busbar_contract::{
-    Fut, ScratchBytes, SlabBytes, StreamId, Transport, TransportConfigView, TransportKeyHandle,
-    TransportMeta,
+use busbar_contract::ids::StreamId;
+use busbar_contract::transport::wire::{CloseReason, Encode, TransportError};
+use busbar_contract::transport::{
+    BytesOut, ConnFacts, Framed, Framer, FramerOut, Located, Side, TransportSettings,
 };
+use busbar_contract::{AbiVersion, Kind, Plugin};
+use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+use tokio_tungstenite::tungstenite::error::ProtocolError;
+use tokio_tungstenite::tungstenite::handshake::client::ClientHandshake;
+use tokio_tungstenite::tungstenite::handshake::server::{NoCallback, ServerHandshake};
+use tokio_tungstenite::tungstenite::handshake::{HandshakeError, MidHandshake};
+use tokio_tungstenite::tungstenite::http::{HeaderName, HeaderValue};
 use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
-use tokio_tungstenite::tungstenite::protocol::CloseFrame;
-use tokio_tungstenite::tungstenite::Message;
+use tokio_tungstenite::tungstenite::protocol::{CloseFrame, WebSocketConfig};
+use tokio_tungstenite::tungstenite::{Error as WsError, Message, WebSocket};
 
-use crate::conn::{ConnState, LowerFacts, LowerIo, Sock, WsConnHandle};
+/// The in-memory stream one framing state's protocol machine reads and writes: what core ingested
+/// and the machine has not consumed, whether the carrier's clean end followed it, what the
+/// machine wrote and core has not been handed yet, and what arrived during the handshake.
+#[derive(Default)]
+pub(crate) struct Pipe {
+    inbound: VecDeque<u8>,
+    ended: bool,
+    outbound: Vec<u8>,
+    /// Every byte ingested while the opening handshake runs: the protocol machine keeps what
+    /// follows the handshake's head, and the fail-fast check reads it from here.
+    seen: Vec<u8>,
+    /// This end dialled: its frames are masked (RFC 6455 section 5.3).
+    client: bool,
+}
 
-/// How long a courtesy Close frame may take to reach the peer before this transport gives up on
-/// it. A peer whose receive window is full can never accept one, and a send with no bound would
-/// hold the writer lock — and the socket — for the process's lifetime, because `close` has already
-/// dropped the only handle that could cancel it.
-pub(crate) const CLOSE_BUDGET: std::time::Duration = std::time::Duration::from_millis(250);
+impl Read for Pipe {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if self.inbound.is_empty() {
+            // Nothing more yet: the machine stops here and resumes on the next ingest. Only the
+            // carrier's clean end is the end.
+            return if self.ended {
+                Ok(0)
+            } else {
+                Err(std::io::ErrorKind::WouldBlock.into())
+            };
+        }
+        let n = buf.len().min(self.inbound.len());
+        for (slot, byte) in buf.iter_mut().zip(self.inbound.drain(..n)) {
+            *slot = byte;
+        }
+        Ok(n)
+    }
+}
+
+impl Write for Pipe {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.outbound.extend_from_slice(buf);
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Where one framing state is.
+enum Phase {
+    /// An accepted connection waiting for (the rest of) the upgrade request.
+    Accepting(MidHandshake<ServerHandshake<Pipe, NoCallback>>),
+    /// A dialled connection waiting for (the rest of) the upgrade response, with the messages
+    /// written before it completes (each with its text flag) and the pieces of one not yet marked
+    /// complete.
+    Dialling {
+        mid: MidHandshake<ClientHandshake<Pipe>>,
+        held: Vec<(Vec<u8>, bool)>,
+        message: Vec<u8>,
+    },
+    /// The session: the protocol machine, the pieces of an outbound message not yet marked
+    /// complete, the fail-fast check of inbound text, and the failure that ended the inbound frames
+    /// (its close code), if the far side broke the protocol.
+    Open {
+        ws: Box<WebSocket<Pipe>>,
+        message: Vec<u8>,
+        scan: Scan,
+        failed: Option<CloseCode>,
+    },
+}
+
+impl Phase {
+    /// The session over `ws`, its outbound message starting as `message`.
+    fn open(ws: WebSocket<Pipe>, message: Vec<u8>) -> Self {
+        Phase::Open {
+            ws: Box::new(ws),
+            message,
+            scan: Scan::default(),
+            failed: None,
+        }
+    }
+}
+
+/// THE FAIL-FAST CHECK of inbound text (RFC 6455 §8.1): the frame headers of the inbound stream,
+/// read as the bytes arrive, and the payload of every frame of a text message unmasked and checked
+/// as UTF-8 then, rather than when the protocol machine completes the frame. It only reads: the
+/// machine still parses every byte, and anything the check cannot follow (a header the machine will
+/// refuse) stops the check, never the connection.
+#[derive(Default)]
+pub(crate) struct Scan {
+    /// The header bytes of the frame being read, until it is whole.
+    head: Vec<u8>,
+    /// Payload bytes of the current frame still to come.
+    left: u64,
+    /// The current frame's mask and how far into its payload the check is.
+    mask: Option<[u8; 4]>,
+    at: u64,
+    /// The current frame ends its message.
+    fin: bool,
+    /// The current frame's payload belongs to a text message.
+    text: bool,
+    /// A text message is open (its continuations are text).
+    in_text: bool,
+    /// The start of a code point the last bytes split (at most three bytes).
+    carry: Vec<u8>,
+    /// The check stopped: a header it cannot follow, or a failure already found.
+    stopped: bool,
+}
+
+impl Scan {
+    /// Read `bytes` off the inbound stream: `false` = a text payload is not UTF-8.
+    fn feed(&mut self, mut bytes: &[u8]) -> bool {
+        while !bytes.is_empty() && !self.stopped {
+            if self.left == 0 && !self.header(&mut bytes) {
+                return true;
+            }
+            let n = usize::try_from(self.left).map_or(bytes.len(), |l| l.min(bytes.len()));
+            let (chunk, rest) = bytes.split_at(n);
+            bytes = rest;
+            if self.text && !self.check(chunk) {
+                self.stopped = true;
+                return false;
+            }
+            self.at += n as u64;
+            self.left -= n as u64;
+            if self.left == 0 && !self.end_of_frame() {
+                self.stopped = true;
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Take header bytes off `bytes` until the header is whole: `false` = it is not yet (or the
+    /// check stopped).
+    fn header(&mut self, bytes: &mut &[u8]) -> bool {
+        loop {
+            let need = match self.head.len() {
+                0 | 1 => 2,
+                _ => {
+                    let len7 = self.head[1] & 0x7f;
+                    let ext = match len7 {
+                        126 => 2,
+                        127 => 8,
+                        _ => 0,
+                    };
+                    2 + ext + if self.head[1] & 0x80 != 0 { 4 } else { 0 }
+                }
+            };
+            if self.head.len() >= need && self.head.len() >= 2 {
+                break;
+            }
+            let Some((&b, rest)) = bytes.split_first() else {
+                return false;
+            };
+            self.head.push(b);
+            *bytes = rest;
+        }
+        let head = std::mem::take(&mut self.head);
+        let (b0, b1) = (head[0], head[1]);
+        let (len, at) = match b1 & 0x7f {
+            126 => (u64::from(u16::from_be_bytes([head[2], head[3]])), 4),
+            127 => {
+                let mut l = [0_u8; 8];
+                l.copy_from_slice(&head[2..10]);
+                (u64::from_be_bytes(l), 10)
+            }
+            l => (u64::from(l), 2),
+        };
+        self.mask = (b1 & 0x80 != 0).then(|| [head[at], head[at + 1], head[at + 2], head[at + 3]]);
+        self.at = 0;
+        self.left = len;
+        self.fin = b0 & 0x80 != 0;
+        let opcode = b0 & 0x0f;
+        self.text = match opcode {
+            // A continuation is text when it continues a text message.
+            0x0 => self.in_text,
+            0x1 => {
+                self.in_text = true;
+                self.carry.clear();
+                true
+            }
+            0x2 => {
+                self.in_text = false;
+                false
+            }
+            // A control frame interleaves; it neither opens nor closes a message.
+            0x8..=0xa => false,
+            // A reserved opcode: the machine refuses it; the check has nothing more to follow.
+            _ => {
+                self.stopped = true;
+                return false;
+            }
+        };
+        true
+    }
+
+    /// The current frame's payload is all read: a text message it ends must end on a whole code
+    /// point.
+    fn end_of_frame(&mut self) -> bool {
+        if self.text && self.fin {
+            self.in_text = false;
+            return std::mem::take(&mut self.carry).is_empty();
+        }
+        true
+    }
+
+    /// Check `chunk` (still masked) as the next text bytes: `false` = not UTF-8.
+    fn check(&mut self, chunk: &[u8]) -> bool {
+        let mut bytes = std::mem::take(&mut self.carry);
+        bytes.extend(chunk.iter().enumerate().map(|(k, b)| match self.mask {
+            Some(m) => b ^ m[((self.at + k as u64) % 4) as usize],
+            None => *b,
+        }));
+        match std::str::from_utf8(&bytes) {
+            Ok(_) => true,
+            // Cut short inside a code point: its start waits for the bytes that finish it.
+            Err(e) if e.error_len().is_none() => {
+                self.carry = bytes[e.valid_up_to()..].to_vec();
+                true
+            }
+            Err(_) => false,
+        }
+    }
+}
+
+impl Phase {
+    fn pipe(&mut self) -> &mut Pipe {
+        match self {
+            Phase::Accepting(mid) => mid.get_mut().get_mut(),
+            Phase::Dialling { mid, .. } => mid.get_mut().get_mut(),
+            Phase::Open { ws, .. } => ws.get_mut(),
+        }
+    }
+}
+
+/// The `ws` framer: its framing states, and the message ceiling every connection is built with.
+pub struct WsFramer {
+    states: Mutex<HashMap<u64, Phase>>,
+    next: AtomicU64,
+    max_message_bytes: usize,
+}
+
+impl std::fmt::Debug for WsFramer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WsFramer")
+            .field("max_message_bytes", &self.max_message_bytes)
+            .finish_non_exhaustive()
+    }
+}
 
 /// The RFC 6455 close code a [`CloseReason`] puts on the wire.
 ///
-/// `close` used to send a bare `Message::Close(None)` regardless of why: a peer that gets no code
-/// cannot tell an orderly shutdown from a policy revocation from a capacity limit, and one that
-/// gets 1009 (Message Too Big) can act on the specific cause — back off, split the payload, log it
-/// — where a bare close leaves it guessing. Every arm below is a code [`CloseCode::is_allowed`]
-/// accepts for sending: the reserved codes (1005 Status, 1006 Abnormal, 1015 Tls) describe a
-/// condition to a *local* API caller and must never appear in a frame an endpoint actually sends, so
-/// none of `busbar`'s own reasons are routed to them. Kept a distinct code per reason rather than
-/// folding several onto the closest match: a caller that later wants to distinguish, say, `Revoked`
-/// from `CapacityExhausted` on the wire should not find both already spent on the same number.
-fn close_code_for(reason: CloseReason) -> CloseCode {
+/// Every arm is a code [`CloseCode::is_allowed`] accepts for sending: the reserved codes (1005
+/// Status, 1006 Abnormal, 1015 Tls) describe a condition to a *local* API caller and never appear
+/// in a frame an endpoint sends. A distinct code per reason, so a peer can tell the causes apart.
+pub(crate) fn close_code_for(reason: CloseReason) -> CloseCode {
     match reason {
         // "An orderly close" is exactly what 1000 means.
         CloseReason::Normal => CloseCode::Normal,
-        // For an explicit `Transport::close(conn, PeerClosed)` call: THIS endpoint is closing
-        // `conn` because it learned, some way other than a Close frame arriving ON `conn` itself,
-        // that its counterpart is gone (e.g. a multiplexing layer tearing down a related
-        // connection). "Going away" is 1001's own definition.
-        //
-        // NOT the code for replying to a Close frame this transport reads directly off `conn`'s
-        // own wire — that reply is tungstenite's, not this function's: `frames()` below drives it
-        // out with a flush rather than building one, and it echoes the PEER's own code (1000 in
-        // the ordinary case), never a hardcoded 1001.
-        CloseReason::PeerClosed => CloseCode::Away,
-        // Node draining is a deliberate, orderly shutdown for maintenance/redeploy — "the server is
-        // restarting" is 1012's own definition, reconnect-elsewhere guidance included.
+        // THIS endpoint closing because its counterpart is gone. 1001 ("going away") is the code
+        // for THIS endpoint itself going away, which a peer leaving is not: the close is an
+        // orderly one, 1000. A close the peer started never reaches here: the machine answers the
+        // peer's Close frame itself, echoing the peer's own code (RFC 6455 §5.5.1).
+        CloseReason::PeerClosed => CloseCode::Normal,
+        // Node draining is a deliberate, orderly shutdown: "the server is restarting" is 1012's
+        // own definition, reconnect-elsewhere guidance included.
         CloseReason::Drain => CloseCode::Restart,
-        // A panic mid-codec is this endpoint's own unexpected condition, not the peer's fault or the
-        // wire's: 1011 is the generic internal-error code the RFC reserves for exactly that.
+        // A panic mid-codec is this endpoint's own unexpected condition: 1011.
         CloseReason::Poisoned => CloseCode::Error,
-        // Authority withdrawn is an access-control decision, and 1008 is the RFC's policy-violation
-        // code for a termination with no more specific status to give.
+        // Authority withdrawn is an access-control decision: 1008, policy violation.
         CloseReason::Revoked => CloseCode::Policy,
-        // No RFC 6455 code names "a deadline expired"; 1013 ("Try Again Later") is the closest
-        // registered meaning — it tells the peer the same thing a timeout implies, that a retry may
-        // succeed where this attempt did not.
+        // No code names "a deadline expired"; 1013 ("Try Again Later") is the closest meaning.
         CloseReason::Timeout => CloseCode::Again,
         // The transport layer failing is, from the wire's perspective, a protocol-level error.
         CloseReason::TransportFailed => CloseCode::Protocol,
-        // No RFC 6455 code names "a spend/budget cap was hit" either; 1009 (Message Too Big) is the
-        // closest registered meaning — a resource ceiling was exceeded — of the codes left unclaimed
-        // by every other reason above.
+        // A resource ceiling was exceeded: 1009 (Message Too Big) is the closest meaning left.
         CloseReason::CapacityExhausted => CloseCode::Size,
     }
 }
 
-/// How long the WebSocket opening handshake may take before this transport gives the socket up.
-///
-/// The handshake IS this connection's Unit 0 (`Unit0Trigger::Upgrade`), and until it completes the
-/// socket answers to nobody: no unit owns it, no admission decision has been made about it, and
-/// nothing else in the stack is watching it. An unbounded handshake therefore lets a peer that
-/// connects and then says nothing hold a slot — and the task upgrading it — for the lifetime of the
-/// process, which is the cheapest exhaustion there is. One round trip over a stream the layer below
-/// has already established is the whole of the work, so the budget is generous rather than tight
-/// and still bounds it.
-pub(crate) const HANDSHAKE_BUDGET: std::time::Duration = std::time::Duration::from_secs(10);
-
-/// How long the Pong answering a peer's Ping may take to reach that peer before this transport gives
-/// the session up.
-///
-/// The frame pump sends it while suspended in its own read, so unlike every other write in this
-/// crate there is no handle anywhere that could cancel it: a peer that pings and then stops reading
-/// would park the pump in the send for as long as it liked. Generous rather than tight — a peer
-/// whose receive window is briefly full is not a peer that has gone away — and still bounded.
-pub(crate) const PONG_BUDGET: std::time::Duration = std::time::Duration::from_secs(10);
-
-/// The configuration key naming the largest message this transport will accept.
-///
-/// It is the deployment's request-body cap, read through the same name the rest of the stack knows
-/// it by: a WebSocket message and an HTTP body are the same thing to an operator sizing a limit,
-/// and a `ws` listener that buffered more than the `http` one beside it would be a hole nobody
-/// declared. Absent, the library's own default stands.
-///
-/// Public because two sides read it and a literal spelled twice is a seam that drifts: this crate
-/// asks for it at `listen`, and the composition root answers it from the listener view it builds.
-pub const MESSAGE_MAX_BYTES_KEY: &str = "limits.request_body_max_bytes";
-
-/// Every string [`intern`] has made `'static`, each exactly once.
-static INTERNED: std::sync::LazyLock<SyncMutex<std::collections::HashSet<&'static str>>> =
-    std::sync::LazyLock::new(|| SyncMutex::new(std::collections::HashSet::new()));
-
-/// The `'static` view of a derived dial address, allocated at most once per distinct string, and
-/// only ever at registration ([`WsTransport::register_target`]) — never by `dial` (CG-06: a
-/// config-derived key is leaked exactly once, at the registration that reads it).
-///
-/// The sealed destination's address shape is already `'static`, but a `ws://` dial target is a URL:
-/// the `host:port` this transport hands the layer below is derived from it, and where the URL
-/// leaves the port implicit or brackets the host that string is not a slice of anything that
-/// already lives forever. Interning makes the registration of such a target leak-once, the same
-/// posture the boot-time lane names take, so a reload that registers it again reuses what the
-/// first registration allocated.
-pub(crate) fn intern(s: &str) -> &'static str {
-    let mut table = INTERNED.lock().expect("ws address intern table poisoned");
-    if let Some(already) = table.get(s) {
-        return already;
+/// The close code a read failure on a LIVE connection fails it with (RFC 6455 §7.4.1), or `None`
+/// when the connection itself is gone and there is no one to tell.
+fn failure_code(e: &WsError) -> Option<CloseCode> {
+    match e {
+        WsError::Protocol(ProtocolError::ResetWithoutClosingHandshake) => None,
+        WsError::Protocol(_) => Some(CloseCode::Protocol),
+        WsError::Utf8(_) => Some(CloseCode::Invalid),
+        WsError::Capacity(_) => Some(CloseCode::Size),
+        _ => None,
     }
-    let once: &'static str = Box::leak(s.to_string().into_boxed_str());
-    table.insert(once);
-    once
 }
 
-/// Whether `s` has been interned — the battery's view of what this process has leaked.
-#[cfg(test)]
-pub(crate) fn is_interned(s: &str) -> bool {
-    INTERNED
-        .lock()
-        .expect("ws address intern table poisoned")
-        .contains(s)
+/// What a failed read of the message stream means to the layer above: bytes that were not
+/// WebSocket are a framing failure, a finished closing handshake is the end, anything else is the
+/// connection going away underneath.
+fn read_error(e: &WsError) -> TransportError {
+    match e {
+        WsError::Protocol(_) | WsError::Capacity(_) | WsError::Utf8(_) => TransportError::Framing,
+        WsError::ConnectionClosed | WsError::AlreadyClosed => TransportError::Closed,
+        _ => TransportError::Reset,
+    }
 }
 
-/// The `host:port` a `ws://` URL spells, as a slice of the URL itself, when the URL spells exactly
-/// the authority `dial` hands the layer below: an explicit port and an unbracketed host. The URL a
-/// sealed destination carries is `'static` already (leaked once where it was registered), so this
-/// view costs nothing. `None` where the authority is derived rather than spelled — an implicit
-/// port, a bracketed host — which is the shape [`WsTransport::register_target`] interns.
-fn spelled_authority(url: &str) -> Option<&str> {
-    let (_, host, port, _) = split_ws_url(url).ok()?;
-    let rest = url
-        .strip_prefix("ws://")
-        .or_else(|| url.strip_prefix("wss://"))?;
-    let authority = rest.find('/').map_or(rest, |i| &rest[..i]);
-    let (h, p) = authority.rsplit_once(':')?;
-    (h == host && p == port.to_string()).then_some(authority)
+/// The upgrade request's own fields, which the handshake writes itself: an opening field of one of
+/// these names is not copied onto it.
+const HANDSHAKE_FIELDS: &[&str] = &[
+    "host",
+    "connection",
+    "upgrade",
+    "content-length",
+    "transfer-encoding",
+];
+
+/// Whether an opening field may ride the upgrade request.
+fn rides_upgrade(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    !HANDSHAKE_FIELDS.contains(&lower.as_str()) && !lower.starts_with("sec-websocket-")
 }
 
-type FrameStream =
-    std::pin::Pin<Box<dyn Stream<Item = Result<(StreamId, Frame), TransportError>> + Send>>;
+/// One message as the protocol machine sends it.
+fn message_of(bytes: Vec<u8>, text: bool) -> Result<Message, WsError> {
+    if text {
+        String::from_utf8(bytes)
+            .map(|t| Message::Text(t.into()))
+            .map_err(|_| WsError::Utf8(String::new()))
+    } else {
+        Ok(Message::Binary(bytes.into()))
+    }
+}
+
+/// Hand whatever the machine wrote to core.
+fn drain(phase: &mut Phase, out: &mut dyn FramerOut) {
+    #[cfg(feature = "test-seeded")]
+    let open = matches!(phase, Phase::Open { .. });
+    let pipe = phase.pipe();
+    if !pipe.outbound.is_empty() {
+        #[cfg(feature = "test-seeded")]
+        if open && pipe.client {
+            seeded::unmask(&mut pipe.outbound);
+        }
+        out.send(&std::mem::take(&mut pipe.outbound));
+    }
+}
+
+/// THE TEST HARNESS'S SEED (`test-seeded`, a dev-dependency feature the published conformance
+/// suite builds with; never in a shipped build, where the handshake key and every frame's mask stay
+/// random as RFC 6455 section 5.3 requires): a dial's handshake key is fixed, and a dialled end's
+/// frames carry the all-zero mask, so the bytes a scripted dial writes are the same every run.
+#[cfg(feature = "test-seeded")]
+mod seeded {
+    /// The handshake key a seeded dial sends (RFC 6455 section 1.3's own example).
+    pub(super) const KEY: &str = "dGhlIHNhbXBsZSBub25jZQ==";
+
+    /// Rewrite each whole client frame in `wire` to the all-zero mask, its payload unmasked.
+    pub(super) fn unmask(wire: &mut [u8]) {
+        let mut at = 0;
+        while at + 2 <= wire.len() {
+            let masked = wire[at + 1] & 0x80 != 0;
+            let (len, head) = match wire[at + 1] & 0x7f {
+                126 if at + 4 <= wire.len() => (
+                    usize::from(u16::from_be_bytes([wire[at + 2], wire[at + 3]])),
+                    4,
+                ),
+                127 if at + 10 <= wire.len() => {
+                    let mut l = [0_u8; 8];
+                    l.copy_from_slice(&wire[at + 2..at + 10]);
+                    (
+                        usize::try_from(u64::from_be_bytes(l)).unwrap_or(usize::MAX),
+                        10,
+                    )
+                }
+                l @ 0..=125 => (usize::from(l), 2),
+                _ => return,
+            };
+            let key_at = at + head;
+            let body = key_at + if masked { 4 } else { 0 };
+            if body.saturating_add(len) > wire.len() {
+                return;
+            }
+            if masked {
+                let mut key = [0_u8; 4];
+                key.copy_from_slice(&wire[key_at..body]);
+                for (k, b) in wire[body..body + len].iter_mut().enumerate() {
+                    *b ^= key[k % 4];
+                }
+                wire[key_at..body].fill(0);
+            }
+            at = body + len;
+        }
+    }
+}
+
+impl WsFramer {
+    /// A framer whose messages (and frames) are capped at `max_message_bytes`; `0` = the protocol
+    /// library's own default stands.
+    #[must_use]
+    pub fn new(max_message_bytes: usize) -> Self {
+        Self {
+            states: Mutex::new(HashMap::new()),
+            next: AtomicU64::new(1),
+            max_message_bytes,
+        }
+    }
+
+    /// The linked row's constructor: the deployment's body cap is the message ceiling, because a
+    /// message is assembled from frames before anything above the transport sees it.
+    #[must_use]
+    pub fn built(settings: &TransportSettings) -> Self {
+        Self::new(settings.request_body_max_bytes)
+    }
+
+    fn config(&self) -> Option<WebSocketConfig> {
+        (self.max_message_bytes > 0).then(|| {
+            WebSocketConfig::default()
+                .max_message_size(Some(self.max_message_bytes))
+                .max_frame_size(Some(self.max_message_bytes))
+        })
+    }
+
+    /// [`Framer::open`], a dialled connection's upgrade request carrying `fields` (the dial's
+    /// opening head fields, `BeginIn::fields`).
+    ///
+    /// # Errors
+    ///
+    /// The target is not a WebSocket URL, or a field is not a valid header.
+    pub fn open_with(
+        &self,
+        side: Side,
+        target: &str,
+        fields: &[(String, Vec<u8>)],
+        out: &mut dyn FramerOut,
+    ) -> Result<u64, TransportError> {
+        let phase = self.start(side, target, fields, out)?;
+        Ok(self.hold(phase))
+    }
+
+    /// [`Framer::emit`]: with `text` (the emit's `EMIT_TEXT`) the message goes out as a text
+    /// message, under the TEXT opcode, which promises UTF-8 (RFC 6455 §8.1): bytes that are not fail
+    /// the write rather than go out under a promise they break. On a dialled connection whose
+    /// handshake has not completed, the message is held and goes out the moment it does.
+    ///
+    /// # Errors
+    ///
+    /// The state is gone, a text message is not UTF-8, or the machine refused it.
+    pub fn emit_text(
+        &self,
+        state: u64,
+        bytes: &[u8],
+        end_of_frame: bool,
+        text: bool,
+        out: &mut dyn FramerOut,
+    ) -> Result<(), TransportError> {
+        {
+            let mut states = self.states.lock().expect("framing states poisoned");
+            if let Some(Phase::Dialling { held, message, .. }) = states.get_mut(&state) {
+                message.extend_from_slice(bytes);
+                if end_of_frame {
+                    held.push((std::mem::take(message), text));
+                }
+                return Ok(());
+            }
+        }
+        self.with_open(state, out, |ws, message| {
+            message.extend_from_slice(bytes);
+            if !end_of_frame {
+                return Ok(());
+            }
+            ws.send(message_of(std::mem::take(message), text)?)
+        })
+    }
+
+    fn hold(&self, phase: Phase) -> u64 {
+        let id = self.next.fetch_add(1, Ordering::Relaxed);
+        self.states
+            .lock()
+            .expect("framing states poisoned")
+            .insert(id, phase);
+        id
+    }
+
+    /// A new framing state for `side`, opening toward `target` when it dials.
+    fn start(
+        &self,
+        side: Side,
+        target: &str,
+        fields: &[(String, Vec<u8>)],
+        out: &mut dyn FramerOut,
+    ) -> Result<Phase, TransportError> {
+        let mut phase = match side {
+            Side::Accept => {
+                match tokio_tungstenite::tungstenite::accept_with_config(
+                    Pipe::default(),
+                    self.config(),
+                ) {
+                    Err(HandshakeError::Interrupted(mid)) => Phase::Accepting(mid),
+                    // Nothing has been read, so nothing can have completed or failed yet.
+                    Ok(_) | Err(HandshakeError::Failure(_)) => {
+                        return Err(TransportError::HandshakeFailed)
+                    }
+                }
+            }
+            Side::Dial => {
+                let (secure, host, port, path) = split_ws_url(target)?;
+                let url = format!(
+                    "{}://{host}:{port}{path}",
+                    if secure { "wss" } else { "ws" }
+                );
+                let mut request = url
+                    .as_str()
+                    .into_client_request()
+                    .map_err(|_| TransportError::AddressRefused)?;
+                for (name, value) in fields.iter().filter(|(n, _)| rides_upgrade(n)) {
+                    let (Ok(name), Ok(value)) = (
+                        HeaderName::from_bytes(name.as_bytes()),
+                        HeaderValue::from_bytes(value),
+                    ) else {
+                        return Err(TransportError::HandshakeFailed);
+                    };
+                    request.headers_mut().append(name, value);
+                }
+                #[cfg(feature = "test-seeded")]
+                request
+                    .headers_mut()
+                    .insert("sec-websocket-key", HeaderValue::from_static(seeded::KEY));
+                match tokio_tungstenite::tungstenite::client::client_with_config(
+                    request,
+                    Pipe {
+                        client: true,
+                        ..Pipe::default()
+                    },
+                    self.config(),
+                ) {
+                    Err(HandshakeError::Interrupted(mid)) => Phase::Dialling {
+                        mid,
+                        held: Vec::new(),
+                        message: Vec::new(),
+                    },
+                    Ok(_) | Err(HandshakeError::Failure(_)) => {
+                        return Err(TransportError::HandshakeFailed)
+                    }
+                }
+            }
+        };
+        drain(&mut phase, out);
+        Ok(phase)
+    }
+
+    /// Drive `phase` over what its pipe holds (`fresh` = the bytes this call ingested, for the
+    /// fail-fast check): finish the handshake if it can, then hand every message it completes up as
+    /// a frame. Answers whether the connection's frames ended.
+    fn drive(
+        phase: Phase,
+        fresh: &[u8],
+        out: &mut dyn FramerOut,
+    ) -> Result<(Phase, bool), TransportError> {
+        let shaking = !matches!(phase, Phase::Open { .. });
+        let mut phase = match phase {
+            Phase::Accepting(mid) => match mid.handshake() {
+                Ok(ws) => Phase::open(ws, Vec::new()),
+                Err(HandshakeError::Interrupted(mid)) => return Ok((Phase::Accepting(mid), false)),
+                Err(HandshakeError::Failure(_)) => return Err(TransportError::HandshakeFailed),
+            },
+            Phase::Dialling { mid, held, message } => match mid.handshake() {
+                Ok((mut ws, _response)) => {
+                    // What was written before the handshake completed goes out now, in order.
+                    for (bytes, text) in held {
+                        let m = message_of(bytes, text).map_err(|e| read_error(&e))?;
+                        ws.write(m).map_err(|e| read_error(&e))?;
+                    }
+                    Phase::open(ws, message)
+                }
+                Err(HandshakeError::Interrupted(mid)) => {
+                    return Ok((Phase::Dialling { mid, held, message }, false))
+                }
+                Err(HandshakeError::Failure(_)) => return Err(TransportError::HandshakeFailed),
+            },
+            open => open,
+        };
+        let Phase::Open {
+            ws, scan, failed, ..
+        } = &mut phase
+        else {
+            unreachable!("every other phase returned above");
+        };
+        if failed.is_some() {
+            // The frames ended at the failure: what still arrives is nobody's.
+            ws.get_mut().inbound.clear();
+            return Ok((phase, false));
+        }
+        // The check reads the stream from the first byte after the handshake's head.
+        let text_ok = if shaking {
+            let seen = std::mem::take(&mut ws.get_mut().seen);
+            let at = seen
+                .windows(4)
+                .position(|w| w == b"\r\n\r\n")
+                .map_or(seen.len(), |p| p + 4);
+            scan.feed(&seen[at..])
+        } else {
+            scan.feed(fresh)
+        };
+        let mut ended = false;
+        loop {
+            match ws.read() {
+                Ok(Message::Binary(b)) => out.frame(Framed::plain(StreamId(0), &b, true)),
+                Ok(Message::Text(t)) => {
+                    out.frame(Framed::plain(StreamId(0), t.as_bytes(), true).text(true));
+                }
+                // A ping's pong is queued by the machine and goes out with the next bytes; a pong and
+                // a raw frame carry nothing for the layer above.
+                Ok(Message::Ping(_) | Message::Pong(_) | Message::Frame(_)) => {}
+                // The peer closed: the machine queued the close answer (the peer's own code), and
+                // no frame follows.
+                Ok(Message::Close(_)) => {
+                    ended = true;
+                    break;
+                }
+                Err(WsError::Io(e)) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(WsError::ConnectionClosed | WsError::AlreadyClosed) => {
+                    ended = true;
+                    break;
+                }
+                Err(e) => match failure_code(&e) {
+                    // The far side broke the protocol on a live connection: the frames end here,
+                    // and the close (written when this end closes) carries the failure's code.
+                    Some(code) => {
+                        *failed = Some(code);
+                        break;
+                    }
+                    None => return Err(read_error(&e)),
+                },
+            }
+        }
+        // A text payload that is not UTF-8 fails the connection now, behind every message that
+        // completed before it.
+        if failed.is_none() && !text_ok {
+            *failed = Some(CloseCode::Invalid);
+        }
+        if failed.is_some() {
+            ws.get_mut().inbound.clear();
+            ended = true;
+        }
+        // Whatever the machine owes the far side (a pong, a close answer) goes out now.
+        match ws.flush() {
+            Ok(()) | Err(WsError::ConnectionClosed | WsError::AlreadyClosed) => {}
+            Err(WsError::Io(e)) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+            Err(e) => return Err(read_error(&e)),
+        }
+        let pipe = ws.get_mut();
+        ended |= pipe.ended && pipe.inbound.is_empty();
+        Ok((phase, ended))
+    }
+
+    /// Run `op` on the open state `state`, handing what it wrote to core.
+    fn with_open(
+        &self,
+        state: u64,
+        out: &mut dyn FramerOut,
+        op: impl FnOnce(&mut WebSocket<Pipe>, &mut Vec<u8>) -> Result<(), WsError>,
+    ) -> Result<(), TransportError> {
+        let mut states = self.states.lock().expect("framing states poisoned");
+        let phase = states.get_mut(&state).ok_or(TransportError::Closed)?;
+        let Phase::Open { ws, message, .. } = phase else {
+            return Err(TransportError::Closed);
+        };
+        let done = op(ws, message);
+        drain(phase, out);
+        done.map_err(|e| match e {
+            WsError::Capacity(_) | WsError::Utf8(_) => TransportError::Framing,
+            WsError::ConnectionClosed | WsError::AlreadyClosed => TransportError::Closed,
+            _ => TransportError::Reset,
+        })
+    }
+}
 
 /// One `ws://`/`wss://` URL, read into `(secure, host, port, path)`. Strict over the scheme, with
 /// the authority read by the contract's one URL reader ([`busbar_contract::net::parse_url`], WHATWG
@@ -184,892 +749,186 @@ pub(crate) fn split_ws_url(url: &str) -> Result<(bool, String, u16, String), Tra
     Ok((secure, parts.host, port, parts.path))
 }
 
-/// The WebSocket transport. In-tree, inside the trusted computing base — see the architecture
-/// doc's transport and transports-table sections.
-///
-/// It opens no socket of its own. Every byte reaches it through the layer it composes over: the
-/// lower transport binds, accepts and dials, and this one takes the stream that layer gives up and
-/// runs the WebSocket handshake on it. That is what makes the composed chain real rather than
-/// declared, and it is what puts the network guard and the frame-honesty
-/// tests in ONE place for the whole stack instead of one place per transport.
-pub struct WsTransport {
-    next_id: AtomicU64,
-    // `Arc`-wrapped so `frames()` — which only ever gets `&self`, not `Arc<Self>` — can clone a
-    // handle to the SAME registry into its (`'static`) pump future. That handle is what lets the
-    // pump deregister a connection when it finishes a peer-initiated close, which is what actually
-    // drops the socket: see the Close arm in `frames()`.
-    conns: Arc<SyncMutex<HashMap<u64, Arc<ConnState>>>>,
-    /// The largest message this transport will read. Zero means nothing was declared and the
-    /// library's default stands.
-    ///
-    /// One field, two routes in, because there are two lifecycles and each reaches only one of
-    /// them. A served instance learns the number at `listen`, from the configuration view it is
-    /// handed there — the seam a deployment's limits actually arrive through. A dial-only instance
-    /// is never bound and so never sees that view, and its composition root names the number at
-    /// construction instead. A `listen` on an instance that was constructed with one overrides it,
-    /// which is the right precedence: the view is the deployment speaking later and more locally.
-    max_message_bytes: std::sync::atomic::AtomicUsize,
-    /// The layer this one composes over. `None` for an instance used only through
-    /// [`WsTransport::adopt`] or the in-memory handshake seam, which are handed a stream directly.
-    lower: Option<Arc<dyn Transport>>,
-    /// The dial targets registered on this instance whose `host:port` is derived rather than
-    /// spelled, each mapped to its interned authority. `dial` reads this and never interns: a
-    /// target that is neither spelled nor registered is refused, not leaked (CG-06).
-    targets: SyncMutex<HashMap<String, &'static str>>,
-}
-
-impl Default for WsTransport {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl WsTransport {
-    /// A transport with no layer under it: it can adopt a stream a caller hands it, and nothing
-    /// else. `listen`, `accept` and `dial` all need a lower layer, because this one owns no socket.
-    #[must_use]
-    pub fn new() -> Self {
-        Self {
-            next_id: AtomicU64::new(1),
-            conns: Arc::new(SyncMutex::new(HashMap::new())),
-            max_message_bytes: std::sync::atomic::AtomicUsize::new(0),
-            lower: None,
-            targets: SyncMutex::new(HashMap::new()),
-        }
-    }
-
-    /// A transport composed over `lower` — the layer that binds, accepts and dials on its behalf.
-    ///
-    /// The design's own stack is `tcp → http → ws`, with core's connection security wrapped around
-    /// the carrier host-side: `http` is what an inbound upgrade arrives on, and `tcp` is what an
-    /// outbound one is dialled through. Which of them a given
-    /// instance stands on is the composition root's declaration, and the boot check is what holds
-    /// that declaration to the transports actually registered.
-    #[must_use]
-    pub fn over(lower: Arc<dyn Transport>) -> Self {
-        Self {
-            next_id: AtomicU64::new(1),
-            conns: Arc::new(SyncMutex::new(HashMap::new())),
-            max_message_bytes: std::sync::atomic::AtomicUsize::new(0),
-            lower: Some(lower),
-            targets: SyncMutex::new(HashMap::new()),
-        }
-    }
-
-    /// The same composition, with the message ceiling named at construction.
-    ///
-    /// [`Transport::listen`] is the seam a served instance learns the ceiling through, and it is
-    /// the right one: a listener is handed the deployment's configuration and reads it there. A
-    /// DIAL-ONLY instance never reaches that seam — nothing binds it, so nothing hands it a view —
-    /// and the composition root that built it is the only thing that holds the number. So the cap
-    /// arrives twice by two different routes for two different lifecycles, and both end at the same
-    /// field: this constructor seeds it, and a later `listen` on the same instance overrides it.
-    #[must_use]
-    pub fn over_with_max_message_bytes(lower: Arc<dyn Transport>, max: usize) -> Self {
-        let t = Self::over(lower);
-        t.max_message_bytes.store(max, Ordering::Relaxed);
-        t
-    }
-
-    /// Register a configured dial target: the one point at which this transport may allocate a
-    /// `'static` view of the address it derives from the URL (CG-06). A target whose URL spells its
-    /// `host:port` needs nothing and stores nothing; one whose port is implicit or whose host is
-    /// bracketed has its authority interned here, once per distinct string across every instance,
-    /// so a reload that registers it again allocates nothing new. `dial` only looks targets up.
-    ///
-    /// # Errors
-    ///
-    /// [`TransportError::AddressRefused`] for a target that is not a `ws://`/`wss://` URL.
-    pub fn register_target(&self, url: &str) -> Result<(), TransportError> {
-        let (_, host, port, _) = split_ws_url(url)?;
-        if spelled_authority(url).is_none() {
-            let authority = intern(&format!("{host}:{port}"));
-            self.targets
+impl WsFramer {
+    /// Whether the far side FAILED the connection in `state` (a protocol violation, text that is
+    /// not UTF-8, a message over the ceiling): its frames ended failed, not cleanly.
+    pub(crate) fn failed(&self, state: u64) -> bool {
+        matches!(
+            self.states
                 .lock()
-                .expect("ws target table poisoned")
-                .insert(url.to_string(), authority);
-        }
-        Ok(())
-    }
-
-    /// The authority `dial` hands the layer below for `url`: spelled in the URL, or registered.
-    pub(crate) fn dial_authority(&self, url: &'static str) -> Option<&'static str> {
-        spelled_authority(url).or_else(|| {
-            self.targets
-                .lock()
-                .expect("ws target table poisoned")
-                .get(url)
-                .copied()
-        })
-    }
-
-    fn lower(&self) -> Result<&Arc<dyn Transport>, TransportError> {
-        // A ws transport with nothing under it has no socket to reach for, and inventing one is the
-        // exact thing this composition exists to stop.
-        self.lower.as_ref().ok_or(TransportError::HandoffMismatch)
-    }
-
-    fn mint_id(&self) -> u64 {
-        self.next_id.fetch_add(1, Ordering::Relaxed)
-    }
-
-    fn insert(&self, id: u64, state: Arc<ConnState>) {
-        self.conns.lock().unwrap().insert(id, state);
-    }
-
-    pub(crate) fn state_of(&self, id: u64) -> Option<Arc<ConnState>> {
-        self.conns.lock().unwrap().get(&id).cloned()
-    }
-
-    /// Wrap an already-established, already-upgraded WS socket as a live connection. `Sock` is
-    /// generic over the boxed duplex, so the battery drives this over an in-memory pair through
-    /// the identical path a real TCP/TLS accept uses.
-    fn hold(
-        &self,
-        sock: crate::conn::Sock,
-        peer: &str,
-        chain: Vec<&'static str>,
-        lower: LowerFacts,
-    ) -> Conn {
-        let id = self.mint_id();
-        self.insert(id, ConnState::new(sock, chain, lower));
-        Conn::new(Arc::new(WsConnHandle {
-            id,
-            peer: peer.to_string(),
-        }))
-    }
-
-    /// Run the WebSocket handshake, in the given role, over a stream some layer already
-    /// established, and hold what comes out.
-    ///
-    /// This is the whole of what this transport does with a socket: it never opens one. An embedder
-    /// that already owns a duplex pair drives the identical path a composed accept or dial does.
-    ///
-    /// `url` is the target the client role names in its upgrade request; the server role ignores
-    /// it. It is the caller's, not a `ws://localhost/` this seam invents — an embedder driving a
-    /// real upstream would otherwise have had its request line rewritten to name a host it was
-    /// never talking to.
-    pub async fn handshake_over<S>(
-        &self,
-        stream: S,
-        is_server: bool,
-        url: &str,
-        peer: &str,
-    ) -> Result<Conn, TransportError>
-    where
-        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Unpin + 'static,
-    {
-        self.handshake(
-            Box::new(stream),
-            is_server,
-            url,
-            peer,
-            vec!["ws"],
-            LowerFacts::default(),
+                .expect("framing states poisoned")
+                .get(&state),
+            Some(Phase::Open {
+                failed: Some(_),
+                ..
+            })
         )
-        .await
-    }
-
-    /// The WebSocket settings every connection this transport makes is built with.
-    ///
-    /// The only one it sets is the message ceiling, and it sets it only when the deployment named
-    /// one: the alternative was tungstenite's 64 MiB default, which is a number this project never
-    /// chose and four orders of magnitude above a typical body cap. Both the message and the frame
-    /// ceiling are set, because a message ceiling alone still lets a single oversized frame be
-    /// buffered before the message is refused.
-    fn ws_config(&self) -> Option<tokio_tungstenite::tungstenite::protocol::WebSocketConfig> {
-        let cap = self.max_message_bytes.load(Ordering::Relaxed);
-        (cap > 0).then(|| {
-            tokio_tungstenite::tungstenite::protocol::WebSocketConfig::default()
-                .max_message_size(Some(cap))
-                .max_frame_size(Some(cap))
-        })
-    }
-
-    /// The one place a WebSocket connection is made, whichever direction it came from.
-    async fn handshake(
-        &self,
-        stream: Box<dyn LowerIo>,
-        is_server: bool,
-        url: &str,
-        peer: &str,
-        chain: Vec<&'static str>,
-        lower: LowerFacts,
-    ) -> Result<Conn, TransportError> {
-        // Both roles are bounded by the same budget: a peer that never answers is the same
-        // unbounded wait whichever side opened the stream.
-        let ws_cfg = self.ws_config();
-        let upgraded = tokio::time::timeout(HANDSHAKE_BUDGET, async {
-            let sock: Sock = if is_server {
-                tokio_tungstenite::accept_async_with_config(stream, ws_cfg)
-                    .await
-                    .map_err(|_| TransportError::HandshakeFailed)?
-            } else {
-                let (sock, _resp) =
-                    tokio_tungstenite::client_async_with_config(url, stream, ws_cfg)
-                        .await
-                        .map_err(|_| TransportError::HandshakeFailed)?;
-                sock
-            };
-            Ok::<Sock, TransportError>(sock)
-        })
-        .await;
-        let sock = match upgraded {
-            Ok(result) => result?,
-            Err(_) => return Err(TransportError::Timeout),
-        };
-        Ok(self.hold(sock, peer, chain, lower))
     }
 }
 
-impl Transport for WsTransport {
-    /// What this connection arrived on, which is what the layers below it established plus the
-    /// upgrade this one ran.
-    ///
-    /// The upgrade replaces the layer the record describes; it does not undo the handshake beneath
-    /// it. This transport declares Sni, Alpn and Port among its selector forms, and the only place
-    /// those facts ever existed is the record the lower layer reported before it gave the stream
-    /// up — answering zero and `None` made every location resolving on them unresolvable against a
-    /// connection that really did have a port, a name and a negotiated protocol.
-    fn arrival(&self, conn: &Conn) -> ArrivalRecord {
-        let state = self.state_of(conn.id());
-        let lower = state.as_ref().map(|s| &s.lower);
-        ArrivalRecord {
-            source: conn.peer(),
-            port: lower.map_or(0, |l| l.port),
-            alpn: lower.and_then(|l| l.alpn.clone()),
-            sni: lower.and_then(|l| l.sni.clone()),
-            peer_cert: lower.and_then(|l| l.peer_cert.clone()),
-            // The chain the layer below reported, plus this one. An adopted connection knows
-            // what it was handed; one this transport opened itself knows what it opened.
-            transport_chain: state.map_or_else(|| vec!["ws"], |s| s.chain.clone()),
+impl Default for WsFramer {
+    fn default() -> Self {
+        Self::new(0)
+    }
+}
+
+impl Plugin for WsFramer {
+    fn key(&self) -> &'static str {
+        crate::linked::KEY
+    }
+    fn kind(&self) -> Kind {
+        Kind::Transport
+    }
+    fn abi(&self) -> AbiVersion {
+        busbar_contract::transport::TRANSPORT_ABI
+    }
+}
+
+impl Framer for WsFramer {
+    /// A `ws://` target is reached at its `host:port`; a `wss://` one asks for its bytes to be
+    /// secured before they leave, and names the host its certificate is checked against.
+    fn locate(&self, target: &str) -> Result<Located, TransportError> {
+        let (secure, host, port, _path) = split_ws_url(target)?;
+        Ok(Located {
+            authority: format!("{host}:{port}"),
+            secure,
+            server_name: secure.then_some(host),
+        })
+    }
+
+    fn open(
+        &self,
+        side: Side,
+        target: &str,
+        _facts: &ConnFacts,
+        out: &mut dyn FramerOut,
+    ) -> Result<u64, TransportError> {
+        self.open_with(side, target, &[], out)
+    }
+
+    fn ingest(
+        &self,
+        state: u64,
+        bytes: &[u8],
+        end: bool,
+        out: &mut dyn FramerOut,
+    ) -> Result<(), TransportError> {
+        let mut states = self.states.lock().expect("framing states poisoned");
+        let mut phase = states.remove(&state).ok_or(TransportError::Closed)?;
+        let shaking = !matches!(phase, Phase::Open { .. });
+        let pipe = phase.pipe();
+        pipe.inbound.extend(bytes);
+        pipe.ended |= end;
+        if shaking {
+            pipe.seen.extend_from_slice(bytes);
+        }
+        match Self::drive(phase, bytes, out) {
+            Ok((mut phase, ended)) => {
+                drain(&mut phase, out);
+                if ended {
+                    out.end();
+                }
+                states.insert(state, phase);
+                Ok(())
+            }
+            // A failed state is gone: its connection has nothing more to say.
+            Err(e) => Err(e),
         }
     }
 
-    /// The listener is the layer below's. This transport binds nothing.
-    fn listen<'a>(
-        &'a self,
-        cfg: &'a dyn TransportConfigView,
-        keys: &'a TransportKeyHandle,
-    ) -> Fut<'a, Listener> {
-        Box::pin(async move {
-            // `listen` is the one call that carries the deployment's configuration into this
-            // transport, so it is where the message cap is read. A dial made from the same instance
-            // reads the same number, which is the intent: the cap is the node's, not the listener's.
-            if let Some(cap) = cfg.get_int(MESSAGE_MAX_BYTES_KEY) {
-                if let Ok(cap) = usize::try_from(cap) {
-                    self.max_message_bytes.store(cap, Ordering::Relaxed);
-                }
-            }
-            self.lower()?.listen(cfg, keys).await
-        })
-    }
-
-    /// Take the next connection off the layer below, then upgrade it — which is
-    /// `Unit0Trigger::Upgrade`: the session opens at the handshake, and the handshake runs on the
-    /// stream that layer gives up.
-    fn accept<'a>(&'a self, l: &'a Listener) -> Fut<'a, Conn> {
-        Box::pin(async move {
-            let lower = self.lower()?;
-            let conn = lower.accept(l).await?;
-            self.adopt(lower.as_ref(), conn, &NO_KEYS).await
-        })
-    }
-
-    fn dial<'a>(
-        &'a self,
-        dest: &'a VerifiedDestination,
-        keys: &'a TransportKeyHandle,
-    ) -> Fut<'a, Conn> {
-        Box::pin(async move {
-            let DestinationFacts::Upstream { address, .. } = dest.facts() else {
-                return Err(TransportError::AddressRefused);
-            };
-            let url = address.authority().ok_or(TransportError::AddressRefused)?;
-            let (secure, host_name, port, path) = split_ws_url(url)?;
-
-            // The socket is the layer below's, dialled against the address this destination already
-            // carries — no name is resolved here, which is what puts the network guard in front of
-            // the dial instead of inside it. Re-addressing narrows the sealed destination to what
-            // that layer reads; it does not re-seal it, and it cannot widen where the unit may go.
-            let lower = self.lower()?;
-            // A `wss://` target says the bytes are encrypted before they leave this process, and
-            // this transport encrypts nothing of its own: it upgrades whatever stream the layer
-            // below gives up, and no transport below it encrypts either — TLS is core's connection
-            // security, never a transport layer. Over a cleartext layer the
-            // handshake would go out as a plain GET with no certificate ever validated — a
-            // downgrade the destination never asked for. The dial is refused before a socket is
-            // opened, which is the only answer that does not put cleartext on a wire the caller
-            // was told was secure. Wrapping the stream here instead is the wrong seam: the trust
-            // roots a node accepts upstream are the deployment's statement, held host-side, not a
-            // root store this crate would invent per dial.
-            if secure {
-                return Err(TransportError::AddressRefused);
-            }
-            // The authority was made `'static` where the target was registered, or is a slice of the
-            // URL the destination already carries; `dial` allocates nothing that outlives it (CG-06).
-            let authority = self
-                .dial_authority(url)
-                .ok_or(TransportError::AddressRefused)?;
-            let beneath = dest
-                .beneath(
-                    lower.key(),
-                    busbar_contract::transport::dest::UpstreamAddress::Socket {
-                        authority,
-                        sni: address.sni(),
-                        extras: &[],
-                    },
-                )
-                .ok_or(TransportError::AddressRefused)?;
-            let conn = lower.dial(&beneath, keys).await?;
-            // The whole record, not only the chain: the layer below is about to give the stream
-            // up and will never be able to answer for this connection again.
-            let below = lower.arrival(&conn);
-            let facts = LowerFacts::of(&below);
-            let mut chain = below.transport_chain;
-            let raw = lower.detach(&conn).ok_or(TransportError::HandoffMismatch)?;
-            chain.push(<crate::WsFramer as TransportMeta>::KEY);
-
-            let request_url = format!(
-                "{}://{host_name}:{port}{path}",
-                if secure { "wss" } else { "ws" }
-            );
-            let stream = tokio_util::compat::FuturesAsyncReadCompatExt::compat(raw.into_io());
-            self.handshake(
-                Box::new(stream),
-                false,
-                &request_url,
-                authority,
-                chain,
-                facts,
-            )
-            .await
-        })
-    }
-
-    fn frames(&self, conn: Conn) -> FrameStream {
-        let id = conn.id();
-        let Some(state) = self.state_of(id) else {
-            return Box::pin(futures::stream::once(async {
-                Err::<(StreamId, Frame), TransportError>(TransportError::Closed)
-            }));
-        };
-        let conns = self.conns.clone();
-        Box::pin(futures::stream::unfold(
-            (state, false),
-            move |(state, done)| {
-                let conns = conns.clone();
-                async move {
-                    if done || state.is_poisoned() || state.is_closed() {
-                        return None;
-                    }
-                    let mut slot = state.reader.lock().await;
-                    let Some(taken) = slot.take() else {
-                        drop(slot);
-                        // The reader is gone. A connection that was closed or fenced put it back before
-                        // this poll and is a clean end — the checks above already caught those, but the
-                        // window between them and this lock is a real one, so re-read the fences here and
-                        // end quietly if either fired. What is left is the reader being HELD by another
-                        // live `frames()` stream on a clone of this `Conn`: a WebSocket carries one
-                        // message stream and it has exactly one reader, so a second consumer cannot get
-                        // frames. Returning `None` here would report it as a peer that cleanly closed —
-                        // indistinguishable from a real close, and a silent lie about a session that is
-                        // still running for the first consumer. It is a caller-side contract violation,
-                        // and the honest answer is to say so loudly rather than fake an end of stream.
-                        if state.is_poisoned() || state.is_closed() {
-                            return None;
-                        }
-                        panic!(
-                        "busbar-transport-ws: frames() called concurrently on the same connection; \
-                         a WebSocket carries one message stream with one reader and admits exactly \
-                         one consumer — the second silently terminating as a clean close would be a \
-                         session cut nothing could see"
-                    );
-                    };
-                    drop(slot);
-                    // The reader belongs to the connection, not to this future. Holding it in a guard
-                    // is what makes a cancelled read the same non-event a cancelled poll of any other
-                    // stream is: the guard's `Drop` runs whether this future completes or is dropped
-                    // mid-read, so the next pump reads on rather than seeing a reader-shaped hole it
-                    // would report as a clean end of session.
-                    let mut held = ReaderGuard {
-                        state: state.clone(),
-                        reader: Some(taken),
-                    };
-                    let reader = held.reader.as_mut().expect("held for the guard's lifetime");
-                    // Set only by THIS iteration's own violation handling below, never by a
-                    // `close()` racing in from elsewhere: the late-close check just past the loop
-                    // exists for that external race ("a frame that arrived afterwards belongs to a
-                    // session already told closed") and must keep discarding for it. But `closed`
-                    // is the one fence both that race and a violation THIS pump just answered set,
-                    // so without a separate flag the check could not tell "an external close beat
-                    // me to it" from "I am the reason `closed` just became true" -- and would
-                    // discard the very violation error this arm exists to report, turning a real
-                    // protocol failure into a silent, indistinguishable clean end of session.
-                    let mut closed_by_this_violation = false;
-                    let item = loop {
-                        match reader.next().await {
-                            None => break None, // the peer closed the socket
-                            Some(Ok(Message::Binary(b))) => {
-                                // One copy, straight into the slab: `to_vec` then `Arc::from` copied the payload
-                                // twice, on the hot path, for every inbound message.
-                                let bytes = SlabBytes::new(Arc::<[u8]>::from(&b[..]));
-                                let meta = FrameMeta {
-                                    bytes: bytes.len() as u64,
-                                    transport_units: None,
-                                    status: None,
-                                    status_code: None,
-                                    retry_after_secs: None,
-                                };
-                                break Some(Ok((
-                                    StreamId(0),
-                                    Frame {
-                                        direction: Direction::Inbound,
-                                        stream: StreamId(0),
-                                        bytes,
-                                        meta,
-                                    },
-                                )));
-                            }
-                            Some(Ok(Message::Text(t))) => {
-                                let bytes = SlabBytes::new(Arc::<[u8]>::from(t.as_bytes()));
-                                let meta = FrameMeta {
-                                    bytes: bytes.len() as u64,
-                                    transport_units: None,
-                                    status: None,
-                                    status_code: None,
-                                    retry_after_secs: None,
-                                };
-                                break Some(Ok((
-                                    StreamId(0),
-                                    Frame {
-                                        direction: Direction::Inbound,
-                                        stream: StreamId(0),
-                                        bytes,
-                                        meta,
-                                    },
-                                )));
-                            }
-                            // RFC 6455 §5.5.1/§7.1.5: an endpoint that receives a Close frame and has
-                            // not already sent one MUST send a Close frame in response before the
-                            // underlying connection ends. NO REPLY IS BUILT HERE: tungstenite parses
-                            // the incoming Close and already QUEUES the reply the moment `reader.next()`
-                            // (above) returns it -- echoing the peer's own code and reason, as RFC 6455 §5.5.1
-                            // recommends -- the prebuilt library owns that decision, not this crate. Its
-                            // own docs are explicit that the queued reply needs a caller to keep driving
-                            // read/write/flush to actually reach the wire (tungstenite
-                            // `protocol/mod.rs`: "You should continue calling read, write or flush to
-                            // drive the reply to the close frame... until Error::ConnectionClosed").
-                            // This pump was doing none of those after a Close, so the queued reply sat
-                            // in the write buffer forever and every peer-initiated close timed out
-                            // waiting for one — on every single connection this transport ever served.
-                            // The fix is the flush the docs ask for, budget-bound like every other
-                            // write this pump answers unprompted.
-                            //
-                            // `closed` is the SAME fence `close()` sets, tested and set here with one
-                            // atomic op: whichever of the two call sites gets there first drives the
-                            // reply out, and the other finds it already sent and stays quiet -- a
-                            // concurrent explicit `close()` and a peer-initiated close racing here can
-                            // otherwise both try to write, which is a second frame after a close no peer
-                            // is still parsing.
-                            //
-                            // DEREGISTERING is not optional either. Flushing the reply satisfies the
-                            // *frame* layer, but RFC 6455 §7.1.1 also puts the underlying connection's
-                            // teardown on this (server) side, and a peer's WebSocket library — the far
-                            // side's own stack, browsers, every one Autobahn drives — waits for the
-                            // SOCKET to end, not merely for the reply frame, before it calls the
-                            // handshake closed. `self.conns` is the only other owner of this
-                            // connection's `Arc<ConnState>` ("the fence goes up before anything is
-                            // spawned" doc on `close()`, above); removing this id from it drops the
-                            // last reference once this pump's own local `state` clone goes out of
-                            // scope, which drops `reader`/`writer` and, with them, the socket — the end
-                            // the peer is waiting for. Left registered, the reply frame answers the
-                            // frame-level handshake and the connection leaks for the rest of the
-                            // process, which every peer sees as a hang, not a close.
-                            Some(Ok(Message::Close(_))) => {
-                                if state
-                                    .closed
-                                    .compare_exchange(
-                                        false,
-                                        true,
-                                        Ordering::AcqRel,
-                                        Ordering::Acquire,
-                                    )
-                                    .is_ok()
-                                {
-                                    let _ = tokio::time::timeout(CLOSE_BUDGET, async {
-                                        let mut w = state.writer.lock().await;
-                                        futures::SinkExt::flush(&mut *w).await
-                                    })
-                                    .await;
-                                    conns.lock().unwrap().remove(&id);
-                                }
-                                break None;
-                            }
-                            // Ping/Pong carry no plane data; tungstenite does not auto-answer a Ping
-                            // on a raw split stream, so this transport answers it itself and keeps
-                            // reading — a protocol-blind, byte-level obligation, not plane meaning.
-                            //
-                            // The answer is still a write, and it is the one write in this crate that
-                            // nothing above it can cancel: the pump is suspended INSIDE it, so a peer
-                            // that pings and then stops reading parks the pump in the send forever,
-                            // holds the connection state the pump carries, and keeps the socket alive
-                            // for the life of the process. The budget is what ends that, and a failure
-                            // is reported rather than swallowed — the layer above is otherwise told the
-                            // session is healthy by a pump that will never yield another frame. The
-                            // fence goes with it, because a send abandoned at the budget is a send
-                            // interrupted mid-frame, which is what every other write here fences for.
-                            Some(Ok(Message::Ping(payload))) => {
-                                let answered = tokio::time::timeout(PONG_BUDGET, async {
-                                    let mut w = state.writer.lock().await;
-                                    futures::SinkExt::send(&mut *w, Message::Pong(payload)).await
-                                })
-                                .await;
-                                match answered {
-                                    Ok(Ok(())) => continue,
-                                    Ok(Err(e)) => break Some(Err(read_error(&e))),
-                                    Err(_) => {
-                                        state.poisoned.store(true, Ordering::Release);
-                                        break Some(Err(TransportError::Backpressure));
-                                    }
-                                }
-                            }
-                            Some(Ok(Message::Pong(_))) | Some(Ok(Message::Frame(_))) => continue,
-                            // RFC 6455 §7.1.7 "Fail the WebSocket Connection": a locally-detected
-                            // protocol violation (a reserved opcode, a message over the cap, a text
-                            // frame that is not UTF-8) obliges this endpoint to fail the connection,
-                            // and SHOULD send a Close frame naming why first. UNLIKE the peer-Close
-                            // arm above, tungstenite queues nothing here on its own -- there is no
-                            // peer code to echo, because the peer never sent a valid Close; the code
-                            // is this endpoint's OWN finding, so it is built from the same
-                            // reason→code table `close()` already uses (not new protocol logic, the
-                            // crate's one existing table), picking `CapacityExhausted` for a message
-                            // over the cap and `TransportFailed` (Protocol, 1002) for everything
-                            // else `read_error` calls `Framing`. Best-effort and budget-bound, same
-                            // as every other write this pump answers unprompted -- and the SAME
-                            // deregister the peer-Close arm does, for the SAME reason: without it the
-                            // socket leaks past this failed session for the rest of the process.
-                            Some(Err(e)) => {
-                                let terr = read_error(&e);
-                                if terr == TransportError::Framing
-                                    && state
-                                        .closed
-                                        .compare_exchange(
-                                            false,
-                                            true,
-                                            Ordering::AcqRel,
-                                            Ordering::Acquire,
-                                        )
-                                        .is_ok()
-                                {
-                                    closed_by_this_violation = true;
-                                    let reason = if matches!(
-                                        e,
-                                        tokio_tungstenite::tungstenite::Error::Capacity(_)
-                                    ) {
-                                        CloseReason::CapacityExhausted
-                                    } else {
-                                        CloseReason::TransportFailed
-                                    };
-                                    let close_frame = CloseFrame {
-                                        code: close_code_for(reason),
-                                        reason: "".into(),
-                                    };
-                                    let _ = tokio::time::timeout(CLOSE_BUDGET, async {
-                                        let mut w = state.writer.lock().await;
-                                        futures::SinkExt::send(
-                                            &mut *w,
-                                            Message::Close(Some(close_frame)),
-                                        )
-                                        .await
-                                    })
-                                    .await;
-                                    conns.lock().unwrap().remove(&id);
-                                }
-                                break Some(Err(terr));
-                            }
-                        }
-                    };
-                    drop(held);
-                    // Checked again on the way out, not only on the way in: this pump was already
-                    // suspended in the read when the close was decided, and a frame that arrived
-                    // afterwards belongs to a session the layer above has been told is over. NOT
-                    // when THIS iteration is the one that just closed it (a violation answered
-                    // above) — that item is the whole reason this pump has anything to report.
-                    if state.is_closed() && !closed_by_this_violation {
-                        return None;
-                    }
-                    match item {
-                        None => None,
-                        Some(result) => {
-                            let done_next = result.is_err();
-                            Some((result, (state, done_next)))
-                        }
-                    }
-                }
-            },
-        ))
-    }
-
-    fn write<'a>(
-        &'a self,
-        conn: &'a Conn,
+    fn emit(
+        &self,
+        state: u64,
         _stream: StreamId,
-        bytes: ScratchBytes<'a>,
-    ) -> Fut<'a, usize> {
-        let id = conn.id();
-        Box::pin(async move {
-            let Some(state) = self.state_of(id) else {
-                return Err(TransportError::Closed);
-            };
-            if state.is_poisoned() {
-                return Err(TransportError::Framing);
-            }
-            // ONE copy, and it is the floor. `bytes` is an `ScratchBytes<'a>` — a borrow into the
-            // caller's arena, which owns the storage and outlives nothing here — and tungstenite's
-            // `Message::Binary` takes owned `Bytes` it holds until the frame is flushed. `Vec ->
-            // Bytes` is itself zero-copy (the allocation is reused), so this `to_vec` is the single
-            // unavoidable copy. Removing it would mean handing the sink an `Arc`-backed `Bytes` that
-            // shares the payload's storage, which the borrowed `ScratchBytes` cannot supply without
-            // widening `Transport::write`'s ABI to pass owned/shared bytes — a change to the one
-            // contract every transport implements, out of proportion to one memcpy. Left as is.
-            let payload = bytes.as_slice().to_vec();
-            let n = payload.len();
-            // The lock first, the fence second. A write dropped while still QUEUED on the writer
-            // put no bytes on the socket, so there is no half-written frame to fence — arming
-            // before the lock condemned a healthy connection permanently on nothing but
-            // contention. From here on the send is the only thing that can be interrupted, which
-            // is exactly what the fence is for.
-            let mut w = state.writer.lock().await;
-            let mut guard = PoisonGuard {
-                state: &state,
-                armed: true,
-            };
-            futures::SinkExt::send(&mut *w, Message::Binary(payload.into()))
-                .await
-                .map_err(|_| TransportError::Reset)?;
-            drop(w);
-            guard.armed = false;
-            Ok(n)
-        })
+        bytes: &[u8],
+        end_of_frame: bool,
+        text: bool,
+        out: &mut dyn FramerOut,
+    ) -> Result<(), TransportError> {
+        self.emit_text(state, bytes, end_of_frame, text, out)
     }
 
-    /// A WebSocket message is its payload. The envelope's fields belonged to the HTTP request that
-    /// carried the upgrade, and that request is long over by the time a message is written.
-    fn encode_envelope<'a>(
+    /// A WebSocket message is its payload: the envelope belonged to the upgrade request, which is
+    /// long over by the time a message is written.
+    fn encode_envelope(
         &self,
         _fields: &[(&str, &[u8])],
         body: &[u8],
-        arena: &'a dyn busbar_contract::PlaneAlloc,
-    ) -> Result<ScratchBytes<'a>, busbar_contract::transport::wire::Encode> {
-        arena
-            .alloc_bytes(body)
-            .map_err(|_| busbar_contract::transport::wire::Encode::ScratchExhausted)
+        out: &mut dyn BytesOut,
+    ) -> Result<(), Encode> {
+        out.put(body);
+        Ok(())
     }
 
-    /// The `http` → `ws` upgrade, from the side that owns what comes out.
-    ///
-    /// `http` gives up the accepted socket without having read the upgrade request, because the
-    /// layer that speaks the upgrade is the one that answers it: this transport runs the handshake
-    /// itself and the 101 goes back over the same stream. The composed chain travels with the
-    /// handoff, so the connection reports `tcp → http → ws` rather than naming only itself.
-    fn adopt<'a>(
-        &'a self,
-        from: &'a dyn Transport,
-        conn: Conn,
-        _keys: &'a TransportKeyHandle,
-    ) -> Fut<'a, Conn> {
-        Box::pin(async move {
-            if !<crate::WsFramer as TransportMeta>::COMPOSES_OVER.contains(&from.key()) {
-                return Err(TransportError::HandoffMismatch);
-            }
-            // Read before the detach, for the same reason: after it, `from` knows nothing about
-            // this connection, and the port, name, protocol and certificate it established are
-            // facts about the connection rather than about the layer that observed them.
-            let below = from.arrival(&conn);
-            let facts = LowerFacts::of(&below);
-            let mut chain = below.transport_chain;
-            let raw = from.detach(&conn).ok_or(TransportError::HandoffMismatch)?;
-            chain.push(<crate::WsFramer as TransportMeta>::KEY);
-            let peer = raw.peer().to_string();
-            let stream = tokio_util::compat::FuturesAsyncReadCompatExt::compat(raw.into_io());
-            self.handshake(Box::new(stream), true, "", &peer, chain, facts)
-                .await
-        })
-    }
-
-    fn detach(&self, conn: &Conn) -> Option<busbar_contract::transport::wire::RawStream> {
-        // Nothing upgrades in-band over `ws` (`UPGRADES_TO` is empty), so there is no raw stream
-        // this layer ever hands up.
-        let _ = conn;
-        None
-    }
-
-    fn composed_over(&self) -> Option<&'static str> {
-        self.lower.as_ref().map(|l| l.key())
-    }
-
-    fn close(&self, conn: Conn, reason: CloseReason) {
-        let id = conn.id();
-        if let Some(state) = self.conns.lock().unwrap().remove(&id) {
-            // The fence goes up before anything is spawned, and before the courtesy frame goes
-            // out: leaving the registry is invisible to a pump that already holds this state, and
-            // a frame delivered after the close is one nothing upstream still owns.
-            //
-            // TESTED, not just set: the frame pump (`frames()`, above) answers a peer-initiated
-            // Close through this SAME fence, so a caller that closes a connection just as the peer
-            // is closing it can race the pump here. `compare_exchange` makes only the winner send
-            // the courtesy frame; the loser finds it already sent and skips a second one a peer
-            // that already got its close reply is no longer parsing.
-            if state
-                .closed
-                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-                .is_err()
-            {
-                return;
-            }
-            // The code this peer is told, not a bare close: a peer that gets 1009 can act on the
-            // specific cause where a bare close leaves it guessing.
-            let close_frame = CloseFrame {
-                code: close_code_for(reason),
-                reason: "".into(),
-            };
-            // The Close frame is a courtesy, and the connection is already finalised: the state has
-            // left the registry, so nothing can cancel the task that sends it. It therefore cancels
-            // itself. A peer whose receive window is full never accepts the frame, and without this
-            // budget the task, the writer lock and the socket would outlive the connection.
-            tokio::spawn(async move {
-                let _ = tokio::time::timeout(CLOSE_BUDGET, async {
-                    let mut w = state.writer.lock().await;
-                    let _ =
-                        futures::SinkExt::send(&mut *w, Message::Close(Some(close_frame))).await;
-                })
-                .await;
-            });
-        }
-    }
-
-    fn unit0_refusal<'a>(
-        &'a self,
-        conn: Conn,
-        // A WebSocket connection carries one message stream; refusing it refuses all of it.
+    /// A WebSocket connection carries one message stream: the refusal is one message, and the
+    /// connection closes after it, with the orderly code.
+    fn refusal(
+        &self,
+        state: u64,
         _stream: Option<StreamId>,
-        _refusal: &'a Refusal,
-        bytes: ScratchBytes<'a>,
-    ) -> Fut<'a, ()> {
-        Box::pin(async move {
-            let id = conn.id();
-            // The refusal is the only answer the far side will ever get about these bytes, so a
-            // send that did not happen is reported rather than swallowed. A connection this
-            // transport no longer holds, or one already fenced, cannot carry one at all — both are
-            // `Closed`, because the session is over either way and the caller's next move is the
-            // same. A send that reached the socket and failed is a `Reset`: the connection was
-            // live and the peer is what went away.
-            let outcome = match self.state_of(id) {
-                None => Err(TransportError::Closed),
-                Some(state) if state.is_poisoned() => Err(TransportError::Closed),
-                Some(state) => {
-                    let payload = bytes.as_slice().to_vec();
-                    // The lock first, the fence second — the identical discipline `write` and the
-                    // Ping-answer path hold, and for the identical reason: a send interrupted
-                    // mid-frame (this future dropped, or the send erroring) has put a partial WS
-                    // frame on the wire, and a later write that resumed on that socket would splice
-                    // its bytes onto the tail of a torn one. Arming only after the lock is held keeps
-                    // a send still QUEUED on the writer — which put no bytes out — from condemning a
-                    // healthy connection. The refusal finalises the connection right below, but the
-                    // fence is what makes the send honest in the window a cancellation opens before
-                    // that.
-                    let mut w = state.writer.lock().await;
-                    let mut guard = PoisonGuard {
-                        state: &state,
-                        armed: true,
-                    };
-                    let sent =
-                        futures::SinkExt::send(&mut *w, Message::Binary(payload.into())).await;
-                    // Disarm only on a clean completion: a send that erred left the same
-                    // possibly-torn frame a dropped one does, so both fence — exactly as `write`
-                    // returns through its own `?` with the guard still armed.
-                    if sent.is_ok() {
-                        guard.armed = false;
-                    }
-                    drop(w);
-                    sent.map_err(|_| TransportError::Reset)
-                }
-            };
-            // Finalised on every path, including the failures: a refusal ends the connection, and
-            // one that could not be written ends it no less than one that could.
-            self.close(conn, CloseReason::Normal);
-            outcome
-        })
+        bytes: &[u8],
+        out: &mut dyn FramerOut,
+    ) -> Result<(), TransportError> {
+        let sent = self.emit(state, StreamId(0), bytes, true, false, out);
+        self.close(state, CloseReason::Normal, out);
+        sent
     }
-}
 
-/// What a failed read of the WebSocket stream means to the layer above.
-///
-/// Reporting all of them as `Reset` told a network story about protocol events, and the two get
-/// different answers upstream: a reset is a connection that broke and may be worth redialling, a
-/// framing failure is a peer whose bytes were wrong and redialling changes nothing. A close the
-/// peer already completed is neither — it is the session ending, and the only error shape for that
-/// is `Closed`.
-fn read_error(e: &tokio_tungstenite::tungstenite::Error) -> TransportError {
-    use tokio_tungstenite::tungstenite::Error as WsError;
-    match e {
-        // The bytes were not WebSocket: a reserved opcode, a message past the cap, a text frame
-        // that was not UTF-8. Nothing happened to the connection.
-        WsError::Protocol(_) | WsError::Capacity(_) | WsError::Utf8(_) => TransportError::Framing,
-        // The closing handshake is finished, or something asked for a read after it was.
-        WsError::ConnectionClosed | WsError::AlreadyClosed => TransportError::Closed,
-        // Everything else — IO, TLS, a full write buffer — really is the connection going away
-        // underneath this layer.
-        _ => TransportError::Reset,
+    fn close(&self, state: u64, reason: CloseReason, out: &mut dyn FramerOut) {
+        let Some(mut phase) = self
+            .states
+            .lock()
+            .expect("framing states poisoned")
+            .remove(&state)
+        else {
+            return;
+        };
+        if let Phase::Open { ws, failed, .. } = &mut phase {
+            // The close frame is a courtesy on a connection already finalised: what the machine
+            // could write goes out, and a close it cannot write is not an error anyone can act on.
+            // A connection the far side failed closes with the failure's code, whatever the reason
+            // this end closes for; one the far side closed already carried the far side's code
+            // back (the machine's answer), and the machine writes nothing more here.
+            let _ = ws.close(Some(CloseFrame {
+                code: failed.unwrap_or_else(|| close_code_for(reason)),
+                reason: "".into(),
+            }));
+            let _ = ws.flush();
+        }
+        drain(&mut phase, out);
     }
-}
 
-/// The read-side counterpart of [`PoisonGuard`]: the reader is put back where the connection keeps
-/// it however this future ends, including a drop mid-read.
-///
-/// Without it a cancelled read left the slot empty and the next `frames()` call read that hole as a
-/// clean end of session — on a session transport, the same answer as the peer closing. The slot's
-/// lock is free by construction here (the guard is built after the lock is released and the reader
-/// is put back before anything else can take it), so a `try_lock` that somehow failed would mean a
-/// second pump held the connection, and fencing is the honest answer to that rather than dropping
-/// the reader on the floor.
-struct ReaderGuard {
-    state: Arc<ConnState>,
-    reader: Option<futures::stream::SplitStream<Sock>>,
-}
-
-impl Drop for ReaderGuard {
-    fn drop(&mut self) {
-        if let Some(reader) = self.reader.take() {
-            match self.state.reader.try_lock() {
-                Ok(mut slot) => *slot = Some(reader),
-                Err(_) => self.state.poisoned.store(true, Ordering::Release),
-            }
+    /// A WebSocket state keeps no deadline of its own (it never states one), so a tick finds nothing
+    /// due; an unknown state is closed.
+    fn tick(&self, state: u64, _out: &mut dyn FramerOut) -> Result<(), TransportError> {
+        if self
+            .states
+            .lock()
+            .expect("framing states poisoned")
+            .contains_key(&state)
+        {
+            Ok(())
+        } else {
+            Err(TransportError::Closed)
         }
     }
-}
 
-/// See `busbar-transport-stdio`'s identical guard: a write that does not reach a clean completion
-/// — an error, or this future being dropped mid-send — fences the connection rather than risk a
-/// half-written WS frame being resumed later.
-struct PoisonGuard<'a> {
-    state: &'a ConnState,
-    armed: bool,
-}
+    /// Nothing upgrades in-band out of a WebSocket, so there is no stream to hand on.
+    fn detach(&self, _state: u64, _out: &mut dyn BytesOut) -> Result<(), TransportError> {
+        Err(TransportError::HandoffMismatch)
+    }
 
-impl Drop for PoisonGuard<'_> {
-    fn drop(&mut self) {
-        if self.armed {
-            self.state.poisoned.store(true, Ordering::Release);
-        }
+    /// The upgrade into this framer: the stream another framer gave up, with the bytes it held —
+    /// the upgrade request itself, on the accepting side — which this one answers.
+    fn adopt(
+        &self,
+        side: Side,
+        facts: &ConnFacts,
+        leftover: &[u8],
+        out: &mut dyn FramerOut,
+    ) -> Result<u64, TransportError> {
+        let state = self.open(side, "", facts, out)?;
+        self.ingest(state, leftover, false, out)?;
+        Ok(state)
     }
 }
-
-/// The keys an accept-side upgrade is adopted under.
-///
-/// The WebSocket handshake needs no key material of its own: whatever secured the bytes was
-/// resolved host-side, by core's connection security, never by a transport. A handle
-/// naming no slot is the honest way to say that rather than passing one this layer never reads.
-static NO_KEYS: std::sync::LazyLock<TransportKeyHandle> =
-    std::sync::LazyLock::new(TransportKeyHandle::keyless);
