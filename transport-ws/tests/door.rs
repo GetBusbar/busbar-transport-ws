@@ -18,8 +18,8 @@ use busbar_contract::abi::mechanism::lifecycle::{slot as life, OpenIn, OpenOut};
 use busbar_contract::abi::transport::check::check_framer;
 use busbar_contract::abi::transport::{
     slot, BeginIn, EmitIn, FinishIn, FramePiece, FramerOut, FramerSink, IngestIn, Ops,
-    CLOSE_NORMAL, EMIT_TEXT, PIECE_END_OF_FRAME, PIECE_TEXT, SIDE_ACCEPT, SIDE_DIAL, YIELD_ENDED,
-    YIELD_MORE,
+    CLOSE_NORMAL, EMIT_TEXT, PIECE_END, PIECE_END_OF_FRAME, PIECE_TEXT, SIDE_ACCEPT, SIDE_DIAL,
+    YIELD_ENDED, YIELD_MORE,
 };
 
 fn z<T>() -> T {
@@ -49,8 +49,10 @@ struct End {
     framing: u64,
     wire: Vec<u8>,
     frames: Vec<(Vec<u8>, bool)>,
-    /// Per frame in `frames`: every message-bearing piece of it carried `PIECE_TEXT`.
+    /// Per frame in `frames`: every piece of it carried `PIECE_TEXT`.
     text: Vec<bool>,
+    /// The stream ended whole (`PIECE_END`).
+    stream_end: bool,
     ended: bool,
 }
 
@@ -123,6 +125,11 @@ impl Host {
         for p in &self.pieces[..n] {
             let b = &self.frame[p.offset as usize..(p.offset + p.len) as usize];
             self.log.extend_from_slice(b);
+            // The stream's end is said, and is no frame.
+            if p.flags & PIECE_END != 0 {
+                end.stream_end = true;
+                continue;
+            }
             match end.frames.last_mut() {
                 Some((open, false)) => open.extend_from_slice(b),
                 _ => {
@@ -130,9 +137,7 @@ impl Host {
                     end.text.push(true);
                 }
             }
-            if !b.is_empty() {
-                *end.text.last_mut().expect("a frame") &= p.flags & PIECE_TEXT != 0;
-            }
+            *end.text.last_mut().expect("a frame") &= p.flags & PIECE_TEXT != 0;
             if p.flags & PIECE_END_OF_FRAME != 0 {
                 end.frames.last_mut().expect("a frame").1 = true;
             }
@@ -266,15 +271,14 @@ fn exchange(label: &str, ops: &'static Ops, caps: (usize, usize, usize)) -> Vec<
     assert_eq!(texts(&dial), ["world"]);
     host.finish(&mut dial);
     host.carry(&mut dial, &mut accept);
-    let last = accept.frames.last().expect("frames");
     println!(
         "PROOF {label}: after the dialled end's close the accepted end's stream ended={} connection ended={}",
-        last.0.is_empty() && last.1,
+        accept.stream_end,
         accept.ended
     );
     assert!(
-        last.0.is_empty() && last.1,
-        "the stream ends with an empty piece"
+        accept.stream_end,
+        "the stream ends with its PIECE_END piece"
     );
     assert!(accept.ended, "and the connection with YIELD_ENDED");
     let log = host.log.clone();
