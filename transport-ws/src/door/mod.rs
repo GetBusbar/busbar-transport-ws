@@ -8,7 +8,7 @@
 //! Each framer op is the framer's own method, answered into the host's sink. What does not fit the
 //! sink waits in the framing's queue and goes out on the `YIELD_MORE` re-call, which carries no new
 //! bytes. A WebSocket connection carries one message stream (stream `0`): each message is a frame,
-//! and when the connection's frames end the stream ends with an empty piece and the answer carries
+//! and when the connection's frames end the stream ends with its `PIECE_END` piece and the answer carries
 //! `YIELD_ENDED`.
 //!
 //! The connector owns the socket and connection security; `locate` tells it where a target is and
@@ -33,9 +33,9 @@ use busbar_contract::abi::transport::{
     ListenIn, ListenOut, LocateIn, LocateOut, Ops, ReadIn, RefuseIn, SettingDecl, ShutIn,
     TransportTail, WriteIn, CANCEL_NOTHING_MOVED, CLOSE_CAPACITY_EXHAUSTED, CLOSE_DRAIN,
     CLOSE_PEER_CLOSED, CLOSE_POISONED, CLOSE_REVOKED, CLOSE_TIMEOUT, CLOSE_TRANSPORT_FAILED,
-    EMIT_TEXT, FRAMING_STREAM, PIECE_END_OF_FRAME, PIECE_STREAM_FAILED, PIECE_TEXT, ROLE_FRAMER,
-    SETTING_COUNT, SIDE_ACCEPT, SIDE_DIAL, UNIT0_UPGRADE, YIELD_ENDED, YIELD_HAS_DEADLINE,
-    YIELD_MORE,
+    EMIT_TEXT, FRAMING_STREAM, PIECE_END, PIECE_END_OF_FRAME, PIECE_STREAM_FAILED, PIECE_TEXT,
+    ROLE_FRAMER, SETTING_COUNT, SIDE_ACCEPT, SIDE_DIAL, UNIT0_UPGRADE, YIELD_ENDED,
+    YIELD_HAS_DEADLINE, YIELD_MORE,
 };
 use busbar_contract::ids::StreamId;
 use busbar_contract::transport::registry::DEFAULT_REQUEST_BODY_MAX_BYTES;
@@ -131,6 +131,9 @@ struct Piece {
     /// The stream's end is a FAILURE (`PIECE_STREAM_FAILED`): the far side broke the protocol, sent
     /// text that is not UTF-8 or a message over the ceiling. Only ever the empty end piece.
     failed: bool,
+    /// The stream ends WHOLE here (`PIECE_END`): the empty last piece of its frames. An empty
+    /// message (`bytes` empty without it) is a message, never the end.
+    end: bool,
 }
 
 /// What one framing owes the host and has not been able to hand it.
@@ -166,6 +169,7 @@ impl Out for Collect<'_> {
             end_of_frame: piece.end_of_frame,
             text: piece.text,
             failed: false,
+            end: false,
         });
     }
     fn end(&mut self) {
@@ -177,6 +181,7 @@ impl Out for Collect<'_> {
                 end_of_frame: true,
                 text: false,
                 failed: false,
+                end: true,
             });
         }
         self.owed.ended = true;
@@ -572,8 +577,10 @@ impl Slot for Ingest {
             // told (`PIECE_STREAM_FAILED` on the empty end piece), and the close carries the code.
             if !ended_before && c.owed.ended && f.failed(i.framing) {
                 if let Some(last) = c.owed.pieces.back_mut() {
-                    if last.bytes.is_empty() && last.end_of_frame {
+                    if last.end {
                         last.failed = true;
+                        // A failed stream ends failed, never whole as well.
+                        last.end = false;
                     }
                 }
             }
@@ -698,15 +705,13 @@ fn fill(owed: &mut Owed, sink: &FramerSink, o: &mut FramerOut) {
                     PIECE_END_OF_FRAME
                 } else {
                     0
-                } | if piece.text && take > 0 {
-                    PIECE_TEXT
-                } else {
-                    0
-                } | if piece.failed && whole {
-                    PIECE_STREAM_FAILED
-                } else {
-                    0
-                },
+                } | if piece.text { PIECE_TEXT } else { 0 }
+                    | if piece.failed && whole {
+                        PIECE_STREAM_FAILED
+                    } else {
+                        0
+                    }
+                    | if piece.end && whole { PIECE_END } else { 0 },
                 _reserved: 0,
                 retry_after_secs: 0,
             });

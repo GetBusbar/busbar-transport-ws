@@ -20,7 +20,7 @@ use busbar_contract::abi::mechanism::lifecycle::{slot as life, OpenIn, OpenOut};
 use busbar_contract::abi::mechanism::KindCode;
 use busbar_contract::abi::transport::{
     slot, BeginIn, EmitIn, FinishIn, FramePiece, FramerOut, FramerSink, IngestIn, CLOSE_NORMAL,
-    PIECE_END_OF_FRAME, SIDE_ACCEPT, SIDE_DIAL, YIELD_ENDED, YIELD_MORE,
+    PIECE_END, PIECE_END_OF_FRAME, SIDE_ACCEPT, SIDE_DIAL, YIELD_ENDED, YIELD_MORE,
 };
 use busbar_plugin_loader::dispatch::kinds::hook::Hook;
 use busbar_plugin_loader::dispatch::kinds::transport::Transport;
@@ -88,6 +88,8 @@ struct End {
     framing: u64,
     wire: Vec<u8>,
     frames: Vec<(Vec<u8>, bool)>,
+    /// The stream ended whole (`PIECE_END`).
+    stream_end: bool,
     ended: bool,
 }
 
@@ -128,6 +130,10 @@ impl Host {
             .extend_from_slice(&self.wire[..o.yielded.wire_len as usize]);
         for p in &self.pieces[..o.yielded.pieces_len as usize] {
             let b = &self.frame[p.offset as usize..(p.offset + p.len) as usize];
+            if p.flags & PIECE_END != 0 {
+                end.stream_end = true;
+                continue;
+            }
             match end.frames.last_mut() {
                 Some((open, false)) => open.extend_from_slice(b),
                 _ => end.frames.push((b.to_vec(), false)),
@@ -226,7 +232,7 @@ impl Host {
 }
 
 /// What the exchange left: the upgrade's first lines, what each end heard, whether the far end's
-/// stream ended with an empty piece and its connection with `YIELD_ENDED`.
+/// stream ended (its `PIECE_END` piece) and its connection with `YIELD_ENDED`.
 type Script = (bool, bool, Vec<Vec<u8>>, Vec<Vec<u8>>, bool, bool);
 
 /// One exchange through the dispatcher: the upgrade, one message each way, the dialled end's close.
@@ -251,8 +257,7 @@ fn script(p: &Plugin<Transport>, caps: (usize, usize, usize)) -> Script {
             .map(|(b, _)| b.clone())
             .collect()
     };
-    let last = accept.frames.last().expect("frames");
-    let stream_end = last.0.is_empty() && last.1;
+    let stream_end = accept.stream_end;
     (
         upgrade,
         answered,
@@ -281,7 +286,7 @@ fn the_linked_and_the_dropped_in_door_are_one_framer() {
         assert!(a.1, "an accepted framing answers 101");
         assert_eq!(a.2, [b"hello".to_vec()], "the accepted end heard hello");
         assert_eq!(a.3, [b"world".to_vec()], "the dialled end heard world");
-        assert!(a.4, "the far side's stream ends with an empty piece");
+        assert!(a.4, "the far side's stream ends with its PIECE_END piece");
         assert!(a.5, "and its connection with YIELD_ENDED");
         assert_eq!(a, b, "both doors answer alike");
     }
