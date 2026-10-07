@@ -25,7 +25,7 @@ use busbar_contract::abi::transport::check::check_framer;
 use busbar_contract::abi::transport::{
     slot, BeginIn, EmitIn, FinishIn, FramePiece, FramerOut, FramerSink, IngestIn, Ops,
     CLOSE_CAPACITY_EXHAUSTED, CLOSE_DRAIN, CLOSE_NORMAL, CLOSE_PEER_CLOSED, CLOSE_POISONED,
-    CLOSE_REVOKED, CLOSE_TIMEOUT, CLOSE_TRANSPORT_FAILED, EMIT_TEXT, PIECE_END_OF_FRAME,
+    CLOSE_REVOKED, CLOSE_TIMEOUT, CLOSE_TRANSPORT_FAILED, EMIT_TEXT, PIECE_END, PIECE_END_OF_FRAME,
     PIECE_STREAM_FAILED, PIECE_TEXT, SIDE_ACCEPT, YIELD_ENDED, YIELD_MORE,
 };
 
@@ -57,7 +57,7 @@ fn call<I, O>(op: Option<Op>, inst: *mut c_void, i: &mut I, o: &mut O, index: u3
 }
 
 /// What one op answered: the bytes for the far side, the frames for the layer above (each with
-/// the kind its first piece stated), whether the stream ended (its empty piece),
+/// the kind its first piece stated), whether the stream ended (its `PIECE_END` piece),
 /// and whether the connection's frames did.
 #[derive(Debug, Default)]
 struct Said {
@@ -146,9 +146,10 @@ impl Host {
             open.0.extend_from_slice(b);
             if p.flags & PIECE_END_OF_FRAME != 0 {
                 let (bytes, kind) = self.open.take().expect("a frame");
-                // An empty piece is the stream's end (the transport ABI: an empty piece states no
-                // kind and completes its frame).
-                if bytes.is_empty() {
+                // The stream's end is SAID (`PIECE_END`, or `PIECE_STREAM_FAILED` for a failed
+                // one); an empty piece without it is an empty message, its kind stated.
+                if p.flags & (PIECE_END | PIECE_STREAM_FAILED) != 0 {
+                    assert!(bytes.is_empty(), "a stream's end carries no message");
                     said.stream_end = true;
                     said.failed |= p.flags & PIECE_STREAM_FAILED != 0;
                 } else {
@@ -350,6 +351,39 @@ fn a_text_message_is_handed_up_as_utf8_and_a_binary_one_as_octets() {
     two.extend(client(true, 0, CONTINUATION, "ment".as_bytes()));
     let said = h.ingest(f, &two);
     assert_eq!(said.frames, [(b"fragment".to_vec(), UTF8)]);
+}
+
+/// RED (Autobahn 1.1.1, 6.1.1, 6.1.2, 9.7.1; the stream-end ruling): an EMPTY text message is
+/// handed up as an empty UTF8 message, an empty binary one as an empty OCTETS message, and three
+/// empty fragments of a text message as one empty text message; none of them ends the stream. On
+/// the parent the empty text message lost its kind (`PIECE_TEXT` only on a piece with bytes), so
+/// it was echoed as binary, and an empty piece read as the stream's end.
+#[test]
+fn an_empty_message_keeps_its_kind_and_never_ends_the_stream() {
+    let mut h = Host::new();
+    let f = h.accept();
+    let said = h.ingest(f, &client(true, 0, TEXT, b""));
+    println!(
+        "PROOF empty: an empty text message is handed up as {:?} stream_end={}",
+        said.frames, said.stream_end
+    );
+    assert_eq!(said.frames, [(Vec::new(), UTF8)]);
+    assert!(!said.stream_end, "an empty message is not the stream's end");
+    let said = h.ingest(f, &client(true, 0, BINARY, b""));
+    assert_eq!(said.frames, [(Vec::new(), OCTETS)]);
+    assert!(!said.stream_end);
+    let mut three = client(false, 0, TEXT, b"");
+    three.extend(client(false, 0, CONTINUATION, b""));
+    three.extend(client(true, 0, CONTINUATION, b""));
+    let said = h.ingest(f, &three);
+    assert_eq!(said.frames, [(Vec::new(), UTF8)]);
+    assert!(!said.stream_end);
+    let said = h.ingest(f, &client(true, 0, TEXT, b"after"));
+    assert_eq!(
+        said.frames,
+        [(b"after".to_vec(), UTF8)],
+        "the stream serves on"
+    );
 }
 
 #[test]
