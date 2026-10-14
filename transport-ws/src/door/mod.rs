@@ -709,6 +709,10 @@ fn fill(owed: &mut Owed, sink: &FramerSink, o: &mut FramerOut) {
                 },
                 _reserved: 0,
                 retry_after_secs: 0,
+                // SAFETY: `FramePiece` is plain `repr(C)` integers; all-zero is every field's
+                // absent value. A field the contract appends later (e.g. `declared_len`, which
+                // this framer does not state) takes it, so an append does not break this crate.
+                ..std::mem::zeroed()
             });
         }
         frame_len += take;
