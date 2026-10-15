@@ -33,9 +33,9 @@ use busbar_contract::abi::transport::{
     ListenIn, ListenOut, LocateIn, LocateOut, Ops, ReadIn, RefuseIn, SettingDecl, ShutIn,
     TransportTail, WriteIn, CANCEL_NOTHING_MOVED, CLOSE_CAPACITY_EXHAUSTED, CLOSE_DRAIN,
     CLOSE_PEER_CLOSED, CLOSE_POISONED, CLOSE_REVOKED, CLOSE_TIMEOUT, CLOSE_TRANSPORT_FAILED,
-    EMIT_TEXT, FRAMING_STREAM, PIECE_END, PIECE_END_OF_FRAME, PIECE_STREAM_FAILED, PIECE_TEXT,
-    ROLE_FRAMER, SETTING_COUNT, SIDE_ACCEPT, SIDE_DIAL, UNIT0_UPGRADE, YIELD_ENDED,
-    YIELD_HAS_DEADLINE, YIELD_MORE,
+    EMIT_TEXT, FRAME_PIECE_SIZE, FRAMING_STREAM, PIECE_END, PIECE_END_OF_FRAME,
+    PIECE_STREAM_FAILED, PIECE_TEXT, ROLE_FRAMER, SETTING_COUNT, SIDE_ACCEPT, SIDE_DIAL,
+    UNIT0_UPGRADE, YIELD_ENDED, YIELD_HAS_DEADLINE, YIELD_MORE,
 };
 use busbar_contract::ids::StreamId;
 use busbar_contract::transport::registry::DEFAULT_REQUEST_BODY_MAX_BYTES;
@@ -93,6 +93,8 @@ const TAIL: TransportTail = TransportTail {
     framing: FRAMING_STREAM,
     facts: 0,
     handshake_max_steps: 0,
+    frame_piece_size: FRAME_PIECE_SIZE,
+    _reserved: 0,
     // No transport names another: the carrier is the connector's choice, and an upgrade reaches
     // this framer by `adopt`, never by composition.
     composes_over: std::ptr::null(),
