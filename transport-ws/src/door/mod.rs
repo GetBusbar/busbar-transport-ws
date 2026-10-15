@@ -716,10 +716,8 @@ fn fill(owed: &mut Owed, sink: &FramerSink, o: &mut FramerOut) {
                     | if piece.end && whole { PIECE_END } else { 0 },
                 fault: 0,
                 retry_after_secs: 0,
-                // SAFETY: `FramePiece` is plain `repr(C)` integers; all-zero is every field's
-                // absent value. A field the contract appends later (e.g. `declared_len`, which
-                // this framer does not state) takes it, so an append does not break this crate.
-                ..std::mem::zeroed()
+                // A websocket message head declares no body length: never `PIECE_HAS_DECLARED_LEN`.
+                declared_len: 0,
             });
         }
         frame_len += take;
