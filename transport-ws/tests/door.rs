@@ -15,12 +15,14 @@ use std::mem::{size_of, zeroed};
 
 use busbar_contract::abi::mechanism::call::{AbiStr, InHead, Op, OutHead, Outcome};
 use busbar_contract::abi::mechanism::lifecycle::{slot as life, OpenIn, OpenOut};
-use busbar_contract::abi::transport::check::check_framer;
+use busbar_contract::abi::transport::check::{check_framer, check_framer_fields};
+use busbar_contract::abi::transport::fields::lines;
 use busbar_contract::abi::transport::{
     slot, BeginIn, EmitIn, FinishIn, FramePiece, FramerOut, FramerSink, IngestIn, Ops,
-    CLOSE_NORMAL, EMIT_TEXT, PIECE_END, PIECE_END_OF_FRAME, PIECE_TEXT, SIDE_ACCEPT, SIDE_DIAL,
-    YIELD_ENDED, YIELD_MORE,
+    CLOSE_NORMAL, EMIT_TEXT, PIECE_CONTINUED, PIECE_END, PIECE_END_OF_FRAME, PIECE_FIELDS,
+    PIECE_HAS_CODE, PIECE_TEXT, SIDE_ACCEPT, SIDE_DIAL, STATUS_SUCCESS, YIELD_ENDED, YIELD_MORE,
 };
+use tokio_tungstenite::tungstenite::handshake::derive_accept_key;
 
 fn z<T>() -> T {
     // SAFETY: plain C data; all-zero is valid.
@@ -54,6 +56,22 @@ struct End {
     /// The stream ended whole (`PIECE_END`).
     stream_end: bool,
     ended: bool,
+    /// Each field block it heard (`PIECE_FIELDS`), never a message: its bytes, reassembled across
+    /// pieces, the code and class its pieces stated (`PIECE_HAS_CODE`), whether it is whole, and
+    /// how many pieces carried it.
+    heads: Vec<Head>,
+    /// Every piece it heard, in order: `true` = a field block's.
+    order: Vec<bool>,
+}
+
+/// One field block as the host heard it.
+#[derive(Debug, Default)]
+struct Head {
+    block: Vec<u8>,
+    code: Option<u32>,
+    class: u8,
+    whole: bool,
+    pieces: usize,
 }
 
 struct Host {
@@ -120,6 +138,11 @@ impl Host {
             self.caps.2 as u64,
         )
         .expect("the answer passes the kind's check");
+        check_framer_fields(
+            &self.pieces[..n],
+            &self.frame[..o.yielded.frame_len as usize],
+        )
+        .expect("no field block carries a pseudo-field");
         end.wire
             .extend_from_slice(&self.wire[..o.yielded.wire_len as usize]);
         for p in &self.pieces[..n] {
@@ -128,6 +151,27 @@ impl Host {
             // The stream's end is said, and is no frame.
             if p.flags & PIECE_END != 0 {
                 end.stream_end = true;
+                continue;
+            }
+            end.order.push(p.flags & PIECE_FIELDS != 0);
+            // A field block is a head (or trailers), never a message.
+            if p.flags & PIECE_FIELDS != 0 {
+                let open = matches!(end.heads.last(), Some(h) if !h.whole);
+                assert!(
+                    open || p.flags & PIECE_CONTINUED == 0,
+                    "only a piece of an open block continues a line"
+                );
+                if !open {
+                    end.heads.push(Head::default());
+                }
+                let head = end.heads.last_mut().expect("a head");
+                head.block.extend_from_slice(b);
+                head.pieces += 1;
+                if p.flags & PIECE_HAS_CODE != 0 {
+                    head.code = Some(p.code);
+                    head.class = p.status_class;
+                }
+                head.whole = p.flags & PIECE_END_OF_FRAME != 0;
                 continue;
             }
             match end.frames.last_mut() {
@@ -366,6 +410,125 @@ fn a_text_message_arrives_as_text_through_the_door() {
     let ops = linked();
     text_and_binary("linked roomy", ops, (64 * 1024, 64 * 1024, 64));
     text_and_binary("linked tight", ops, (7, 3, 1));
+}
+
+/// The far end's switching answer to the upgrade request `request`, its own fields `extra`
+/// (each `name: value\r\n`) after the handshake's.
+fn switching(request: &[u8], extra: &str) -> Vec<u8> {
+    let request = String::from_utf8_lossy(request);
+    let key = request
+        .lines()
+        .find_map(|l| {
+            let (n, v) = l.split_once(':')?;
+            n.trim()
+                .eq_ignore_ascii_case("sec-websocket-key")
+                .then(|| v.trim().to_string())
+        })
+        .expect("the upgrade request carries its key");
+    format!(
+        "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nConnection: x-hop\r\n\
+         Sec-WebSocket-Accept: {}\r\nX-Hop: dropped\r\n{extra}\r\n",
+        derive_accept_key(key.as_bytes())
+    )
+    .into_bytes()
+}
+
+/// RED (HEAD-FIELDS, `BUSBAR-1.6.0.md` l.736: a transport always hands the response head up as the
+/// first `Fields` piece): a SILENT far end, one that answers the upgrade with `101` and sends no
+/// message, has ANSWERED. The dialled end hears the switching response as ONE field block
+/// (`PIECE_FIELDS`, `PIECE_HAS_CODE` `101`, `STATUS_SUCCESS`) and no message; its fields cross in
+/// the far end's order, a repeated one on its own lines, the hop-by-hop ones (and those its
+/// `connection` names) and the handshake's own dropped. The far end's first message, when it
+/// comes, follows the head. On the parent the dialled end discarded the response: it heard
+/// nothing until the far end spoke, so the layer above never counted the far end as answered.
+fn a_silent_upgrade_is_answered(label: &str, ops: &'static Ops, caps: (usize, usize, usize)) {
+    let mut host = Host::open(ops, caps);
+    let mut dial = host.begin(SIDE_DIAL, "ws://svc.test/stream");
+    let answer = switching(
+        &dial.wire,
+        "X-Request-Id: req-101\r\nSet-Cookie: a=1\r\nSet-Cookie: b=2\r\n",
+    );
+    dial.wire.clear();
+    host.hear(&mut dial, &answer);
+    println!(
+        "PROOF {label}: the silent far end's 101 heard as heads {:?}, frames {:?}",
+        dial.heads, dial.frames
+    );
+    assert_eq!(
+        dial.heads.len(),
+        1,
+        "the switching response is handed up as the stream's head"
+    );
+    let head = &dial.heads[0];
+    assert!(head.whole, "the head is one whole field block");
+    assert_eq!(head.code, Some(101), "carrying the switching status");
+    assert_eq!(
+        head.class, STATUS_SUCCESS,
+        "an upgrade answered is a success"
+    );
+    assert_eq!(
+        lines(&head.block)
+            .map(|(n, v)| (
+                String::from_utf8_lossy(n).into_owned(),
+                String::from_utf8_lossy(v).into_owned()
+            ))
+            .collect::<Vec<_>>(),
+        [
+            ("x-request-id".to_string(), "req-101".to_string()),
+            ("set-cookie".to_string(), "a=1".to_string()),
+            ("set-cookie".to_string(), "b=2".to_string()),
+        ],
+        "the far end's own fields, in its order; hop-by-hop and handshake fields dropped"
+    );
+    assert!(
+        dial.frames.is_empty(),
+        "no message arrived: the head is no message"
+    );
+    assert!(!dial.ended, "the connection carries on");
+
+    // The far end speaks at last: its message follows the head.
+    let mut message = vec![0x81, 4];
+    message.extend_from_slice(b"late");
+    host.hear(&mut dial, &message);
+    assert_eq!(texts(&dial), ["late"]);
+    assert_eq!(dial.heads.len(), 1, "one head per stream");
+    let first_message = dial.order.iter().position(|f| !f).expect("a message piece");
+    assert!(
+        dial.order[..first_message].iter().all(|f| *f),
+        "the head precedes the first message: {:?}",
+        dial.order
+    );
+    host.close();
+}
+
+#[test]
+fn a_silent_far_end_that_answered_the_upgrade_is_answered_through_the_door() {
+    let ops = linked();
+    a_silent_upgrade_is_answered("linked roomy", ops, (64 * 1024, 64 * 1024, 64));
+    // A sink too small for the block: it crosses in pieces, each cut at a line's start or inside
+    // a value (`PIECE_CONTINUED`), one piece per answer.
+    a_silent_upgrade_is_answered("linked cut", ops, (64, 16, 1));
+}
+
+/// The accepting end's own switching answer, carried to the dialled end: its head crosses EMPTY
+/// (every field of it hop-by-hop or the handshake's own), framed all the same, with its status.
+#[test]
+fn an_upgrade_answered_with_no_field_left_is_an_empty_head() {
+    let ops = linked();
+    for caps in [(64 * 1024, 64 * 1024, 64), (7, 3, 1)] {
+        let mut host = Host::open(ops, caps);
+        let mut dial = host.begin(SIDE_DIAL, "ws://svc.test/stream");
+        let mut accept = host.begin(SIDE_ACCEPT, "");
+        host.carry(&mut dial, &mut accept);
+        host.carry(&mut accept, &mut dial);
+        assert_eq!(dial.heads.len(), 1, "{caps:?}: the head is handed up");
+        let head = &dial.heads[0];
+        assert!(head.whole && head.block.is_empty(), "{caps:?}: {head:?}");
+        assert_eq!(head.pieces, 1, "{caps:?}: one empty fields piece");
+        assert_eq!(head.code, Some(101), "{caps:?}");
+        assert!(dial.frames.is_empty(), "{caps:?}: and no message");
+        host.close();
+    }
 }
 
 fn linked() -> &'static Ops {

@@ -17,6 +17,9 @@
       "target": "ws://peer.test:8080/echo",
       "opening": "GET /echo HTTP/1.1\r\nHost: peer.test:8080\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n",
       "answer": "HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n\r\n",
+      "answer_frames": [
+        ""
+      ],
       "emit": "hi",
       "wire": {
         "hex": "8282000000006869"
