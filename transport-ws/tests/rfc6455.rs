@@ -661,3 +661,183 @@ fn a_code_point_split_across_chops_and_fragments_is_valid() {
     let handed: Vec<&[u8]> = frames.iter().map(|(b, _)| b.as_slice()).collect();
     assert_eq!(handed, [bytes, bytes], "both arrive whole");
 }
+
+// ── 5. THE 2026-10-06 MEASURE, ONE CELL PER FAILING CASE ─────────────────────────────────────────
+//
+// Autobahn|Testsuite 0.8.2 against busbar's ws-conformance subject (release build, NON-STRICT
+// counted as failing) failed 13 of 517 cases on 2026-10-06. Each cell below sends the case's own
+// frames, as the subject's socket read them, and grades the door's half of the case the way
+// Autobahn grades the echo.
+//
+// * 1.1.1, 1.2.1, 6.1.1, 6.1.2, 9.7.1, 9.8.1 (FAILED): an EMPTY message. RFC 6455 §5.6 lets a data
+//   frame carry no payload, and an empty text message is valid UTF-8 (§8.1), so the echo owes an
+//   empty message of the same kind. On the door before 0f3af6d an empty piece was the stream's end
+//   and an empty text piece stated no `PIECE_TEXT`: the message was never echoed (or echoed as
+//   binary) and the stream was over. The door now ends the stream with `PIECE_END` only.
+// * 3.2, 3.3, 4.1.3, 4.1.4, 4.2.3, 4.2.4, 5.15 (NON-STRICT): a whole text message, then a
+//   violation, in one read. RFC 6455 §7.1.7 fails the connection AT the violation; the message
+//   before it was valid and is answered first. The door hands the message up and ends the frames
+//   failed in the same answer (as here); the connector refused the echo once the frames had ended,
+//   fixed by busbar #510 (`compose::tests::a_message_handed_up_with_the_frames_end_is_still_answered`).
+//   These cells pin the door's half: the message is handed up as TEXT, the echo is still written,
+//   and the close (1002) comes after it, never before.
+
+/// Autobahn's "small text message" (cases 3.x and 4.x).
+const SMALL: &[u8] = b"Hello, world!";
+
+/// The far side sends `chop` (a whole text message `first`, then a violation) in one read. Strict:
+/// `first` is handed up as text, the frames end FAILED, nothing has closed yet, the echo is still
+/// written as text, and the close with 1002 follows it.
+fn strict(case: &str, chop: &[u8], first: &[u8]) {
+    let mut h = Host::new();
+    let f = h.accept();
+    let (r, said) = h.ingest_answer(f, chop);
+    assert_eq!(r, Outcome::Ready, "{case}: the violation is no fault");
+    assert_eq!(
+        said.frames,
+        [(first.to_vec(), UTF8)],
+        "{case}: the text message before the violation is handed up, as text"
+    );
+    assert!(
+        said.stream_end && said.ended && said.failed,
+        "{case}: the frames end FAILED at the violation"
+    );
+    assert_eq!(
+        close_code(&server_frames(&said.wire)),
+        None,
+        "{case}: no close before the message is answered"
+    );
+    let (r, echo) = h.emit(f, UTF8, first);
+    assert_eq!(r, Outcome::Ready, "{case}: the echo is still written");
+    let closed = h.finish(f, CLOSE_NORMAL);
+    let mut wire = echo.wire;
+    wire.extend(closed.wire);
+    let frames = server_frames(&wire);
+    println!("PROOF autobahn {case}: the door wrote {frames:?}");
+    assert_eq!(
+        frames,
+        [
+            (TEXT, first.to_vec()),
+            (CLOSE, 1002_u16.to_be_bytes().to_vec())
+        ],
+        "{case}: the echo, then the close with 1002"
+    );
+}
+
+/// The small text message, then `violation`, then a ping (the 3.x and 4.x shape), in one read.
+fn after_small(violation: &[u8]) -> Vec<u8> {
+    let mut b = client(true, 0, TEXT, SMALL);
+    b.extend_from_slice(violation);
+    b.extend(client(true, 0, PING, b""));
+    b
+}
+
+#[test]
+fn autobahn_3_2_reserved_bits_2_after_a_text_message() {
+    strict("3.2", &after_small(&client(true, 2, TEXT, SMALL)), SMALL);
+}
+
+/// 3.3 writes frame by frame; on loopback the subject's one read took all three.
+#[test]
+fn autobahn_3_3_reserved_bits_3_after_a_text_message() {
+    strict("3.3", &after_small(&client(true, 3, TEXT, SMALL)), SMALL);
+}
+
+#[test]
+fn autobahn_4_1_3_reserved_non_control_opcode_5_after_a_text_message() {
+    strict("4.1.3", &after_small(&client(true, 0, 5, b"")), SMALL);
+}
+
+#[test]
+fn autobahn_4_1_4_reserved_non_control_opcode_6_with_payload_after_a_text_message() {
+    strict("4.1.4", &after_small(&client(true, 0, 6, SMALL)), SMALL);
+}
+
+#[test]
+fn autobahn_4_2_3_reserved_control_opcode_13_after_a_text_message() {
+    strict("4.2.3", &after_small(&client(true, 0, 13, b"")), SMALL);
+}
+
+#[test]
+fn autobahn_4_2_4_reserved_control_opcode_14_with_payload_after_a_text_message() {
+    strict("4.2.4", &after_small(&client(true, 0, 14, SMALL)), SMALL);
+}
+
+/// Two fragments, a continuation with nothing to continue, then a whole text message, in one chop.
+#[test]
+fn autobahn_5_15_a_continuation_with_nothing_to_continue_after_a_fragmented_message() {
+    let mut b = client(false, 0, TEXT, b"fragment1");
+    b.extend(client(true, 0, CONTINUATION, b"fragment2"));
+    b.extend(client(false, 0, CONTINUATION, b"fragment3"));
+    b.extend(client(true, 0, TEXT, b"fragment4"));
+    strict("5.15", &b, b"fragment1fragment2");
+}
+
+/// The far side sends `frames` (one empty message of `kind`, `rounds` times over, each after the
+/// echo of the one before, as Autobahn waits for it): each is handed up as an empty message of
+/// its kind, never as the stream's end, and its echo is an empty message of the same opcode.
+fn empty_echoed(case: &str, frames: &[u8], kind: u8, rounds: usize) {
+    let opcode = if kind == UTF8 { TEXT } else { BINARY };
+    let mut h = Host::new();
+    let f = h.accept();
+    for round in 0..rounds {
+        let said = h.ingest(f, frames);
+        assert_eq!(
+            said.frames,
+            [(Vec::new(), kind)],
+            "{case} #{round}: an empty message is handed up, its kind stated"
+        );
+        assert!(
+            !said.stream_end && !said.ended,
+            "{case} #{round}: an empty message is not the stream's end"
+        );
+        let (r, echo) = h.emit(f, kind, b"");
+        assert_eq!(r, Outcome::Ready, "{case} #{round}: the echo is written");
+        assert_eq!(
+            server_frames(&echo.wire),
+            [(opcode, Vec::new())],
+            "{case} #{round}: the echo is an empty message of the same kind"
+        );
+    }
+    println!("PROOF autobahn {case}: {rounds} empty message(s) echoed in kind");
+    let closed = h.ingest(f, &close(1000));
+    assert_eq!(
+        close_code(&server_frames(&closed.wire)),
+        Some(1000),
+        "{case}: the closing handshake is answered"
+    );
+    assert!(closed.stream_end && !closed.failed);
+}
+
+#[test]
+fn autobahn_1_1_1_an_empty_text_message() {
+    empty_echoed("1.1.1", &client(true, 0, TEXT, b""), UTF8, 1);
+}
+
+#[test]
+fn autobahn_1_2_1_an_empty_binary_message() {
+    empty_echoed("1.2.1", &client(true, 0, BINARY, b""), OCTETS, 1);
+}
+
+#[test]
+fn autobahn_6_1_1_a_text_message_of_length_0() {
+    empty_echoed("6.1.1", &client(true, 0, TEXT, b""), UTF8, 1);
+}
+
+#[test]
+fn autobahn_6_1_2_a_text_message_of_three_empty_fragments() {
+    let mut three = client(false, 0, TEXT, b"");
+    three.extend(client(false, 0, CONTINUATION, b""));
+    three.extend(client(true, 0, CONTINUATION, b""));
+    empty_echoed("6.1.2", &three, UTF8, 1);
+}
+
+#[test]
+fn autobahn_9_7_1_a_thousand_empty_text_messages() {
+    empty_echoed("9.7.1", &client(true, 0, TEXT, b""), UTF8, 1000);
+}
+
+#[test]
+fn autobahn_9_8_1_a_thousand_empty_binary_messages() {
+    empty_echoed("9.8.1", &client(true, 0, BINARY, b""), OCTETS, 1000);
+}
