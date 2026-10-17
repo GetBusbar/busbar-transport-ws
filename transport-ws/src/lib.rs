@@ -12,12 +12,11 @@
 //! ## One entry: the door
 //!
 //! The crate's one entry is its memory-ABI door (`door::door`), the same table compiled in (a busbar
-//! build's `transport-door` row) and dropped in (the sibling `busbar-transport-ws-plugin` cdylib),
-//! single-entry and door-only as ARCHITECT ruling (A) shaped the stdio row. There is no in-process
-//! `Transport`: the host's connector owns the socket and connection security, and frames a ws
-//! connection with this door, whether it is accepted on the data listener's upgrade or dialled
-//! through `tcp`. No transport encrypts: TLS is core's connection security, applied host-side and
-//! never composed as a layer.
+//! build's `transport-door` row) and dropped in (the sibling `busbar-transport-ws-plugin` cdylib).
+//! There is no in-process `Transport`: the host's connector owns the socket and connection
+//! security, and frames a ws connection with this door, whether it is accepted on the data
+//! listener's upgrade or dialled over the carrier the connector chooses. No transport encrypts:
+//! TLS is core's connection security, applied host-side and never composed as a layer.
 
 #![deny(unsafe_code)]
 #![deny(missing_docs)]
@@ -36,9 +35,7 @@ pub use transport::WsFramer;
 /// layers it declares, and its door, which the root builds the wire from (the `transport-door`
 /// axis) and opens on the one connector (the `connector-door` axis). The root names none of them.
 pub mod linked {
-    use std::sync::Arc;
-
-    use busbar_contract::transport::{TransportMeta, TransportSettings};
+    use busbar_contract::transport::TransportMeta;
 
     pub use crate::door::door;
 
@@ -48,16 +45,6 @@ pub mod linked {
     pub const COMPOSES_OVER: &[&str] = <crate::WsFramer as TransportMeta>::COMPOSES_OVER;
     /// Whether this wire carries sessions.
     pub const SESSION: bool = <crate::WsFramer as TransportMeta>::SESSION;
-
-    /// Every constant this wire declares, as the root reads a row.
-    pub const ROW: busbar_contract::transport::TransportRow =
-        busbar_contract::transport::TransportRow::of::<crate::WsFramer>();
-
-    /// The framer, built: the deployment's body cap is its message ceiling.
-    #[must_use]
-    pub fn framer(settings: &TransportSettings) -> Arc<dyn busbar_contract::transport::Framer> {
-        Arc::new(crate::WsFramer::built(settings))
-    }
 }
 
 #[cfg(test)]

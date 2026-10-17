@@ -11,11 +11,9 @@ use busbar_contract::grammar::SelectorForm;
 
 /// The forms an INGRESS claim over this wire may take.
 ///
-/// ws IS the top transport of its stack (composed over `http`), and the architecture states the
-/// TOP transport owns claims — including the ones that, before the upgrade, are read off the
-/// HTTP request carrying it. So this declares the request-shaped forms rather than none; a
-/// genuine open question (flagged in the crate's report) is whether that reading is what the
-/// design intends, since `http`'s own row would otherwise carry the identical set unused.
+/// A ws session opens on an HTTP upgrade request, so an ingress claim over this wire selects on
+/// that request's shape: its path, its fields, and the connection it arrived on. The door renders
+/// its claim rows from this list (`crate::door`); it is stated nowhere else.
 pub(crate) const SELECTOR_FORMS: &[SelectorForm] = &[
     SelectorForm::ExactPath,
     SelectorForm::PrefixOneLevel,

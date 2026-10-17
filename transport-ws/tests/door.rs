@@ -560,7 +560,7 @@ fn the_ws_claim_opens_at_the_upgrade_and_composes_over_nothing() {
     let tail = unsafe { &*st.kind_tail.cast::<TransportTail>() };
     let rows: &[Claim] =
         unsafe { std::slice::from_raw_parts(tail.claim_rows, tail.claim_rows_len) };
-    assert_eq!(rows.len(), 1, "one entry, one claim");
-    assert_eq!(rows[0].unit0_trigger, UNIT0_UPGRADE);
+    assert_eq!(rows.len(), 2, "one entry, two claims: `ws` and `wss`");
+    assert!(rows.iter().all(|r| r.unit0_trigger == UNIT0_UPGRADE));
     assert_eq!(tail.composes_over_len, 0);
 }
