@@ -15,18 +15,20 @@ use std::cell::Cell;
 use std::collections::VecDeque;
 use std::ffi::c_void;
 use std::io::{Read, Write};
-use std::mem::{size_of, zeroed};
+use std::mem::zeroed;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 
-use busbar_contract::abi::mechanism::call::{AbiStr, InHead, Op, OutHead, Outcome};
-use busbar_contract::abi::mechanism::lifecycle::{slot as life, OpenIn, OpenOut};
+use busbar_contract::abi::mechanism::call::{AbiStr, Outcome};
+use busbar_contract::abi::mechanism::lifecycle::{OpenIn, OpenOut};
+use busbar_contract::abi::sdk::door::Slot;
 use busbar_contract::abi::sdk::transport::form_codes;
 use busbar_contract::abi::transport::{
-    slot, BeginIn, Claim, EmitIn, FramePiece, FramerOut as DoorOut, FramerSink, IngestIn, Ops,
-    TransportTail, SIDE_ACCEPT, UNIT0_UPGRADE, YIELD_MORE,
+    BeginIn, Claim, EmitIn, FramePiece, FramerOut as DoorOut, FramerSink, IngestIn, TransportTail,
+    SIDE_ACCEPT, UNIT0_UPGRADE, YIELD_MORE,
 };
 use busbar_contract::transport::{ConnFacts, Framed, Framer, FramerOut, HostTime, Side};
 use busbar_contract::TransportMeta;
+use busbar_transport_ws::door::{Begin, Emit, Ingest, Open};
 use busbar_transport_ws::WsFramer;
 use tokio_tungstenite::tungstenite::protocol::Role;
 use tokio_tungstenite::tungstenite::{Bytes, Message, WebSocket};
@@ -321,24 +323,9 @@ fn z<T>() -> T {
     unsafe { zeroed() }
 }
 
-fn call<I, O>(op: Option<Op>, inst: *mut c_void, i: &mut I, o: &mut O, index: u32) -> Outcome {
-    // SAFETY: `I`/`O` lead with their heads.
-    unsafe {
-        let ih = std::ptr::from_mut(i).cast::<InHead>();
-        (*ih).size = size_of::<I>() as u32;
-        (*ih).op = index;
-        (*std::ptr::from_mut(o).cast::<OutHead>()).size = size_of::<O>() as u32;
-    }
-    let r = (op.expect("every slot is filled"))(
-        inst,
-        std::ptr::from_ref(i).cast(),
-        std::ptr::from_mut(o).cast(),
-    );
-    r.outcome()
-}
-
+/// The door's own slots, called as its trampoline calls them but outside it: the count is the
+/// door's and the framer's logic, not the crossing's log capture (whose cost is the SDK's).
 struct Host {
-    ops: &'static Ops,
     inst: *mut c_void,
     wire: Vec<u8>,
     frame: Vec<u8>,
@@ -349,23 +336,10 @@ struct Host {
 impl Host {
     /// An open instance with one accepted framing past its upgrade, and roomy buffers.
     fn accepted() -> Self {
-        let d = busbar_transport_ws::door::door();
-        // SAFETY: the door's `'static` table.
-        let ops: &'static Ops = unsafe { &*(*d).ops.cast::<Ops>() };
-        let mut i: OpenIn = z();
+        let i: OpenIn = z();
         let mut o: OpenOut = z();
-        assert_eq!(
-            call(
-                ops.head.open,
-                std::ptr::null_mut(),
-                &mut i,
-                &mut o,
-                life::OPEN
-            ),
-            Outcome::Ready
-        );
+        assert_eq!(Open::call(std::ptr::null_mut(), &i, &mut o), Outcome::Ready);
         let mut host = Host {
-            ops,
             inst: o.instance,
             wire: vec![0; 64 * 1024],
             frame: vec![0; 64 * 1024],
@@ -380,10 +354,7 @@ impl Host {
         };
         b.sink = host.sink();
         let mut bo: DoorOut = z();
-        assert_eq!(
-            call(ops.begin, host.inst, &mut b, &mut bo, slot::BEGIN),
-            Outcome::Ready
-        );
+        assert_eq!(Begin::call(host.inst, &b, &mut bo), Outcome::Ready);
         host.framing = bo.framing;
         let answer = host.ingest(UPGRADE);
         assert!(host.wire[..answer.yielded.wire_len as usize].starts_with(b"HTTP/1.1 101"));
@@ -413,7 +384,7 @@ impl Host {
         i.len = bytes.len();
         i.sink = self.sink();
         let mut o: DoorOut = z();
-        let r = call(self.ops.ingest, self.inst, &mut i, &mut o, slot::INGEST);
+        let r = Ingest::call(self.inst, &i, &mut o);
         assert_eq!(r, Outcome::Ready);
         assert_eq!(o.yielded.flags & YIELD_MORE, 0, "a roomy sink holds it all");
         o
@@ -428,7 +399,7 @@ impl Host {
         i.end_of_frame = 1;
         i.sink = self.sink();
         let mut o: DoorOut = z();
-        let r = call(self.ops.emit, self.inst, &mut i, &mut o, slot::EMIT);
+        let r = Emit::call(self.inst, &i, &mut o);
         assert_eq!(r, Outcome::Ready);
         assert_eq!(o.yielded.flags & YIELD_MORE, 0, "a roomy sink holds it all");
         o
