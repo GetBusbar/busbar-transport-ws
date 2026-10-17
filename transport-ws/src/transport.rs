@@ -2,10 +2,9 @@
 // Copyright (C) 2026 Busbar Inc and contributors
 
 //! THE FRAMER (TRANSPORT-STACK; #3, #30), as the kind's entry file (`BUSBAR-1.6.0.md` THE DESIGN,
-//! §2: meta, claims, and the kind-named entry): `ws` as the contract's [`Framer`] — the one
-//! implementation both doors drive. A build that links this crate holds a [`WsFramer`] as its `Arc<dyn Framer>`
-//! (`crate::linked::framer`); the sibling `busbar-transport-ws-plugin` cdylib exports the door
-//! over this same type (`crate::door`).
+//! §2: meta, claims, and the kind-named entry): `ws` as the contract's [`Framer`], the one
+//! implementation the door drives (`crate::door`), linked into a busbar build or exported by the
+//! sibling `busbar-transport-ws-plugin` cdylib.
 //!
 //! SANS-IO. The framer holds no socket, no waker and no clock: core hands it the bytes the carrier
 //! read and sends the bytes it answers. Each framing state is the WebSocket protocol machine over an
@@ -46,14 +45,12 @@
 use std::collections::{HashMap, VecDeque};
 use std::io::{Read, Write};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use busbar_contract::abi::transport::fields::{hop_by_hop, LINE_END, SEPARATOR};
 use busbar_contract::ids::StreamId;
 use busbar_contract::transport::wire::{CloseReason, Encode, TransportError, WireStatusClass};
-use busbar_contract::transport::{
-    BytesOut, ConnFacts, Framed, Framer, FramerOut, Located, Side, TransportSettings,
-};
+use busbar_contract::transport::{BytesOut, ConnFacts, Framed, Framer, FramerOut, Located, Side};
 use busbar_contract::{AbiVersion, Kind, Plugin};
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::error::ProtocolError;
@@ -63,7 +60,7 @@ use tokio_tungstenite::tungstenite::handshake::{HandshakeError, MidHandshake};
 use tokio_tungstenite::tungstenite::http::{HeaderMap, HeaderName, HeaderValue};
 use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
 use tokio_tungstenite::tungstenite::protocol::{CloseFrame, WebSocketConfig};
-use tokio_tungstenite::tungstenite::{Error as WsError, Message, WebSocket};
+use tokio_tungstenite::tungstenite::{Bytes, Error as WsError, Message, Utf8Bytes, WebSocket};
 
 /// The in-memory stream one framing state's protocol machine reads and writes: what core ingested
 /// and the machine has not consumed, whether the carrier's clean end followed it, what the
@@ -92,9 +89,11 @@ impl Read for Pipe {
             };
         }
         let n = buf.len().min(self.inbound.len());
-        for (slot, byte) in buf.iter_mut().zip(self.inbound.drain(..n)) {
-            *slot = byte;
-        }
+        let (front, back) = self.inbound.as_slices();
+        let a = n.min(front.len());
+        buf[..a].copy_from_slice(&front[..a]);
+        buf[a..n].copy_from_slice(&back[..n - a]);
+        self.inbound.drain(..n);
         Ok(n)
     }
 }
@@ -108,6 +107,9 @@ impl Write for Pipe {
         Ok(())
     }
 }
+
+/// One framing state behind its own lock; `None` while an op holds it out, or once it failed.
+type Conn = Arc<Mutex<Option<Phase>>>;
 
 /// Where one framing state is.
 enum Phase {
@@ -166,6 +168,9 @@ pub(crate) struct Scan {
     in_text: bool,
     /// The start of a code point the last bytes split (at most three bytes).
     carry: Vec<u8>,
+    /// The bytes being checked, unmasked: kept between calls so a check allocates nothing once
+    /// it has held its largest chunk.
+    buf: Vec<u8>,
     /// The check stopped: a header it cannot follow, or a failure already found.
     stopped: bool,
 }
@@ -219,7 +224,11 @@ impl Scan {
             self.head.push(b);
             *bytes = rest;
         }
-        let head = std::mem::take(&mut self.head);
+        // The header, read off the kept buffer (at most 14 bytes), which is emptied for the next
+        // frame's header without giving up its room.
+        let mut head = [0_u8; 14];
+        head[..self.head.len()].copy_from_slice(&self.head);
+        self.head.clear();
         let (b0, b1) = (head[0], head[1]);
         let (len, at) = match b1 & 0x7f {
             126 => (u64::from(u16::from_be_bytes([head[2], head[3]])), 4),
@@ -263,27 +272,37 @@ impl Scan {
     fn end_of_frame(&mut self) -> bool {
         if self.text && self.fin {
             self.in_text = false;
-            return std::mem::take(&mut self.carry).is_empty();
+            let whole = self.carry.is_empty();
+            self.carry.clear();
+            return whole;
         }
         true
     }
 
     /// Check `chunk` (still masked) as the next text bytes: `false` = not UTF-8.
     fn check(&mut self, chunk: &[u8]) -> bool {
-        let mut bytes = std::mem::take(&mut self.carry);
+        let mut bytes = std::mem::take(&mut self.buf);
+        bytes.clear();
+        bytes.extend_from_slice(&self.carry);
         bytes.extend(chunk.iter().enumerate().map(|(k, b)| match self.mask {
             Some(m) => b ^ m[((self.at + k as u64) % 4) as usize],
             None => *b,
         }));
-        match std::str::from_utf8(&bytes) {
-            Ok(_) => true,
+        let ok = match std::str::from_utf8(&bytes) {
+            Ok(_) => {
+                self.carry.clear();
+                true
+            }
             // Cut short inside a code point: its start waits for the bytes that finish it.
             Err(e) if e.error_len().is_none() => {
-                self.carry = bytes[e.valid_up_to()..].to_vec();
+                self.carry.clear();
+                self.carry.extend_from_slice(&bytes[e.valid_up_to()..]);
                 true
             }
             Err(_) => false,
-        }
+        };
+        self.buf = bytes;
+        ok
     }
 }
 
@@ -299,7 +318,10 @@ impl Phase {
 
 /// The `ws` framer: its framing states, and the message ceiling every connection is built with.
 pub struct WsFramer {
-    states: Mutex<HashMap<u64, Phase>>,
+    /// Every framing state, each behind its own lock: the map's lock is held only to find, add or
+    /// remove one, never across a framing's work, so connections run side by side and a panic in
+    /// one fails that one alone.
+    states: Mutex<HashMap<u64, Conn>>,
     next: AtomicU64,
     max_message_bytes: usize,
 }
@@ -408,13 +430,13 @@ fn head_block(headers: &HeaderMap) -> Vec<u8> {
 }
 
 /// One message as the protocol machine sends it.
-fn message_of(bytes: Vec<u8>, text: bool) -> Result<Message, WsError> {
+fn message_of(bytes: Bytes, text: bool) -> Result<Message, WsError> {
     if text {
-        String::from_utf8(bytes)
-            .map(|t| Message::Text(t.into()))
+        Utf8Bytes::try_from(bytes)
+            .map(Message::Text)
             .map_err(|_| WsError::Utf8(String::new()))
     } else {
-        Ok(Message::Binary(bytes.into()))
+        Ok(Message::Binary(bytes))
     }
 }
 
@@ -428,7 +450,8 @@ fn drain(phase: &mut Phase, out: &mut dyn FramerOut) {
         if open && pipe.client {
             seeded::unmask(&mut pipe.outbound);
         }
-        out.send(&std::mem::take(&mut pipe.outbound));
+        out.send(&pipe.outbound);
+        pipe.outbound.clear();
     }
 }
 
@@ -492,13 +515,6 @@ impl WsFramer {
         }
     }
 
-    /// The linked row's constructor: the deployment's body cap is the message ceiling, because a
-    /// message is assembled from frames before anything above the transport sees it.
-    #[must_use]
-    pub fn built(settings: &TransportSettings) -> Self {
-        Self::new(settings.request_body_max_bytes)
-    }
-
     fn config(&self) -> Option<WebSocketConfig> {
         (self.max_message_bytes > 0).then(|| {
             WebSocketConfig::default()
@@ -540,32 +556,55 @@ impl WsFramer {
         text: bool,
         out: &mut dyn FramerOut,
     ) -> Result<(), TransportError> {
-        {
-            let mut states = self.states.lock().expect("framing states poisoned");
-            if let Some(Phase::Dialling { held, message, .. }) = states.get_mut(&state) {
-                message.extend_from_slice(bytes);
-                if end_of_frame {
-                    held.push((std::mem::take(message), text));
-                }
-                return Ok(());
-            }
-        }
-        self.with_open(state, out, |ws, message| {
+        let conn = self.conn(state)?;
+        let mut guard = Self::enter(&conn)?;
+        if let Some(Phase::Dialling { held, message, .. }) = guard.as_mut() {
             message.extend_from_slice(bytes);
+            if end_of_frame {
+                held.push((std::mem::take(message), text));
+            }
+            return Ok(());
+        }
+        Self::with_open(guard.as_mut(), out, |ws, message| {
             if !end_of_frame {
+                message.extend_from_slice(bytes);
                 return Ok(());
             }
-            ws.send(message_of(std::mem::take(message), text)?)
+            // A message emitted whole is copied once, into the payload the machine sends; one
+            // emitted in pieces is the pieces gathered.
+            let whole = if message.is_empty() {
+                Bytes::copy_from_slice(bytes)
+            } else {
+                message.extend_from_slice(bytes);
+                Bytes::from(std::mem::take(message))
+            };
+            ws.send(message_of(whole, text)?)
         })
     }
 
     fn hold(&self, phase: Phase) -> u64 {
         let id = self.next.fetch_add(1, Ordering::Relaxed);
-        self.states
-            .lock()
-            .expect("framing states poisoned")
-            .insert(id, phase);
+        self.map().insert(id, Arc::new(Mutex::new(Some(phase))));
         id
+    }
+
+    /// The map of framing states. Its lock guards only the map (no framing's work runs under it),
+    /// so a panic cannot leave it half-changed: a poisoned map is read as it stands.
+    fn map(&self) -> MutexGuard<'_, HashMap<u64, Conn>> {
+        self.states.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Framing `state`'s own lock, found under the map's.
+    fn conn(&self, state: u64) -> Result<Conn, TransportError> {
+        self.map()
+            .get(&state)
+            .cloned()
+            .ok_or(TransportError::Closed)
+    }
+
+    /// Hold one framing's state. A framing whose op panicked is failed: that one, and no other.
+    fn enter(conn: &Conn) -> Result<MutexGuard<'_, Option<Phase>>, TransportError> {
+        conn.lock().map_err(|_| TransportError::Reset)
     }
 
     /// A new framing state for `side`, opening toward `target` when it dials.
@@ -590,11 +629,7 @@ impl WsFramer {
                 }
             }
             Side::Dial => {
-                let (secure, host, port, path) = split_ws_url(target)?;
-                let url = format!(
-                    "{}://{host}:{port}{path}",
-                    if secure { "wss" } else { "ws" }
-                );
+                let url = request_url(target)?;
                 let mut request = url
                     .as_str()
                     .into_client_request()
@@ -663,7 +698,7 @@ impl WsFramer {
                     });
                     // What was written before the handshake completed goes out now, in order.
                     for (bytes, text) in held {
-                        let m = message_of(bytes, text).map_err(|e| read_error(&e))?;
+                        let m = message_of(Bytes::from(bytes), text).map_err(|e| read_error(&e))?;
                         ws.write(m).map_err(|e| read_error(&e))?;
                     }
                     Phase::open(ws, message)
@@ -718,6 +753,13 @@ impl WsFramer {
                     ended = true;
                     break;
                 }
+                // The carrier ended with no closing handshake (a dropped connection, a closed
+                // tab): every message completed before it was handed up above, and the stream
+                // ends here. That is the connection going away, not a protocol the far side broke.
+                Err(WsError::Protocol(ProtocolError::ResetWithoutClosingHandshake)) => {
+                    ended = true;
+                    break;
+                }
                 Err(e) => match failure_code(&e) {
                     // The far side broke the protocol on a live connection: the frames end here,
                     // and the close (written when this end closes) carries the failure's code.
@@ -751,13 +793,11 @@ impl WsFramer {
 
     /// Run `op` on the open state `state`, handing what it wrote to core.
     fn with_open(
-        &self,
-        state: u64,
+        phase: Option<&mut Phase>,
         out: &mut dyn FramerOut,
         op: impl FnOnce(&mut WebSocket<Pipe>, &mut Vec<u8>) -> Result<(), WsError>,
     ) -> Result<(), TransportError> {
-        let mut states = self.states.lock().expect("framing states poisoned");
-        let phase = states.get_mut(&state).ok_or(TransportError::Closed)?;
+        let phase = phase.ok_or(TransportError::Closed)?;
         let Phase::Open { ws, message, .. } = phase else {
             return Err(TransportError::Closed);
         };
@@ -791,15 +831,43 @@ pub(crate) fn split_ws_url(url: &str) -> Result<(bool, String, u16, String), Tra
     Ok((secure, parts.host, port, parts.path))
 }
 
+/// A host as an authority spells it: an IPv6 literal in its brackets (RFC 3986 section 3.2.2).
+fn authority_host(host: &str) -> String {
+    if host.contains(':') {
+        format!("[{host}]")
+    } else {
+        host.to_owned()
+    }
+}
+
+/// The upgrade request's URL for a dial to `url`: its scheme, host (an IPv6 literal bracketed),
+/// port only where the target spelled one, and path, so the request's `Host` is the target's
+/// authority as written.
+fn request_url(url: &str) -> Result<String, TransportError> {
+    let (secure, host, _, path) = split_ws_url(url)?;
+    let port = busbar_contract::net::parse_url(url)
+        .map_err(|_| TransportError::AddressRefused)?
+        .port;
+    Ok(format!(
+        "{}://{}{}{path}",
+        if secure { "wss" } else { "ws" },
+        authority_host(&host),
+        port.map(|p| format!(":{p}")).unwrap_or_default()
+    ))
+}
+
 impl WsFramer {
     /// Whether the far side FAILED the connection in `state` (a protocol violation, text that is
     /// not UTF-8, a message over the ceiling): its frames ended failed, not cleanly.
     pub(crate) fn failed(&self, state: u64) -> bool {
+        let Ok(conn) = self.conn(state) else {
+            return false;
+        };
+        let Ok(held) = Self::enter(&conn) else {
+            return false;
+        };
         matches!(
-            self.states
-                .lock()
-                .expect("framing states poisoned")
-                .get(&state),
+            held.as_ref(),
             Some(Phase::Open {
                 failed: Some(_),
                 ..
@@ -832,7 +900,7 @@ impl Framer for WsFramer {
     fn locate(&self, target: &str) -> Result<Located, TransportError> {
         let (secure, host, port, _path) = split_ws_url(target)?;
         Ok(Located {
-            authority: format!("{host}:{port}"),
+            authority: format!("{}:{port}", authority_host(&host)),
             secure,
             server_name: secure.then_some(host),
         })
@@ -855,8 +923,9 @@ impl Framer for WsFramer {
         end: bool,
         out: &mut dyn FramerOut,
     ) -> Result<(), TransportError> {
-        let mut states = self.states.lock().expect("framing states poisoned");
-        let mut phase = states.remove(&state).ok_or(TransportError::Closed)?;
+        let conn = self.conn(state)?;
+        let mut held = Self::enter(&conn)?;
+        let mut phase = held.take().ok_or(TransportError::Closed)?;
         let shaking = !matches!(phase, Phase::Open { .. });
         let pipe = phase.pipe();
         pipe.inbound.extend(bytes);
@@ -870,11 +939,15 @@ impl Framer for WsFramer {
                 if ended {
                     out.end();
                 }
-                states.insert(state, phase);
+                *held = Some(phase);
                 Ok(())
             }
             // A failed state is gone: its connection has nothing more to say.
-            Err(e) => Err(e),
+            Err(e) => {
+                drop(held);
+                self.map().remove(&state);
+                Err(e)
+            }
         }
     }
 
@@ -917,12 +990,13 @@ impl Framer for WsFramer {
     }
 
     fn close(&self, state: u64, reason: CloseReason, out: &mut dyn FramerOut) {
-        let Some(mut phase) = self
-            .states
-            .lock()
-            .expect("framing states poisoned")
-            .remove(&state)
-        else {
+        let Some(conn) = self.map().remove(&state) else {
+            return;
+        };
+        let Ok(mut held) = Self::enter(&conn) else {
+            return;
+        };
+        let Some(mut phase) = held.take() else {
             return;
         };
         if let Phase::Open { ws, failed, .. } = &mut phase {
@@ -943,12 +1017,7 @@ impl Framer for WsFramer {
     /// A WebSocket state keeps no deadline of its own (it never states one), so a tick finds nothing
     /// due; an unknown state is closed.
     fn tick(&self, state: u64, _out: &mut dyn FramerOut) -> Result<(), TransportError> {
-        if self
-            .states
-            .lock()
-            .expect("framing states poisoned")
-            .contains_key(&state)
-        {
+        if self.map().contains_key(&state) {
             Ok(())
         } else {
             Err(TransportError::Closed)
