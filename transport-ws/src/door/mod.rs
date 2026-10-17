@@ -11,6 +11,12 @@
 //! and when the connection's frames end the stream ends with its `PIECE_END` piece and the answer carries
 //! `YIELD_ENDED`.
 //!
+//! A DIALLED framing's stream opens with its HEAD (HEAD-FIELDS): the far end's switching-protocols
+//! response, the moment it completes the handshake, as ONE `PIECE_FIELDS` frame carrying its status
+//! (`PIECE_HAS_CODE`, `101`, `STATUS_SUCCESS`) and the response's field block, framed even when no
+//! field is left in it; the messages follow it. A block the sink cannot hold whole is cut only at a
+//! line's start or inside a value, the rest marked `PIECE_CONTINUED`.
+//!
 //! The connector owns the socket and connection security; `locate` tells it where a target is and
 //! whether it asks for security (`wss`). Both sides frame: a dialled framing opens with the upgrade
 //! request, an accepted one answers it, and `adopt` takes over a stream another framer detached
@@ -33,13 +39,14 @@ use busbar_contract::abi::transport::{
     ListenIn, ListenOut, LocateIn, LocateOut, Ops, ReadIn, RefuseIn, SettingDecl, ShutIn,
     TransportTail, WriteIn, CANCEL_NOTHING_MOVED, CLOSE_CAPACITY_EXHAUSTED, CLOSE_DRAIN,
     CLOSE_PEER_CLOSED, CLOSE_POISONED, CLOSE_REVOKED, CLOSE_TIMEOUT, CLOSE_TRANSPORT_FAILED,
-    EMIT_TEXT, FRAMING_STREAM, PIECE_END, PIECE_END_OF_FRAME, PIECE_STREAM_FAILED, PIECE_TEXT,
-    ROLE_FRAMER, SETTING_COUNT, SIDE_ACCEPT, SIDE_DIAL, UNIT0_UPGRADE, YIELD_ENDED,
-    YIELD_HAS_DEADLINE, YIELD_MORE,
+    EMIT_TEXT, FAULT_NONE, FRAME_PIECE_SIZE, FRAMING_STREAM, PIECE_CONTINUED, PIECE_END,
+    PIECE_END_OF_FRAME, PIECE_FIELDS, PIECE_HAS_CODE, PIECE_STREAM_FAILED, PIECE_TEXT, ROLE_FRAMER,
+    SETTING_COUNT, SIDE_ACCEPT, SIDE_DIAL, STATUS_CALLER_FAULT, STATUS_FAR_END_FAULT, STATUS_NONE,
+    STATUS_OTHER, STATUS_SUCCESS, UNIT0_UPGRADE, YIELD_ENDED, YIELD_HAS_DEADLINE, YIELD_MORE,
 };
 use busbar_contract::ids::StreamId;
 use busbar_contract::transport::registry::DEFAULT_REQUEST_BODY_MAX_BYTES;
-use busbar_contract::transport::wire::CloseReason;
+use busbar_contract::transport::wire::{CloseReason, WireStatusClass};
 use busbar_contract::transport::{
     BytesOut, ConnFacts, Framed, Framer, FramerOut as Out, HostTime, Side,
 };
@@ -93,6 +100,8 @@ const TAIL: TransportTail = TransportTail {
     framing: FRAMING_STREAM,
     facts: 0,
     handshake_max_steps: 0,
+    frame_piece_size: FRAME_PIECE_SIZE,
+    _reserved: 0,
     // No transport names another: the carrier is the connector's choice, and an upgrade reaches
     // this framer by `adopt`, never by composition.
     composes_over: std::ptr::null(),
@@ -136,6 +145,67 @@ struct Piece {
     /// The stream ends WHOLE here (`PIECE_END`): the empty last piece of its frames. An empty
     /// message (`bytes` empty without it) is a message, never the end.
     end: bool,
+    /// The bytes are the stream's HEAD, a field block (`PIECE_FIELDS`): the dialled far end's
+    /// switching response. Never with `text`, `failed` or `end`.
+    fields: bool,
+    /// A full sink cut this field block inside a value: `bytes` open by continuing it
+    /// (`PIECE_CONTINUED`).
+    continued: bool,
+    /// The status the piece states (`PIECE_HAS_CODE`): its number and its class (`STATUS_*`).
+    status: Option<(u32, u8)>,
+}
+
+impl Piece {
+    /// A piece that is no head and states no status.
+    fn plain(stream: u64, bytes: Vec<u8>, end_of_frame: bool) -> Self {
+        Self {
+            stream,
+            bytes,
+            end_of_frame,
+            text: false,
+            failed: false,
+            end: false,
+            fields: false,
+            continued: false,
+            status: None,
+        }
+    }
+}
+
+/// A status class as the piece states it (`STATUS_*`).
+fn class_code(class: Option<WireStatusClass>) -> u8 {
+    match class {
+        None => STATUS_NONE,
+        Some(WireStatusClass::Success) => STATUS_SUCCESS,
+        Some(WireStatusClass::CallerFault) => STATUS_CALLER_FAULT,
+        Some(WireStatusClass::FarEndFault) => STATUS_FAR_END_FAULT,
+        Some(WireStatusClass::Other) => STATUS_OTHER,
+    }
+}
+
+/// How much of a field block's `bytes` a sink with `room` may take: all of it when it fits, else
+/// the furthest cut at a line's start or inside a value, so a continued piece always extends a
+/// value (the host refuses any other continuation). `in_value`: the bytes open inside a value.
+/// `0`: no cut fits.
+fn field_cut(bytes: &[u8], room: usize, in_value: bool) -> usize {
+    if bytes.len() <= room {
+        return bytes.len();
+    }
+    // 0 = a line's start, 1 = a name, 2 = a value.
+    let mut at = if in_value { 2 } else { 0 };
+    let mut best = 0;
+    for (i, &b) in bytes[..room].iter().enumerate() {
+        at = match (at, b) {
+            (0 | 1, b':') => 2,
+            (0 | 1, _) => 1,
+            (_, b'\n') => 0,
+            _ => 2,
+        };
+        if at != 1 {
+            best = i + 1;
+        }
+    }
+    best
 }
 
 /// What one framing owes the host and has not been able to hand it.
@@ -165,25 +235,24 @@ impl Out for Collect<'_> {
         self.owed.wire.extend(bytes);
     }
     fn frame(&mut self, piece: Framed<'_>) {
+        // The framer states a status on ONE frame only, the dialled stream's head: a message
+        // never carries one (`crate::transport`).
+        let head = piece.status_code.is_some();
         self.owed.pieces.push_back(Piece {
-            stream: piece.stream.0,
-            bytes: piece.bytes.to_vec(),
-            end_of_frame: piece.end_of_frame,
-            text: piece.text,
-            failed: false,
-            end: false,
+            text: piece.text && !head,
+            fields: head,
+            status: piece
+                .status_code
+                .map(|code| (code, class_code(piece.status))),
+            ..Piece::plain(piece.stream.0, piece.bytes.to_vec(), piece.end_of_frame)
         });
     }
     fn end(&mut self) {
         if !self.owed.ended {
             // The one stream's frames are over: its empty last piece, then the connection's end.
             self.owed.pieces.push_back(Piece {
-                stream: 0,
-                bytes: Vec::new(),
-                end_of_frame: true,
-                text: false,
-                failed: false,
                 end: true,
+                ..Piece::plain(0, Vec::new(), true)
             });
         }
         self.owed.ended = true;
@@ -689,11 +758,22 @@ fn fill(owed: &mut Owed, sink: &FramerSink, o: &mut FramerOut) {
             break;
         };
         let room = sink.frame_cap - frame_len;
-        let take = piece.bytes.len().min(room);
+        // A field block is cut only where the host takes a continuation: at a line's start or
+        // inside a value. A name longer than the whole frame buffer is cut anyway (the host
+        // refuses it by name) rather than never moving.
+        let take = if piece.fields {
+            match field_cut(&piece.bytes, room, piece.continued) {
+                0 if frame_len == 0 => piece.bytes.len().min(room),
+                cut => cut,
+            }
+        } else {
+            piece.bytes.len().min(room)
+        };
         if take == 0 && !piece.bytes.is_empty() {
             break;
         }
         let whole = take == piece.bytes.len();
+        let (code, status_class) = piece.status.unwrap_or((0, STATUS_NONE));
         // SAFETY: host buffers of the stated capacities; `take <= room`, `n < pieces_cap`.
         unsafe {
             std::ptr::copy_nonoverlapping(piece.bytes.as_ptr(), sink.frame.add(frame_len), take);
@@ -701,8 +781,8 @@ fn fill(owed: &mut Owed, sink: &FramerSink, o: &mut FramerOut) {
                 stream: piece.stream,
                 offset: frame_len as u64,
                 len: take as u64,
-                code: 0,
-                status_class: 0,
+                code,
+                status_class,
                 flags: if whole && piece.end_of_frame {
                     PIECE_END_OF_FRAME
                 } else {
@@ -713,9 +793,23 @@ fn fill(owed: &mut Owed, sink: &FramerSink, o: &mut FramerOut) {
                     } else {
                         0
                     }
-                    | if piece.end && whole { PIECE_END } else { 0 },
-                fault: 0,
+                    | if piece.end && whole { PIECE_END } else { 0 }
+                    | if piece.fields { PIECE_FIELDS } else { 0 }
+                    | if piece.fields && piece.continued {
+                        PIECE_CONTINUED
+                    } else {
+                        0
+                    }
+                    | if piece.status.is_some() {
+                        PIECE_HAS_CODE
+                    } else {
+                        0
+                    },
+                // No fault table: the breaker reads the status by its class.
+                fault: FAULT_NONE,
                 retry_after_secs: 0,
+                // A websocket head declares no body length: never `PIECE_HAS_DECLARED_LEN`.
+                declared_len: 0,
             });
         }
         frame_len += take;
@@ -723,6 +817,10 @@ fn fill(owed: &mut Owed, sink: &FramerSink, o: &mut FramerOut) {
         if whole {
             owed.pieces.pop_front();
         } else {
+            // The rest of a field block opens mid-line unless what was taken ended one.
+            if piece.fields {
+                piece.continued = !piece.bytes[..take].ends_with(b"\n");
+            }
             piece.bytes.drain(..take);
         }
     }

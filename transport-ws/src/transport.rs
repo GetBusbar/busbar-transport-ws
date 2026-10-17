@@ -22,6 +22,12 @@
 //! * A DIALLED connection's upgrade request carries the dial's opening head fields (the bound
 //!   auth's `Authorization` among them), the WebSocket handshake's own fields excepted; a message
 //!   written before the handshake completes is held and goes out, in order, the moment it does.
+//! * A DIALLED connection's switching-protocols response is the far end's ANSWER (HEAD-FIELDS: a
+//!   transport always hands the response head up as the stream's first fields frame): the moment
+//!   it completes the handshake it is handed up as ONE frame carrying its status (`101`, a
+//!   success) and its field block ([`head_block`]), ahead of any message, so a far end that has
+//!   answered the upgrade and not yet sent a message has answered. It is the only frame this framer
+//!   states a status on: a message never carries one.
 //! * A ping is answered with its pong on the next bytes out; a peer's close is answered with the
 //!   peer's own code and ends the frames.
 //! * A close this end starts carries the RFC 6455 code its reason names ([`close_code_for`]).
@@ -42,8 +48,9 @@ use std::io::{Read, Write};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 
+use busbar_contract::abi::transport::fields::{hop_by_hop, LINE_END, SEPARATOR};
 use busbar_contract::ids::StreamId;
-use busbar_contract::transport::wire::{CloseReason, Encode, TransportError};
+use busbar_contract::transport::wire::{CloseReason, Encode, TransportError, WireStatusClass};
 use busbar_contract::transport::{
     BytesOut, ConnFacts, Framed, Framer, FramerOut, Located, Side, TransportSettings,
 };
@@ -53,7 +60,7 @@ use tokio_tungstenite::tungstenite::error::ProtocolError;
 use tokio_tungstenite::tungstenite::handshake::client::ClientHandshake;
 use tokio_tungstenite::tungstenite::handshake::server::{NoCallback, ServerHandshake};
 use tokio_tungstenite::tungstenite::handshake::{HandshakeError, MidHandshake};
-use tokio_tungstenite::tungstenite::http::{HeaderName, HeaderValue};
+use tokio_tungstenite::tungstenite::http::{HeaderMap, HeaderName, HeaderValue};
 use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
 use tokio_tungstenite::tungstenite::protocol::{CloseFrame, WebSocketConfig};
 use tokio_tungstenite::tungstenite::{Error as WsError, Message, WebSocket};
@@ -374,6 +381,32 @@ fn rides_upgrade(name: &str) -> bool {
     !HANDSHAKE_FIELDS.contains(&lower.as_str()) && !lower.starts_with("sec-websocket-")
 }
 
+/// THE ANSWER'S HEAD as a field block (`busbar_contract::abi::transport::fields`): the switching
+/// response's fields in the far end's order, names lower-case, a repeated name's values each on its
+/// own line. Hop-by-hop fields (and every field a `connection` field names) never enter it, nor do
+/// the handshake's own fields ([`rides_upgrade`]'s refusals: `content-length` among them, and every
+/// `sec-websocket-*` field, which answer this hop's handshake and nothing above it). No field left
+/// is the EMPTY block, still handed up: an empty head is a head.
+fn head_block(headers: &HeaderMap) -> Vec<u8> {
+    let nominated: Vec<&[u8]> = headers
+        .get_all("connection")
+        .iter()
+        .map(HeaderValue::as_bytes)
+        .collect();
+    let mut block = Vec::new();
+    for (name, value) in headers {
+        let name = name.as_str();
+        if !rides_upgrade(name) || hop_by_hop(name, nominated.iter().copied()) {
+            continue;
+        }
+        block.extend_from_slice(name.as_bytes());
+        block.extend_from_slice(SEPARATOR);
+        block.extend_from_slice(value.as_bytes());
+        block.extend_from_slice(LINE_END);
+    }
+    block
+}
+
 /// One message as the protocol machine sends it.
 fn message_of(bytes: Vec<u8>, text: bool) -> Result<Message, WsError> {
     if text {
@@ -618,7 +651,16 @@ impl WsFramer {
                 Err(HandshakeError::Failure(_)) => return Err(TransportError::HandshakeFailed),
             },
             Phase::Dialling { mid, held, message } => match mid.handshake() {
-                Ok((mut ws, _response)) => {
+                Ok((mut ws, response)) => {
+                    // THE FAR END ANSWERED (HEAD-FIELDS): its switching response is the stream's
+                    // head, handed up before anything else, with its status and its field block.
+                    // A far end that answered the upgrade and sends nothing more has answered.
+                    let block = head_block(response.headers());
+                    out.frame(Framed {
+                        status: Some(WireStatusClass::Success),
+                        status_code: Some(u32::from(response.status().as_u16())),
+                        ..Framed::plain(StreamId(0), &block, true)
+                    });
                     // What was written before the handshake completed goes out now, in order.
                     for (bytes, text) in held {
                         let m = message_of(bytes, text).map_err(|e| read_error(&e))?;

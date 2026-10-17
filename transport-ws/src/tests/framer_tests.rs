@@ -7,6 +7,7 @@
 //! moment it does; a message the emit states text (`EMIT_TEXT`) goes out as a text message, any
 //! other as binary.
 
+use busbar_contract::transport::wire::WireStatusClass;
 use busbar_contract::transport::{Framed, Framer, FramerOut, HostTime, Side};
 use tokio_tungstenite::tungstenite::handshake::derive_accept_key;
 
@@ -17,6 +18,8 @@ use crate::WsFramer;
 struct Out {
     sent: Vec<u8>,
     frames: Vec<Vec<u8>>,
+    /// Per frame in `frames`: the status it stated, and its class.
+    statuses: Vec<Option<(u32, Option<WireStatusClass>)>>,
 }
 
 impl FramerOut for Out {
@@ -25,6 +28,8 @@ impl FramerOut for Out {
     }
     fn frame(&mut self, piece: Framed<'_>) {
         self.frames.push(piece.bytes.to_vec());
+        self.statuses
+            .push(piece.status_code.map(|code| (code, piece.status)));
     }
     fn end(&mut self) {}
     fn now(&self) -> HostTime {
@@ -129,6 +134,15 @@ fn a_dial_carries_its_opening_fields_holds_early_messages_and_flags_text() {
         opcodes(&done.sent),
         [0x1, 0x2],
         "text, then binary, in order"
+    );
+    // RED (HEAD-FIELDS): the switching response is handed up as the stream's head, its status
+    // stated and its fields (every one of them the handshake's own here) dropped, before any
+    // message; on the parent nothing was handed up until the far end spoke.
+    assert_eq!(done.frames, [Vec::<u8>::new()], "the head, an empty block");
+    assert_eq!(
+        done.statuses,
+        [Some((101, Some(WireStatusClass::Success)))],
+        "carrying the switching status"
     );
 
     // Once open, a flagged message goes out as text at once.
