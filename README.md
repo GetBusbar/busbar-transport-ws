@@ -1,4 +1,4 @@
-<!-- fleet:header:begin (rendered by `busbar-release plugin sync` from GetBusbar/busbar-release template/ and busbar's plugins.yaml; edit it there) -->
+<!-- fleet:header:begin (rendered by `busbar-release plugin heal` from GetBusbar/busbar-release template/ and busbar's plugins.yaml; edit it there) -->
 # busbar-transport-ws
 
 First-party signed kind:transport plugin cdylib: the ws transport, packaged as a droppable busbar plugin. Drop the signed tarball into plugins/.
