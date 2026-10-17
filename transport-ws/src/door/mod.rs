@@ -24,7 +24,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::ffi::c_void;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use busbar_contract::abi::mechanism::call::{AbiStr, Blob, InHead, OutHead, Outcome};
 use busbar_contract::abi::mechanism::door::{KindTailHead, Statement};
@@ -33,6 +33,7 @@ use busbar_contract::abi::mechanism::lifecycle::{
     ValidateIn,
 };
 use busbar_contract::abi::sdk::door::{abi_str, statement, Slot};
+use busbar_contract::abi::sdk::transport::form_codes;
 use busbar_contract::abi::transport::{
     AcceptIn, AcceptOut, AdoptIn, ArrivalIn, ArrivalOut, BeginIn, Claim, ConnIn, ConnOut, DialIn,
     EmitIn, EncodeIn, FinishIn, FramePiece, FramerOut, FramerSink, FramingIn, IngestIn, IoOut,
@@ -46,10 +47,11 @@ use busbar_contract::abi::transport::{
 };
 use busbar_contract::ids::StreamId;
 use busbar_contract::transport::registry::DEFAULT_REQUEST_BODY_MAX_BYTES;
-use busbar_contract::transport::wire::{CloseReason, WireStatusClass};
+use busbar_contract::transport::wire::{CloseReason, Unit0Trigger, WireStatusClass};
 use busbar_contract::transport::{
     BytesOut, ConnFacts, Framed, Framer, FramerOut as Out, HostTime, Side,
 };
+use busbar_contract::TransportMeta;
 
 use crate::transport::WsFramer;
 
@@ -63,32 +65,99 @@ const NONE: AbiStr = AbiStr {
     len: 0,
 };
 
-/// The schemes `ws` claims, by name: the Statement's `claims`, the one place they are stated.
-const CLAIM_NAMES: &[AbiStr] = &[abi_str(
-    <crate::WsFramer as busbar_contract::TransportMeta>::KEY,
-)];
+/// The transport's own key (`meta.rs`).
+const KEY: &str = <WsFramer as TransportMeta>::KEY;
 
-/// Each claimed scheme's row, by index into [`CLAIM_NAMES`].
-const CLAIMS: &[Claim] = &[Claim {
-    selector_forms: abi_str(""),
-    egress_selector_forms: abi_str(""),
-    facts: std::ptr::null(),
-    facts_len: 0,
+/// The secured form of the scheme: a `wss` target is a `ws` one whose bytes the connector secures
+/// before they leave (THE DESIGN §5: "ws claims `ws` and `wss`").
+pub const SECURE_KEY: &str = "wss";
+
+/// The schemes `ws` claims, by name: the Statement's `claims`, the one place they are stated.
+const CLAIM_NAMES: &[AbiStr] = &[abi_str(KEY), abi_str(SECURE_KEY)];
+
+const fn bytes_str(b: &'static [u8]) -> AbiStr {
+    AbiStr {
+        ptr: b.as_ptr(),
+        len: b.len(),
+    }
+}
+
+/// `names` as host strings, in declared order.
+const fn strs<const N: usize>(names: &[&'static str]) -> [AbiStr; N] {
+    let mut list = [NONE; N];
+    let mut i = 0;
+    while i < N {
+        list[i] = abi_str(names[i]);
+        i += 1;
+    }
+    list
+}
+
+const SELECTOR_CODES: [u8; crate::claims::SELECTOR_FORMS.len()] =
+    form_codes(<WsFramer as TransportMeta>::SELECTOR_FORMS);
+const EGRESS_SELECTOR_CODES: [u8; crate::claims::EGRESS_SELECTOR_FORMS.len()] =
+    form_codes(<WsFramer as TransportMeta>::EGRESS_SELECTOR_FORMS);
+const FACT_LIST: [AbiStr; <WsFramer as TransportMeta>::TRANSPORT_FACTS.len()] =
+    strs(<WsFramer as TransportMeta>::TRANSPORT_FACTS);
+const FACTS: &[AbiStr] = &FACT_LIST;
+
+/// The trigger code of the declared `UNIT0_TRIGGER`: ws opens a unit at the upgrade, and the host
+/// reads its upgrade lines off this, never off a layer list (busbar ARCHITECT ruling Q128 U7).
+const UNIT0: u8 = match <WsFramer as TransportMeta>::UNIT0_TRIGGER {
+    Some(Unit0Trigger::Upgrade) => UNIT0_UPGRADE,
+    _ => panic!("ws declares its unit opening at the upgrade"),
+};
+
+/// The claim row, RENDERED from the transport's one declaration (`meta.rs`, `claims.rs`; THE
+/// DESIGN §2 "Each fact is declared once; anything derivable is derived"). `ws` and `wss` are one
+/// wire, so both claims carry it.
+const ROW: Claim = Claim {
+    selector_forms: bytes_str(&SELECTOR_CODES),
+    egress_selector_forms: bytes_str(&EGRESS_SELECTOR_CODES),
+    facts: FACTS.as_ptr(),
+    facts_len: FACTS.len(),
+    // The declaration states no status numbering and no status leg (`STATUS_NAMESPACE`,
+    // `STATUS_CLASS`): frames after the upgrade carry none.
     status_namespace: NONE,
-    session: 1,
-    session_bound: 0,
-    // A ws unit opens at the upgrade (meta.rs `UNIT0_TRIGGER`): the host reads its upgrade lines
-    // off this, never off a layer list (busbar ARCHITECT ruling Q128 U7).
-    unit0_trigger: UNIT0_UPGRADE,
+    session: <WsFramer as TransportMeta>::SESSION as u8,
+    session_bound: <WsFramer as TransportMeta>::SESSION_BOUND as u8,
+    unit0_trigger: UNIT0,
     status_at: 0,
     _reserved: 0,
-}];
+};
+
+/// Each claimed scheme's row, by index into [`CLAIM_NAMES`].
+const CLAIMS: &[Claim] = &[ROW, ROW];
+
+const _: () = assert!(
+    <WsFramer as TransportMeta>::STATUS_NAMESPACE.is_none()
+        && <WsFramer as TransportMeta>::STATUS_CLASS.is_none(),
+    "the row states no status numbering and no status leg"
+);
+
+/// The message ceiling's declared default, as the Statement states it.
+const DEFAULT_BODY_MAX: &str = "33554432";
+
+/// `text` read as a decimal count.
+const fn count(text: &str) -> usize {
+    let b = text.as_bytes();
+    let mut n = 0;
+    let mut i = 0;
+    while i < b.len() {
+        n = n * 10 + (b[i] - b'0') as usize;
+        i += 1;
+    }
+    n
+}
+
+// The declared default is the default `read_settings` falls back to: one fact, held equal.
+const _: () = assert!(count(DEFAULT_BODY_MAX) == DEFAULT_REQUEST_BODY_MAX_BYTES);
 
 const SETTINGS: &[SettingDecl] = &[SettingDecl {
     path: abi_str(BODY_MAX_BYTES),
     kind: SETTING_COUNT,
     _reserved: 0,
-    default: abi_str("33554432"),
+    default: abi_str(DEFAULT_BODY_MAX),
 }];
 
 const TAIL: TransportTail = TransportTail {
@@ -127,7 +196,7 @@ pub const STATEMENT: Statement = Statement {
     kind_tail: (&TAIL as *const TransportTail).cast::<KindTailHead>(),
     claims: CLAIM_NAMES.as_ptr(),
     claims_len: CLAIM_NAMES.len(),
-    ..statement("ws", env!("CARGO_PKG_VERSION"), 64)
+    ..statement(KEY, env!("CARGO_PKG_VERSION"), 64)
 };
 
 // ── the instance ─────────────────────────────────────────────────────────────────────────────────
@@ -213,15 +282,50 @@ fn field_cut(bytes: &[u8], room: usize, in_value: bool) -> usize {
 struct Owed {
     wire: VecDeque<u8>,
     pieces: VecDeque<Piece>,
+    /// The byte buffers of pieces already handed over, kept for the next pieces: a framing in
+    /// steady state queues its messages without allocating.
+    spare: Vec<Vec<u8>>,
     ended: bool,
     deadline: Option<u64>,
     error: String,
 }
 
-/// The framer and what each framing owes.
+/// The most handed-over piece buffers a framing keeps for reuse.
+const SPARE_MAX: usize = 8;
+
+impl Owed {
+    /// A buffer holding `bytes`, a kept one where there is one.
+    fn buffer(&mut self, bytes: &[u8]) -> Vec<u8> {
+        let mut b = self.spare.pop().unwrap_or_default();
+        b.clear();
+        b.extend_from_slice(bytes);
+        b
+    }
+
+    /// Keep a handed-over piece's buffer for the next piece.
+    fn recycle(&mut self, b: Vec<u8>) {
+        if self.spare.len() < SPARE_MAX {
+            self.spare.push(b);
+        }
+    }
+}
+
+/// One framing's queue behind its own lock.
+type OwedSlot = Arc<Mutex<Owed>>;
+
+/// The framer and what each framing owes. The map's lock is held only to find, add or remove one
+/// framing's queue, never across an op, so framings run side by side and a panic in one fails that
+/// one alone.
 pub struct Instance {
     framer: WsFramer,
-    owed: Mutex<HashMap<u64, Owed>>,
+    owed: Mutex<HashMap<u64, OwedSlot>>,
+}
+
+impl Instance {
+    /// The map of queues; a poisoned map is read as it stands (no op runs under its lock).
+    fn queues(&self) -> MutexGuard<'_, HashMap<u64, OwedSlot>> {
+        self.owed.lock().unwrap_or_else(PoisonError::into_inner)
+    }
 }
 
 /// The framer's output for one op, collected before it goes to the sink.
@@ -238,13 +342,14 @@ impl Out for Collect<'_> {
         // The framer states a status on ONE frame only, the dialled stream's head: a message
         // never carries one (`crate::transport`).
         let head = piece.status_code.is_some();
+        let bytes = self.owed.buffer(piece.bytes);
         self.owed.pieces.push_back(Piece {
             text: piece.text && !head,
             fields: head,
             status: piece
                 .status_code
                 .map(|code| (code, class_code(piece.status))),
-            ..Piece::plain(piece.stream.0, piece.bytes.to_vec(), piece.end_of_frame)
+            ..Piece::plain(piece.stream.0, bytes, piece.end_of_frame)
         });
     }
     fn end(&mut self) {
@@ -358,7 +463,8 @@ fn reason_of(code: u32) -> CloseReason {
     }
 }
 
-/// The connection-security facts the old framer shape reads: the protocol agreed and the claim.
+/// The connection-security facts an adopted framing reads: the name offered, the protocol agreed
+/// and the claim.
 fn facts_of(p: *const busbar_contract::abi::transport::ConnFacts) -> ConnFacts {
     if p.is_null() {
         return ConnFacts::default();
@@ -541,10 +647,8 @@ fn opening(
     match open(&inst.framer, &mut c) {
         Ok(token) => {
             o.framing = token;
-            let mut all = inst.owed.lock().expect("owed");
-            let slot = all.entry(token).or_default();
-            *slot = owed;
-            fill(slot, sink, o);
+            fill(&mut owed, sink, o);
+            inst.queues().insert(token, Arc::new(Mutex::new(owed)));
             Outcome::Ready
         }
         Err(_) => {
@@ -563,17 +667,22 @@ fn framing(
     op: impl FnOnce(&WsFramer, &mut Collect<'_>) -> Result<(), String>,
 ) -> Outcome {
     let inst = instance(p);
-    let mut all = inst.owed.lock().expect("owed");
-    let Some(owed) = all.get_mut(&token) else {
+    let Some(slot) = inst.queues().get(&token).cloned() else {
         o.head.error = abi_str("no such framing");
         return Outcome::Failed;
     };
+    let Ok(mut held) = slot.lock() else {
+        // An op on this framing panicked: it is failed, and it alone.
+        o.head.error = abi_str("the framing failed");
+        return Outcome::Failed;
+    };
     let mut c = Collect {
-        owed,
+        owed: &mut held,
         now: time(sink),
     };
-    if let Err(e) = op(&inst.framer, &mut c) {
-        let owed = all.get_mut(&token).expect("held");
+    let done = op(&inst.framer, &mut c);
+    let owed = &mut *held;
+    if let Err(e) = done {
         if owed.wire.is_empty() && owed.pieces.is_empty() {
             owed.error = e;
             o.head.error = AbiStr {
@@ -585,7 +694,7 @@ fn framing(
         // What the failing op produced still goes out; the connection's end follows it.
         owed.ended = true;
     }
-    fill(all.get_mut(&token).expect("held"), sink, o);
+    fill(owed, sink, o);
     Outcome::Ready
 }
 
@@ -600,7 +709,6 @@ impl Slot for Begin {
             return Outcome::Failed;
         };
         let target = String::from_utf8_lossy(text(&i.target)).into_owned();
-        let _ = facts_of(i.facts);
         let fields = opening_fields(i.fields, i.fields_len);
         opening(p, &i.sink, o, |f, c| {
             f.open_with(side, &target, &fields, c)
@@ -718,7 +826,7 @@ impl Slot for Finish {
             Ok(())
         });
         if o.yielded.flags & YIELD_MORE == 0 {
-            instance(p).owed.lock().expect("owed").remove(&i.framing);
+            instance(p).queues().remove(&i.framing);
         }
         out
     }
@@ -745,10 +853,15 @@ impl Slot for Encode {
 /// Hand the host what the framing owes it, as far as the sink holds.
 fn fill(owed: &mut Owed, sink: &FramerSink, o: &mut FramerOut) {
     let w = owed.wire.len().min(sink.wire_cap);
-    for (k, b) in owed.wire.drain(..w).enumerate() {
-        // SAFETY: `k < w <= wire_cap`.
-        unsafe { sink.wire.add(k).write(b) };
+    let (front, back) = owed.wire.as_slices();
+    let a = w.min(front.len());
+    // SAFETY: `a <= w <= wire_cap` and `w - a <= back.len()`: both runs land inside the host's
+    // wire buffer, which no queue byte overlaps.
+    unsafe {
+        std::ptr::copy_nonoverlapping(front.as_ptr(), sink.wire, a);
+        std::ptr::copy_nonoverlapping(back.as_ptr(), sink.wire.add(a), w - a);
     }
+    owed.wire.drain(..w);
     let y = &mut o.yielded;
     y.wire_len = w as u64;
     let mut frame_len = 0_usize;
@@ -815,7 +928,9 @@ fn fill(owed: &mut Owed, sink: &FramerSink, o: &mut FramerOut) {
         frame_len += take;
         n += 1;
         if whole {
-            owed.pieces.pop_front();
+            if let Some(done) = owed.pieces.pop_front() {
+                owed.recycle(done.bytes);
+            }
         } else {
             // The rest of a field block opens mid-line unless what was taken ended one.
             if piece.fields {
