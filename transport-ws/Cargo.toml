@@ -4,7 +4,7 @@ name = "busbar-transport-ws"
 version = "1.6.0"
 publish = false            # a first-party plugin crate; shipped linked into busbar or as a signed tarball
 edition = "2021"
-rust-version = "1.97"
+rust-version.workspace = true
 description = "The WebSocket transport: duplex message frames over an HTTP upgrade."
 license = "Apache-2.0"
 
@@ -27,7 +27,8 @@ test-seeded = []
 # busbar build that links this crate `[patch]`es the busbar git source to its own tree, so ONE copy
 # of the contract links.
 busbar-contract = { workspace = true }
-# The protocol machine the framer drives over its in-memory pipe (`tungstenite`, sync; no runtime).
-tokio-tungstenite = { workspace = true }
+# The protocol machine the framer drives over its in-memory pipe (`tungstenite`, sync; no runtime),
+# with its handshake machines.
+tungstenite = { workspace = true, features = ["handshake"] }
 # The door's settings blob is JSON (`door::read_settings`).
 serde_json = { workspace = true }
