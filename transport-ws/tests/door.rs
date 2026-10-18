@@ -22,7 +22,7 @@ use busbar_contract::abi::transport::{
     CLOSE_NORMAL, EMIT_TEXT, PIECE_CONTINUED, PIECE_END, PIECE_END_OF_FRAME, PIECE_FIELDS,
     PIECE_HAS_CODE, PIECE_TEXT, SIDE_ACCEPT, SIDE_DIAL, STATUS_SUCCESS, YIELD_ENDED, YIELD_MORE,
 };
-use tokio_tungstenite::tungstenite::handshake::derive_accept_key;
+use tungstenite::handshake::derive_accept_key;
 
 fn z<T>() -> T {
     // SAFETY: plain C data; all-zero is valid.

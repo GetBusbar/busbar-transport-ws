@@ -4,7 +4,7 @@ name = "busbar-transport-ws-plugin"
 version = "1.6.0"
 publish = false            # first-party signed cdylib, shipped as a packed/signed tarball, not to crates.io
 edition = "2021"
-rust-version = "1.97"
+rust-version.workspace = true
 description = "First-party signed kind:transport plugin cdylib: the `ws` transport, packaged as a droppable busbar plugin. Drop the signed tarball into `plugins/` and the boot seal folds the wire beside the linked ones."
 license = "Apache-2.0"
 
