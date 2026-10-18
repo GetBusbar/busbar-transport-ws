@@ -41,9 +41,10 @@ use busbar_contract::abi::transport::{
     TransportTail, WriteIn, CANCEL_NOTHING_MOVED, CLOSE_CAPACITY_EXHAUSTED, CLOSE_DRAIN,
     CLOSE_PEER_CLOSED, CLOSE_POISONED, CLOSE_REVOKED, CLOSE_TIMEOUT, CLOSE_TRANSPORT_FAILED,
     EMIT_TEXT, FAULT_NONE, FRAME_PIECE_SIZE, FRAMING_STREAM, PIECE_CONTINUED, PIECE_END,
-    PIECE_END_OF_FRAME, PIECE_FIELDS, PIECE_HAS_CODE, PIECE_STREAM_FAILED, PIECE_TEXT, ROLE_FRAMER,
-    SETTING_COUNT, SIDE_ACCEPT, SIDE_DIAL, STATUS_CALLER_FAULT, STATUS_FAR_END_FAULT, STATUS_NONE,
-    STATUS_OTHER, STATUS_SUCCESS, UNIT0_UPGRADE, YIELD_ENDED, YIELD_HAS_DEADLINE, YIELD_MORE,
+    PIECE_END_OF_FRAME, PIECE_FIELDS, PIECE_HAS_CODE, PIECE_HAS_RETRY_AFTER, PIECE_STREAM_FAILED,
+    PIECE_TEXT, ROLE_FRAMER, SETTING_COUNT, SIDE_ACCEPT, SIDE_DIAL, STATUS_CALLER_FAULT,
+    STATUS_FAR_END_FAULT, STATUS_NONE, STATUS_OTHER, STATUS_SUCCESS, UNIT0_UPGRADE, YIELD_ENDED,
+    YIELD_HAS_DEADLINE, YIELD_MORE,
 };
 use busbar_contract::ids::StreamId;
 use busbar_contract::transport::registry::DEFAULT_REQUEST_BODY_MAX_BYTES;
@@ -222,6 +223,8 @@ struct Piece {
     continued: bool,
     /// The status the piece states (`PIECE_HAS_CODE`): its number and its class (`STATUS_*`).
     status: Option<(u32, u8)>,
+    /// The wait the far end asked for (`PIECE_HAS_RETRY_AFTER`), on a refused upgrade's head.
+    retry_after: Option<u64>,
 }
 
 impl Piece {
@@ -237,6 +240,7 @@ impl Piece {
             fields: false,
             continued: false,
             status: None,
+            retry_after: None,
         }
     }
 }
@@ -349,6 +353,7 @@ impl Out for Collect<'_> {
             status: piece
                 .status_code
                 .map(|code| (code, class_code(piece.status))),
+            retry_after: piece.retry_after_secs.filter(|_| head),
             ..Piece::plain(piece.stream.0, bytes, piece.end_of_frame)
         });
     }
@@ -917,10 +922,16 @@ fn fill(owed: &mut Owed, sink: &FramerSink, o: &mut FramerOut) {
                         PIECE_HAS_CODE
                     } else {
                         0
+                    }
+                    | if piece.status.is_some() && piece.retry_after.is_some() {
+                        PIECE_HAS_RETRY_AFTER
+                    } else {
+                        0
                     },
-                // No fault table: the breaker reads the status by its class.
+                // No fault table: the breaker reads the status by its class, and the far end's
+                // wait from `retry_after_secs`.
                 fault: FAULT_NONE,
-                retry_after_secs: 0,
+                retry_after_secs: piece.retry_after.unwrap_or(0),
                 // A websocket head declares no body length: never `PIECE_HAS_DECLARED_LEN`.
                 declared_len: 0,
             });

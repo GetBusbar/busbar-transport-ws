@@ -72,6 +72,8 @@ struct Head {
     class: u8,
     whole: bool,
     pieces: usize,
+    /// The wait its piece stated (`PIECE_HAS_RETRY_AFTER`).
+    retry_after: Option<u64>,
 }
 
 struct Host {
@@ -170,6 +172,9 @@ impl Host {
                 if p.flags & PIECE_HAS_CODE != 0 {
                     head.code = Some(p.code);
                     head.class = p.status_class;
+                }
+                if p.flags & busbar_contract::abi::transport::PIECE_HAS_RETRY_AFTER != 0 {
+                    head.retry_after = Some(p.retry_after_secs);
                 }
                 head.whole = p.flags & PIECE_END_OF_FRAME != 0;
                 continue;
@@ -563,4 +568,23 @@ fn the_ws_claim_opens_at_the_upgrade_and_composes_over_nothing() {
     assert_eq!(rows.len(), 2, "one entry, two claims: `ws` and `wss`");
     assert!(rows.iter().all(|r| r.unit0_trigger == UNIT0_UPGRADE));
     assert_eq!(tail.composes_over_len, 0);
+}
+
+/// A REFUSED UPGRADE'S WAIT CROSSES THE ABI (THE DESIGN §1: the breaker applies to every plane
+/// alike; the piece's `retry_after_secs` with `PIECE_HAS_RETRY_AFTER`): a far end answering `429`
+/// with `Retry-After: 7` in place of `101` is heard as one head stating `429`, its class, and the
+/// seven seconds. RED before the fix: the framer read the wait and the door dropped it.
+#[test]
+fn a_refused_upgrade_s_retry_after_reaches_the_host() {
+    let mut host = Host::open(linked(), (64 * 1024, 64 * 1024, 64));
+    let mut dial = host.begin(SIDE_DIAL, "ws://svc.test/stream");
+    dial.wire.clear();
+    host.hear(
+        &mut dial,
+        b"HTTP/1.1 429 Too Many Requests\r\nRetry-After: 7\r\nContent-Length: 0\r\n\r\n",
+    );
+    assert_eq!(dial.heads.len(), 1, "one head");
+    assert_eq!(dial.heads[0].code, Some(429));
+    assert_eq!(dial.heads[0].retry_after, Some(7), "the wait crosses");
+    host.close();
 }
