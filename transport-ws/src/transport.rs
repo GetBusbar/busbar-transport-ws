@@ -132,6 +132,9 @@ enum Phase {
         scan: Scan,
         failed: Option<CloseCode>,
     },
+    /// A dialled connection the far end answered with something other than `101`: its answer was
+    /// handed up as the stream's head and its frames ended; nothing more is read or written.
+    Answered(Pipe),
 }
 
 impl Phase {
@@ -312,6 +315,7 @@ impl Phase {
             Phase::Accepting(mid) => mid.get_mut().get_mut(),
             Phase::Dialling { mid, .. } => mid.get_mut().get_mut(),
             Phase::Open { ws, .. } => ws.get_mut(),
+            Phase::Answered(pipe) => pipe,
         }
     }
 }
@@ -443,6 +447,38 @@ fn message_of(bytes: Bytes, text: bool) -> Result<Message, WsError> {
     }
 }
 
+/// THE STATUS CLASS of a far end's answer to the upgrade, by its HTTP status.
+fn status_class(code: u16) -> WireStatusClass {
+    match code {
+        200..=299 => WireStatusClass::Success,
+        400..=499 => WireStatusClass::CallerFault,
+        500..=599 => WireStatusClass::FarEndFault,
+        _ => WireStatusClass::Other,
+    }
+}
+
+/// The `Retry-After` an answer states, in whole seconds (its delta-seconds form).
+fn retry_after(headers: &HeaderMap) -> Option<u64> {
+    headers
+        .get("retry-after")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.trim().parse().ok())
+}
+
+/// THE CLOSE CODE A REFUSAL'S NEUTRAL STATUS MAPS TO (the plane seam: a neutral status the transport
+/// maps to its wire; RFC 6455 §7.4.1): the caller's credential refused or a policy, `1008`; too
+/// big, `1009`; throttled or unavailable, `1013` (try again later); another server failure, `1011`;
+/// none stated (`0`) or any other, the orderly `1000`.
+pub(crate) fn close_code_of_status(status: u32) -> CloseCode {
+    match status {
+        401 | 403 => CloseCode::Policy,
+        413 => CloseCode::Size,
+        429 | 503 => CloseCode::Again,
+        500..=599 => CloseCode::Error,
+        _ => CloseCode::Normal,
+    }
+}
+
 /// Hand whatever the machine wrote to core.
 fn drain(phase: &mut Phase, out: &mut dyn FramerOut) {
     #[cfg(feature = "test-seeded")]
@@ -507,6 +543,52 @@ mod seeded {
 }
 
 impl WsFramer {
+    /// Close `state` with `code` (a connection the far side failed closes with the failure's
+    /// code instead), handing what the machine wrote to core, and forget it.
+    fn close_with(&self, state: u64, code: CloseCode, out: &mut dyn FramerOut) {
+        let Some(conn) = self.map().remove(&state) else {
+            return;
+        };
+        let Ok(mut held) = Self::enter(&conn) else {
+            return;
+        };
+        let Some(mut phase) = held.take() else {
+            return;
+        };
+        if let Phase::Open { ws, failed, .. } = &mut phase {
+            // The close frame is a courtesy on a connection already finalised: what the machine
+            // could write goes out, and a close it cannot write is not an error anyone can act on.
+            // A connection the far side failed closes with the failure's code, whatever the reason
+            // this end closes for; one the far side closed already carried the far side's code
+            // back (the machine's answer), and the machine writes nothing more here.
+            let _ = ws.close(Some(CloseFrame {
+                code: failed.unwrap_or(code),
+                reason: "".into(),
+            }));
+            let _ = ws.flush();
+        }
+        drain(&mut phase, out);
+    }
+
+    /// The refusal `bytes`, closing the connection after it; `status` is the refusal's neutral
+    /// status (`RefuseIn::status`, `0` = none stated).
+    ///
+    /// # Errors
+    ///
+    /// As [`Framer::refusal`].
+    pub fn refusal_with(
+        &self,
+        state: u64,
+        _stream: Option<StreamId>,
+        bytes: &[u8],
+        status: u32,
+        out: &mut dyn FramerOut,
+    ) -> Result<(), TransportError> {
+        let sent = self.emit(state, StreamId(0), bytes, true, false, out);
+        self.close_with(state, close_code_of_status(status), out);
+        sent
+    }
+
     /// A framer whose messages (and frames) are capped at `max_message_bytes`; `0` = the protocol
     /// library's own default stands.
     #[must_use]
@@ -686,6 +768,10 @@ impl WsFramer {
         fresh: &[u8],
         out: &mut dyn FramerOut,
     ) -> Result<(Phase, bool), TransportError> {
+        if let Phase::Answered(_) = phase {
+            // Already answered and ended: what still arrives is nobody's.
+            return Ok((phase, false));
+        }
         let shaking = !matches!(phase, Phase::Open { .. });
         let mut phase = match phase {
             Phase::Accepting(mid) => match mid.handshake() {
@@ -713,6 +799,26 @@ impl WsFramer {
                 }
                 Err(HandshakeError::Interrupted(mid)) => {
                     return Ok((Phase::Dialling { mid, held, message }, false))
+                }
+                // THE FAR END REFUSED THE UPGRADE (HEAD-FIELDS: the head is always the first
+                // fields piece): its answer is handed up as ONE head with its status, its class and
+                // its fields, and the frames end, so the breaker reads what it answered.
+                Err(HandshakeError::Failure(WsError::Http(response))) => {
+                    let code = response.status().as_u16();
+                    let block = head_block(response.headers());
+                    out.frame(Framed {
+                        status: Some(status_class(code)),
+                        status_code: Some(u32::from(code)),
+                        retry_after_secs: retry_after(response.headers()),
+                        ..Framed::plain(StreamId(0), &block, true)
+                    });
+                    return Ok((
+                        Phase::Answered(Pipe {
+                            ended: true,
+                            ..Pipe::default()
+                        }),
+                        true,
+                    ));
                 }
                 Err(HandshakeError::Failure(_)) => return Err(TransportError::HandshakeFailed),
             },
@@ -988,38 +1094,15 @@ impl Framer for WsFramer {
     fn refusal(
         &self,
         state: u64,
-        _stream: Option<StreamId>,
+        stream: Option<StreamId>,
         bytes: &[u8],
         out: &mut dyn FramerOut,
     ) -> Result<(), TransportError> {
-        let sent = self.emit(state, StreamId(0), bytes, true, false, out);
-        self.close(state, CloseReason::Normal, out);
-        sent
+        self.refusal_with(state, stream, bytes, 0, out)
     }
 
     fn close(&self, state: u64, reason: CloseReason, out: &mut dyn FramerOut) {
-        let Some(conn) = self.map().remove(&state) else {
-            return;
-        };
-        let Ok(mut held) = Self::enter(&conn) else {
-            return;
-        };
-        let Some(mut phase) = held.take() else {
-            return;
-        };
-        if let Phase::Open { ws, failed, .. } = &mut phase {
-            // The close frame is a courtesy on a connection already finalised: what the machine
-            // could write goes out, and a close it cannot write is not an error anyone can act on.
-            // A connection the far side failed closes with the failure's code, whatever the reason
-            // this end closes for; one the far side closed already carried the far side's code
-            // back (the machine's answer), and the machine writes nothing more here.
-            let _ = ws.close(Some(CloseFrame {
-                code: failed.unwrap_or_else(|| close_code_for(reason)),
-                reason: "".into(),
-            }));
-            let _ = ws.flush();
-        }
-        drain(&mut phase, out);
+        self.close_with(state, close_code_for(reason), out);
     }
 
     /// A WebSocket state keeps no deadline of its own (it never states one), so a tick finds nothing
