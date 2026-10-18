@@ -9,7 +9,7 @@
 
 use busbar_contract::transport::wire::WireStatusClass;
 use busbar_contract::transport::{Framed, Framer, FramerOut, HostTime, Side};
-use tokio_tungstenite::tungstenite::handshake::derive_accept_key;
+use tungstenite::handshake::derive_accept_key;
 
 use crate::WsFramer;
 
@@ -221,4 +221,39 @@ fn a_ws_authority_ends_at_a_query_a_fragment_or_a_backslash() {
         (true, "host".to_string(), 9443, "/#f".to_string())
     );
     assert!(crate::transport::split_ws_url("wss://u@host/").is_err());
+}
+
+/// HELD, AND BOUNDED: a dial whose far end never answers cannot grow the framing without end. A
+/// message over the ceiling is refused as a capacity failure, and so is one past the held count.
+/// RED before the bound: both were held.
+#[test]
+fn a_dial_holds_early_messages_only_up_to_the_ceiling_and_the_held_count() {
+    let framer = WsFramer::new(8);
+    let mut out = Out::default();
+    let state = framer
+        .open_with(Side::Dial, "ws://127.0.0.1:9/x", &[], &mut out)
+        .expect("the dial opens");
+    let mut early = Out::default();
+    assert!(
+        framer
+            .emit_text(state, b"0123456789", true, false, &mut early)
+            .is_err(),
+        "a message over the ceiling is refused while held"
+    );
+    let unbounded = WsFramer::new(0);
+    let state = unbounded
+        .open_with(Side::Dial, "ws://127.0.0.1:9/x", &[], &mut out)
+        .expect("the dial opens");
+    for _ in 0..crate::transport::MAX_HELD_MESSAGES {
+        unbounded
+            .emit_text(state, b"m", true, false, &mut early)
+            .expect("held");
+    }
+    assert!(
+        unbounded
+            .emit_text(state, b"m", true, false, &mut early)
+            .is_err(),
+        "one past the held count is refused"
+    );
+    assert!(early.sent.is_empty(), "nothing leaves before the handshake");
 }
