@@ -343,3 +343,33 @@ fn a_refusal_closes_with_the_code_its_status_maps_to() {
         assert_eq!(close_code(&refused.sent), Some(code), "status {status}");
     }
 }
+
+/// A TEXT MESSAGE HELD WHILE THE DIAL'S HANDSHAKE RUNS IS CHECKED AT THE CALL, as the open
+/// connection checks it: bytes that are not UTF-8 fail the write, before they are held, so a bad
+/// message never tears the connection down later with the good ones queued ahead of it. RED before
+/// the fix: the held message was accepted and failed only at the replay.
+#[test]
+fn a_held_text_message_that_is_not_utf8_fails_at_the_call() {
+    let framer = WsFramer::new(0);
+    let mut out = Out::default();
+    let state = framer
+        .open_with(Side::Dial, "ws://127.0.0.1:9/x", &[], &mut out)
+        .expect("the dial opens");
+    let mut early = Out::default();
+    framer
+        .emit_text(state, b"fine", true, true, &mut early)
+        .expect("a text message is held");
+    assert!(
+        framer
+            .emit_text(state, b"\xff\xfe", true, true, &mut early)
+            .is_err(),
+        "not UTF-8: refused at the call"
+    );
+    // The connection lives on: the handshake completes and the good message goes out.
+    let request = String::from_utf8(out.sent.clone()).unwrap();
+    let mut done = Out::default();
+    framer
+        .ingest(state, &switching(&request), false, &mut done)
+        .expect("the handshake completes");
+    assert_eq!(opcodes(&done.sent), [0x1]);
+}
