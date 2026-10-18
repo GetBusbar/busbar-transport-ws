@@ -654,6 +654,12 @@ impl WsFramer {
             }
             message.extend_from_slice(bytes);
             if end_of_frame {
+                // A text message is checked at the call, as the open connection checks it: bytes
+                // that are not UTF-8 fail the write before they are held, never later at replay.
+                if text && std::str::from_utf8(message).is_err() {
+                    message.clear();
+                    return Err(TransportError::Framing);
+                }
                 held.push((std::mem::take(message), text));
             }
             return Ok(());
