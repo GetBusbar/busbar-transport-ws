@@ -507,6 +507,25 @@ mod seeded {
 }
 
 impl WsFramer {
+    /// The refusal `bytes`, closing the connection after it; `status` is the refusal's neutral
+    /// status (`RefuseIn::status`, `0` = none stated).
+    ///
+    /// # Errors
+    ///
+    /// As [`Framer::refusal`].
+    pub fn refusal_with(
+        &self,
+        state: u64,
+        _stream: Option<StreamId>,
+        bytes: &[u8],
+        _status: u32,
+        out: &mut dyn FramerOut,
+    ) -> Result<(), TransportError> {
+        let sent = self.emit(state, StreamId(0), bytes, true, false, out);
+        self.close(state, CloseReason::Normal, out);
+        sent
+    }
+
     /// A framer whose messages (and frames) are capped at `max_message_bytes`; `0` = the protocol
     /// library's own default stands.
     #[must_use]
@@ -988,13 +1007,11 @@ impl Framer for WsFramer {
     fn refusal(
         &self,
         state: u64,
-        _stream: Option<StreamId>,
+        stream: Option<StreamId>,
         bytes: &[u8],
         out: &mut dyn FramerOut,
     ) -> Result<(), TransportError> {
-        let sent = self.emit(state, StreamId(0), bytes, true, false, out);
-        self.close(state, CloseReason::Normal, out);
-        sent
+        self.refusal_with(state, stream, bytes, 0, out)
     }
 
     fn close(&self, state: u64, reason: CloseReason, out: &mut dyn FramerOut) {
