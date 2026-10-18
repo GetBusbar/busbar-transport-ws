@@ -30,8 +30,8 @@ use busbar_contract::transport::{ConnFacts, Framed, Framer, FramerOut, HostTime,
 use busbar_contract::TransportMeta;
 use busbar_transport_ws::door::{Begin, Emit, Ingest, Open};
 use busbar_transport_ws::WsFramer;
-use tokio_tungstenite::tungstenite::protocol::Role;
-use tokio_tungstenite::tungstenite::{Bytes, Message, WebSocket};
+use tungstenite::protocol::Role;
+use tungstenite::{Bytes, Message, WebSocket};
 
 const UPGRADE: &[u8] = b"GET /echo HTTP/1.1\r\nHost: svc.test\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n";
 

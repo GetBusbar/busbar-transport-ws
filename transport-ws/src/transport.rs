@@ -52,15 +52,15 @@ use busbar_contract::ids::StreamId;
 use busbar_contract::transport::wire::{CloseReason, Encode, TransportError, WireStatusClass};
 use busbar_contract::transport::{BytesOut, ConnFacts, Framed, Framer, FramerOut, Located, Side};
 use busbar_contract::{AbiVersion, Kind, Plugin};
-use tokio_tungstenite::tungstenite::client::IntoClientRequest;
-use tokio_tungstenite::tungstenite::error::ProtocolError;
-use tokio_tungstenite::tungstenite::handshake::client::ClientHandshake;
-use tokio_tungstenite::tungstenite::handshake::server::{NoCallback, ServerHandshake};
-use tokio_tungstenite::tungstenite::handshake::{HandshakeError, MidHandshake};
-use tokio_tungstenite::tungstenite::http::{HeaderMap, HeaderName, HeaderValue};
-use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
-use tokio_tungstenite::tungstenite::protocol::{CloseFrame, WebSocketConfig};
-use tokio_tungstenite::tungstenite::{Bytes, Error as WsError, Message, Utf8Bytes, WebSocket};
+use tungstenite::client::IntoClientRequest;
+use tungstenite::error::ProtocolError;
+use tungstenite::handshake::client::ClientHandshake;
+use tungstenite::handshake::server::{NoCallback, ServerHandshake};
+use tungstenite::handshake::{HandshakeError, MidHandshake};
+use tungstenite::http::{HeaderMap, HeaderName, HeaderValue};
+use tungstenite::protocol::frame::coding::CloseCode;
+use tungstenite::protocol::{CloseFrame, WebSocketConfig};
+use tungstenite::{Bytes, Error as WsError, Message, Utf8Bytes, WebSocket};
 
 /// The in-memory stream one framing state's protocol machine reads and writes: what core ingested
 /// and the machine has not consumed, whether the carrier's clean end followed it, what the
@@ -316,6 +316,9 @@ impl Phase {
     }
 }
 
+/// The most whole messages a dial holds while its handshake has not completed.
+pub const MAX_HELD_MESSAGES: usize = 64;
+
 /// The `ws` framer: its framing states, and the message ceiling every connection is built with.
 pub struct WsFramer {
     /// Every framing state, each behind its own lock: the map's lock is held only to find, add or
@@ -559,6 +562,14 @@ impl WsFramer {
         let conn = self.conn(state)?;
         let mut guard = Self::enter(&conn)?;
         if let Some(Phase::Dialling { held, message, .. }) = guard.as_mut() {
+            // HELD, AND BOUNDED: a message over the ceiling is refused as the open connection
+            // would refuse it (a capacity failure), and so is one past the held count, so a dial
+            // whose far end never answers cannot grow the framing without end.
+            let over = self.max_message_bytes > 0
+                && message.len().saturating_add(bytes.len()) > self.max_message_bytes;
+            if over || (end_of_frame && held.len() >= MAX_HELD_MESSAGES) {
+                return Err(TransportError::Framing);
+            }
             message.extend_from_slice(bytes);
             if end_of_frame {
                 held.push((std::mem::take(message), text));
@@ -617,10 +628,7 @@ impl WsFramer {
     ) -> Result<Phase, TransportError> {
         let mut phase = match side {
             Side::Accept => {
-                match tokio_tungstenite::tungstenite::accept_with_config(
-                    Pipe::default(),
-                    self.config(),
-                ) {
+                match tungstenite::accept_with_config(Pipe::default(), self.config()) {
                     Err(HandshakeError::Interrupted(mid)) => Phase::Accepting(mid),
                     // Nothing has been read, so nothing can have completed or failed yet.
                     Ok(_) | Err(HandshakeError::Failure(_)) => {
@@ -647,7 +655,7 @@ impl WsFramer {
                 request
                     .headers_mut()
                     .insert("sec-websocket-key", HeaderValue::from_static(seeded::KEY));
-                match tokio_tungstenite::tungstenite::client::client_with_config(
+                match tungstenite::client::client_with_config(
                     request,
                     Pipe {
                         client: true,
