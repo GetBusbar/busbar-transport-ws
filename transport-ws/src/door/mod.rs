@@ -795,7 +795,7 @@ impl Slot for Refuse {
         let bytes = raw(i.bytes, i.len);
         let stream = (i.has_stream != 0).then_some(StreamId(i.stream));
         framing(p, i.framing, &i.sink, o, |f, c| {
-            f.refusal(i.framing, stream, bytes, c)
+            f.refusal_with(i.framing, stream, bytes, i.status, c)
                 .map_err(|e| format!("{e:?}"))
         })
     }

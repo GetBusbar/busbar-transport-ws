@@ -257,3 +257,89 @@ fn a_dial_holds_early_messages_only_up_to_the_ceiling_and_the_held_count() {
     );
     assert!(early.sent.is_empty(), "nothing leaves before the handshake");
 }
+
+/// THE FAR END'S REFUSAL OF THE UPGRADE IS ITS ANSWER (THE DESIGN §5, HEAD-FIELDS: the head is
+/// always the first fields piece): a `401` (or `429`, `5xx`) in place of `101` is handed up as ONE
+/// head carrying its status, its class and its fields, and the frames end, so the breaker reads the
+/// status class. RED before the fix: the answer was discarded as a bare handshake failure.
+#[test]
+fn a_far_end_that_refuses_the_upgrade_hands_up_its_answer() {
+    for (code, class) in [
+        (401, WireStatusClass::CallerFault),
+        (429, WireStatusClass::CallerFault),
+        (503, WireStatusClass::FarEndFault),
+    ] {
+        let framer = WsFramer::new(0);
+        let mut out = Out::default();
+        let state = framer
+            .open_with(Side::Dial, "ws://127.0.0.1:9/x", &[], &mut out)
+            .expect("the dial opens");
+        let answer = format!(
+            "HTTP/1.1 {code} Nope\r\nWWW-Authenticate: Bearer\r\nRetry-After: 7\r\n\
+             Content-Length: 0\r\n\r\n"
+        );
+        let mut heard = Out::default();
+        framer
+            .ingest(state, answer.as_bytes(), false, &mut heard)
+            .expect("the far end answered");
+        assert_eq!(heard.frames.len(), 1, "{code}: one head");
+        assert_eq!(heard.statuses[0], Some((code, Some(class))), "{code}");
+        let head = String::from_utf8(heard.frames[0].clone()).unwrap();
+        assert!(
+            head.to_ascii_lowercase()
+                .contains("www-authenticate: bearer"),
+            "{code}: its fields ride the head: {head}"
+        );
+    }
+}
+
+/// The close code of the first close frame in a client's (masked) `wire`.
+fn close_code(wire: &[u8]) -> Option<u16> {
+    let mut at = 0;
+    while at + 2 <= wire.len() {
+        let op = wire[at] & 0x0f;
+        let len = usize::from(wire[at + 1] & 0x7f);
+        let mask = &wire[at + 2..at + 6];
+        let payload = &wire[at + 6..at + 6 + len];
+        if op == 0x8 && len >= 2 {
+            return Some(u16::from_be_bytes([
+                payload[0] ^ mask[0],
+                payload[1] ^ mask[1],
+            ]));
+        }
+        at += 6 + len;
+    }
+    None
+}
+
+/// A REFUSAL CLOSES WITH THE CODE ITS NEUTRAL STATUS MAPS TO (the plane seam: a neutral status the
+/// transport maps to its wire): 401/403 policy (1008), 413 too big (1009), 429/503 try again later
+/// (1013), another 5xx internal error (1011), none stated normal (1000). RED before the fix: every
+/// refusal closed 1000.
+#[test]
+fn a_refusal_closes_with_the_code_its_status_maps_to() {
+    for (status, code) in [
+        (0, 1000),
+        (401, 1008),
+        (403, 1008),
+        (413, 1009),
+        (429, 1013),
+        (503, 1013),
+        (500, 1011),
+    ] {
+        let framer = WsFramer::new(0);
+        let mut out = Out::default();
+        let state = framer
+            .open_with(Side::Dial, "ws://127.0.0.1:9/x", &[], &mut out)
+            .expect("the dial opens");
+        let request = String::from_utf8(out.sent.clone()).unwrap();
+        framer
+            .ingest(state, &switching(&request), false, &mut Out::default())
+            .expect("open");
+        let mut refused = Out::default();
+        framer
+            .refusal_with(state, None, b"no", status, &mut refused)
+            .expect("refused");
+        assert_eq!(close_code(&refused.sent), Some(code), "status {status}");
+    }
+}
