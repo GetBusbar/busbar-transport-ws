@@ -27,6 +27,8 @@ use std::ffi::c_void;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::task::Poll;
 
+use zeroize::Zeroize;
+
 use busbar_contract::abi::auth::{FIELD_QUERY, POINT_HEAD, POINT_HEAD_BODY, POINT_PEER};
 use busbar_contract::abi::host::service::{AuthRef, UnitRef, FLOW_CONTINUE};
 use busbar_contract::abi::mechanism::call::{AbiStr, Blob, InHead, OutHead, Outcome};
@@ -320,7 +322,9 @@ fn field_cut(bytes: &[u8], room: usize, in_value: bool) -> usize {
 /// What one framing owes the host and has not been able to hand it.
 #[derive(Default)]
 struct Owed {
-    wire: VecDeque<u8>,
+    /// Bytes owed to the far side: a dialled upgrade request carries its auth's credential lines,
+    /// so every byte leaves this buffer wiped ([`push_wiped`], [`consume_wiped`], and on drop).
+    wire: Vec<u8>,
     pieces: VecDeque<Piece>,
     /// The byte buffers of pieces already handed over, kept for the next pieces: a framing in
     /// steady state queues its messages without allocating.
@@ -328,6 +332,32 @@ struct Owed {
     ended: bool,
     deadline: Option<u64>,
     error: String,
+}
+
+impl Drop for Owed {
+    fn drop(&mut self) {
+        self.wire.zeroize();
+    }
+}
+
+/// Append `bytes` to `wire`, never leaving a copy behind in a buffer it outgrows.
+fn push_wiped(wire: &mut Vec<u8>, bytes: &[u8]) {
+    if wire.capacity() - wire.len() < bytes.len() {
+        let mut grown = Vec::with_capacity((wire.len() + bytes.len()).max(wire.capacity() * 2));
+        grown.extend_from_slice(wire);
+        wire.zeroize();
+        *wire = grown;
+    }
+    wire.extend_from_slice(bytes);
+}
+
+/// Drop the first `n` bytes of `wire` (handed to the host), wiping every byte the remainder no
+/// longer covers.
+fn consume_wiped(wire: &mut Vec<u8>, n: usize) {
+    let rest = wire.len() - n;
+    wire.copy_within(n.., 0);
+    wire[rest..].zeroize();
+    wire.truncate(rest);
 }
 
 /// The most handed-over piece buffers a framing keeps for reuse.
@@ -379,7 +409,7 @@ struct Collect<'a> {
 
 impl Out for Collect<'_> {
     fn send(&mut self, bytes: &[u8]) {
-        self.owed.wire.extend(bytes);
+        push_wiped(&mut self.owed.wire, bytes);
     }
     fn frame(&mut self, piece: Framed<'_>) {
         // The framer states a status on ONE frame only, the dialled stream's head: a message
@@ -416,7 +446,7 @@ impl Out for Collect<'_> {
 
 impl BytesOut for Collect<'_> {
     fn put(&mut self, bytes: &[u8]) {
-        self.owed.wire.extend(bytes);
+        push_wiped(&mut self.owed.wire, bytes);
     }
 }
 
@@ -582,12 +612,18 @@ impl Slot for Close {
     }
 }
 
-/// `cancel`: no framer op pends, so nothing is ever in flight to cancel.
+/// `cancel`: the one framer op that pends is a dial's `begin` on its auth call; a cancel of its
+/// ticket releases the dial parked there. Nothing of it went out, so nothing moved.
 pub struct Cancel;
 impl Slot for Cancel {
     type In = CancelIn;
     type Out = CancelOut;
-    fn call(_: *mut c_void, _: &CancelIn, o: &mut CancelOut) -> Outcome {
+    fn call(p: *mut c_void, i: &CancelIn, o: &mut CancelOut) -> Outcome {
+        if !p.is_null() {
+            instance(p)
+                .framer
+                .release((i.ticket.slot, i.ticket.generation));
+        }
         o.disposition = CANCEL_NOTHING_MOVED;
         Outcome::Ready
     }
@@ -1044,15 +1080,10 @@ impl Slot for Encode {
 /// Hand the host what the framing owes it, as far as the sink holds.
 fn fill(owed: &mut Owed, sink: &FramerSink, o: &mut FramerOut) {
     let w = owed.wire.len().min(sink.wire_cap);
-    let (front, back) = owed.wire.as_slices();
-    let a = w.min(front.len());
-    // SAFETY: `a <= w <= wire_cap` and `w - a <= back.len()`: both runs land inside the host's
-    // wire buffer, which no queue byte overlaps.
-    unsafe {
-        std::ptr::copy_nonoverlapping(front.as_ptr(), sink.wire, a);
-        std::ptr::copy_nonoverlapping(back.as_ptr(), sink.wire.add(a), w - a);
-    }
-    owed.wire.drain(..w);
+    // SAFETY: `w <= wire_cap`: the run lands inside the host's wire buffer, which no queue byte
+    // overlaps.
+    unsafe { std::ptr::copy_nonoverlapping(owed.wire.as_ptr(), sink.wire, w) };
+    consume_wiped(&mut owed.wire, w);
     let y = &mut o.yielded;
     y.wire_len = w as u64;
     let mut frame_len = 0_usize;
