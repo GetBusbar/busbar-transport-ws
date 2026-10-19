@@ -21,6 +21,8 @@
 //! * A DIALLED connection's upgrade request carries the dial's opening head fields (the bound
 //!   auth's `Authorization` among them), the WebSocket handshake's own fields excepted; a message
 //!   written before the handshake completes is held and goes out, in order, the moment it does.
+//! * A DIALLED connection's head yields its reason phrase as the far end sent it (HTTP/1), for the
+//!   door's head slots ([`WsFramer::take_reason`]).
 //! * A DIALLED connection's switching-protocols response is the far end's ANSWER (HEAD-FIELDS: a
 //!   transport always hands the response head up as the stream's first fields frame): the moment
 //!   it completes the handshake it is handed up as ONE frame carrying its status (`101`, a
@@ -34,8 +36,9 @@
 //!   every message completed before them is handed up first, the frames end, the layer above may
 //!   still answer what it was handed, and the close then carries the failure's code (1002 a
 //!   protocol error, 1007 a text payload that is not UTF-8, 1009 a message over the ceiling).
-//!   A text payload is checked as its bytes arrive, so a bad sequence fails the connection at
-//!   once, not when its frame completes.
+//!   The protocol machine judges every frame, text UTF-8 included (as each frame completes); this
+//!   framer parses no WebSocket frame of its own (THE DESIGN §2 "Libraries": ONE protocol = ONE
+//!   library, the `tungstenite` family).
 //! * The message ceiling is the deployment's body cap, for a whole message and for a single frame.
 //!
 //! The upgrade INTO this framer is [`Framer::adopt`]: another framer gave up the stream with the
@@ -70,10 +73,12 @@ pub(crate) struct Pipe {
     inbound: VecDeque<u8>,
     ended: bool,
     outbound: Vec<u8>,
-    /// Every byte ingested while the opening handshake runs: the protocol machine keeps what
-    /// follows the handshake's head, and the fail-fast check reads it from here.
+    /// Every byte ingested while the opening handshake runs: a dialled head's status line (its
+    /// reason phrase) is read from here.
     seen: Vec<u8>,
-    /// This end dialled: its frames are masked (RFC 6455 section 5.3).
+    /// This end dialled: its frames are masked (RFC 6455 section 5.3). Read only by the test
+    /// harness's seed (`test-seeded`), which unmasks a dialled end's frames.
+    #[cfg_attr(not(feature = "test-seeded"), allow(dead_code))]
     client: bool,
 }
 
@@ -124,17 +129,17 @@ enum Phase {
         message: Vec<u8>,
     },
     /// The session: the protocol machine, the pieces of an outbound message not yet marked
-    /// complete, the fail-fast check of inbound text, and the failure that ended the inbound frames
-    /// (its close code), if the far side broke the protocol.
+    /// complete, and the failure that ended the inbound frames (its close code), if the far side
+    /// broke the protocol.
     Open {
         ws: Box<WebSocket<Pipe>>,
         message: Vec<u8>,
-        scan: Scan,
         failed: Option<CloseCode>,
     },
-    /// A dialled connection the far end answered with something other than `101`: its answer was
-    /// handed up as the stream's head and its frames ended; nothing more is read or written.
-    Answered(Pipe),
+    /// A dialled connection the far end answered with something other than `101`: its answer's
+    /// head was handed up as the stream's head, then its body, `left` bytes of which (its declared
+    /// `Content-Length`) are still to come; at `0` its frames have ended and nothing more is read.
+    Answered { pipe: Pipe, left: u64 },
 }
 
 impl Phase {
@@ -143,169 +148,8 @@ impl Phase {
         Phase::Open {
             ws: Box::new(ws),
             message,
-            scan: Scan::default(),
             failed: None,
         }
-    }
-}
-
-/// THE FAIL-FAST CHECK of inbound text (RFC 6455 §8.1): the frame headers of the inbound stream,
-/// read as the bytes arrive, and the payload of every frame of a text message unmasked and checked
-/// as UTF-8 then, rather than when the protocol machine completes the frame. It only reads: the
-/// machine still parses every byte, and anything the check cannot follow (a header the machine will
-/// refuse) stops the check, never the connection.
-#[derive(Default)]
-pub(crate) struct Scan {
-    /// The header bytes of the frame being read, until it is whole.
-    head: Vec<u8>,
-    /// Payload bytes of the current frame still to come.
-    left: u64,
-    /// The current frame's mask and how far into its payload the check is.
-    mask: Option<[u8; 4]>,
-    at: u64,
-    /// The current frame ends its message.
-    fin: bool,
-    /// The current frame's payload belongs to a text message.
-    text: bool,
-    /// A text message is open (its continuations are text).
-    in_text: bool,
-    /// The start of a code point the last bytes split (at most three bytes).
-    carry: Vec<u8>,
-    /// The bytes being checked, unmasked: kept between calls so a check allocates nothing once
-    /// it has held its largest chunk.
-    buf: Vec<u8>,
-    /// The check stopped: a header it cannot follow, or a failure already found.
-    stopped: bool,
-}
-
-impl Scan {
-    /// Read `bytes` off the inbound stream: `false` = a text payload is not UTF-8.
-    fn feed(&mut self, mut bytes: &[u8]) -> bool {
-        while !bytes.is_empty() && !self.stopped {
-            if self.left == 0 && !self.header(&mut bytes) {
-                return true;
-            }
-            let n = usize::try_from(self.left).map_or(bytes.len(), |l| l.min(bytes.len()));
-            let (chunk, rest) = bytes.split_at(n);
-            bytes = rest;
-            if self.text && !self.check(chunk) {
-                self.stopped = true;
-                return false;
-            }
-            self.at += n as u64;
-            self.left -= n as u64;
-            if self.left == 0 && !self.end_of_frame() {
-                self.stopped = true;
-                return false;
-            }
-        }
-        true
-    }
-
-    /// Take header bytes off `bytes` until the header is whole: `false` = it is not yet (or the
-    /// check stopped).
-    fn header(&mut self, bytes: &mut &[u8]) -> bool {
-        loop {
-            let need = match self.head.len() {
-                0 | 1 => 2,
-                _ => {
-                    let len7 = self.head[1] & 0x7f;
-                    let ext = match len7 {
-                        126 => 2,
-                        127 => 8,
-                        _ => 0,
-                    };
-                    2 + ext + if self.head[1] & 0x80 != 0 { 4 } else { 0 }
-                }
-            };
-            if self.head.len() >= need && self.head.len() >= 2 {
-                break;
-            }
-            let Some((&b, rest)) = bytes.split_first() else {
-                return false;
-            };
-            self.head.push(b);
-            *bytes = rest;
-        }
-        // The header, read off the kept buffer (at most 14 bytes), which is emptied for the next
-        // frame's header without giving up its room.
-        let mut head = [0_u8; 14];
-        head[..self.head.len()].copy_from_slice(&self.head);
-        self.head.clear();
-        let (b0, b1) = (head[0], head[1]);
-        let (len, at) = match b1 & 0x7f {
-            126 => (u64::from(u16::from_be_bytes([head[2], head[3]])), 4),
-            127 => {
-                let mut l = [0_u8; 8];
-                l.copy_from_slice(&head[2..10]);
-                (u64::from_be_bytes(l), 10)
-            }
-            l => (u64::from(l), 2),
-        };
-        self.mask = (b1 & 0x80 != 0).then(|| [head[at], head[at + 1], head[at + 2], head[at + 3]]);
-        self.at = 0;
-        self.left = len;
-        self.fin = b0 & 0x80 != 0;
-        let opcode = b0 & 0x0f;
-        self.text = match opcode {
-            // A continuation is text when it continues a text message.
-            0x0 => self.in_text,
-            0x1 => {
-                self.in_text = true;
-                self.carry.clear();
-                true
-            }
-            0x2 => {
-                self.in_text = false;
-                false
-            }
-            // A control frame interleaves; it neither opens nor closes a message.
-            0x8..=0xa => false,
-            // A reserved opcode: the machine refuses it; the check has nothing more to follow.
-            _ => {
-                self.stopped = true;
-                return false;
-            }
-        };
-        true
-    }
-
-    /// The current frame's payload is all read: a text message it ends must end on a whole code
-    /// point.
-    fn end_of_frame(&mut self) -> bool {
-        if self.text && self.fin {
-            self.in_text = false;
-            let whole = self.carry.is_empty();
-            self.carry.clear();
-            return whole;
-        }
-        true
-    }
-
-    /// Check `chunk` (still masked) as the next text bytes: `false` = not UTF-8.
-    fn check(&mut self, chunk: &[u8]) -> bool {
-        let mut bytes = std::mem::take(&mut self.buf);
-        bytes.clear();
-        bytes.extend_from_slice(&self.carry);
-        bytes.extend(chunk.iter().enumerate().map(|(k, b)| match self.mask {
-            Some(m) => b ^ m[((self.at + k as u64) % 4) as usize],
-            None => *b,
-        }));
-        let ok = match std::str::from_utf8(&bytes) {
-            Ok(_) => {
-                self.carry.clear();
-                true
-            }
-            // Cut short inside a code point: its start waits for the bytes that finish it.
-            Err(e) if e.error_len().is_none() => {
-                self.carry.clear();
-                self.carry.extend_from_slice(&bytes[e.valid_up_to()..]);
-                true
-            }
-            Err(_) => false,
-        };
-        self.buf = bytes;
-        ok
     }
 }
 
@@ -315,7 +159,7 @@ impl Phase {
             Phase::Accepting(mid) => mid.get_mut().get_mut(),
             Phase::Dialling { mid, .. } => mid.get_mut().get_mut(),
             Phase::Open { ws, .. } => ws.get_mut(),
-            Phase::Answered(pipe) => pipe,
+            Phase::Answered { pipe, .. } => pipe,
         }
     }
 }
@@ -329,6 +173,9 @@ pub struct WsFramer {
     /// remove one, never across a framing's work, so connections run side by side and a panic in
     /// one fails that one alone.
     states: Mutex<HashMap<u64, Conn>>,
+    /// Each dialled framing's head reason phrase, from the call that handed the head up until the
+    /// door takes it ([`WsFramer::take_reason`]).
+    reasons: Mutex<HashMap<u64, Vec<u8>>>,
     next: AtomicU64,
     max_message_bytes: usize,
 }
@@ -465,6 +312,44 @@ fn retry_after(headers: &HeaderMap) -> Option<u64> {
         .and_then(|v| v.trim().parse().ok())
 }
 
+/// The `Content-Length` an answer declares.
+fn content_length(headers: &HeaderMap) -> Option<u64> {
+    headers
+        .get("content-length")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.trim().parse().ok())
+}
+
+/// A dialled head's REASON PHRASE (HEAD-FIELDS: the dialled side fills `reason`, HTTP/1 as sent):
+/// the status line's text after its code, once the line is whole (`HTTP/1.1 401 Unauthorized` →
+/// `Unauthorized`); `None` before the line ends, or for a line with no phrase.
+pub(crate) fn reason_phrase(seen: &[u8]) -> Option<Vec<u8>> {
+    let end = seen.windows(2).position(|w| w == b"\r\n")?;
+    let mut parts = seen[..end].splitn(3, |b| *b == b' ');
+    let (_version, _code) = (parts.next()?, parts.next()?);
+    parts.next().filter(|r| !r.is_empty()).map(<[u8]>::to_vec)
+}
+
+/// A refused upgrade's body still arriving: frame what the pipe holds, up to the `left` bytes its
+/// `Content-Length` still owes, and end the frames once they are all handed up (or the carrier
+/// ended). Past that, what arrives is nobody's.
+fn answered_body(mut pipe: Pipe, left: u64, out: &mut dyn FramerOut) -> (Phase, bool) {
+    if left == 0 {
+        pipe.inbound.clear();
+        return (Phase::Answered { pipe, left }, false);
+    }
+    let take = usize::try_from(left).map_or(pipe.inbound.len(), |l| l.min(pipe.inbound.len()));
+    let bytes: Vec<u8> = pipe.inbound.drain(..take).collect();
+    let left = left - take as u64;
+    let ended = left == 0 || (pipe.ended && pipe.inbound.is_empty());
+    if !bytes.is_empty() || ended {
+        out.frame(Framed::plain(StreamId(0), &bytes, ended));
+    }
+    pipe.inbound.clear();
+    let left = if ended { 0 } else { left };
+    (Phase::Answered { pipe, left }, ended)
+}
+
 /// THE CLOSE CODE A REFUSAL'S NEUTRAL STATUS MAPS TO (the plane seam: a neutral status the transport
 /// maps to its wire; RFC 6455 §7.4.1): the caller's credential refused or a policy, `1008`; too
 /// big, `1009`; throttled or unavailable, `1013` (try again later); another server failure, `1011`;
@@ -595,6 +480,7 @@ impl WsFramer {
     pub fn new(max_message_bytes: usize) -> Self {
         Self {
             states: Mutex::new(HashMap::new()),
+            reasons: Mutex::new(HashMap::new()),
             next: AtomicU64::new(1),
             max_message_bytes,
         }
@@ -693,6 +579,15 @@ impl WsFramer {
         self.states.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
+    /// The reason phrase of the head framing `state`'s last call handed up (a dialled framing's,
+    /// HTTP/1 as sent), taken once: the door states it in the head's slots.
+    pub fn take_reason(&self, state: u64) -> Option<Vec<u8>> {
+        self.reasons
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&state)
+    }
+
     /// Framing `state`'s own lock, found under the map's.
     fn conn(&self, state: u64) -> Result<Conn, TransportError> {
         self.map()
@@ -766,23 +661,36 @@ impl WsFramer {
         Ok(phase)
     }
 
-    /// Drive `phase` over what its pipe holds (`fresh` = the bytes this call ingested, for the
-    /// fail-fast check): finish the handshake if it can, then hand every message it completes up as
-    /// a frame. Answers whether the connection's frames ended.
+    /// Drive `phase` over what its pipe holds: finish the handshake if it can, then hand every
+    /// message it completes up as a frame. Answers whether the connection's frames ended, and a
+    /// dialled head's reason phrase the moment that head is handed up.
     fn drive(
         phase: Phase,
-        fresh: &[u8],
         out: &mut dyn FramerOut,
-    ) -> Result<(Phase, bool), TransportError> {
-        if let Phase::Answered(_) = phase {
-            // Already answered and ended: what still arrives is nobody's.
-            return Ok((phase, false));
-        }
+    ) -> Result<(Phase, bool, Option<Vec<u8>>), TransportError> {
+        let mut phase = match phase {
+            Phase::Answered { pipe, left } => {
+                let (phase, ended) = answered_body(pipe, left, out);
+                return Ok((phase, ended, None));
+            }
+            phase => phase,
+        };
         let shaking = !matches!(phase, Phase::Open { .. });
+        // THE DIALLED HEAD'S REASON PHRASE (HEAD-FIELDS: the dialled side fills `reason`, as the
+        // far end sent it), read off the status line before the machine takes the head.
+        let reason = match &mut phase {
+            Phase::Dialling { mid, .. } => reason_phrase(&mid.get_mut().get_mut().seen),
+            _ => None,
+        };
         let mut phase = match phase {
             Phase::Accepting(mid) => match mid.handshake() {
-                Ok(ws) => Phase::open(ws, Vec::new()),
-                Err(HandshakeError::Interrupted(mid)) => return Ok((Phase::Accepting(mid), false)),
+                Ok(mut ws) => {
+                    ws.get_mut().seen = Vec::new();
+                    Phase::open(ws, Vec::new())
+                }
+                Err(HandshakeError::Interrupted(mid)) => {
+                    return Ok((Phase::Accepting(mid), false, None))
+                }
                 Err(HandshakeError::Failure(_)) => return Err(TransportError::HandshakeFailed),
             },
             Phase::Dialling { mid, held, message } => match mid.handshake() {
@@ -801,14 +709,19 @@ impl WsFramer {
                         let m = message_of(Bytes::from(bytes), text).map_err(|e| read_error(&e))?;
                         ws.write(m).map_err(|e| read_error(&e))?;
                     }
+                    ws.get_mut().seen = Vec::new();
                     Phase::open(ws, message)
                 }
                 Err(HandshakeError::Interrupted(mid)) => {
-                    return Ok((Phase::Dialling { mid, held, message }, false))
+                    return Ok((Phase::Dialling { mid, held, message }, false, None))
                 }
                 // THE FAR END REFUSED THE UPGRADE (HEAD-FIELDS: the head is always the first
                 // fields piece): its answer is handed up as ONE head with its status, its class and
-                // its fields, and the frames end, so the breaker reads what it answered.
+                // its fields, then its body (a far end's error document), and the frames end, so the
+                // breaker reads what it answered and the plane sees what it said. The body is the
+                // bytes its declared `Content-Length` names: what the machine read past the head
+                // first, then what still arrives. With no length declared, the bytes that came with
+                // the head are the body (this framer decodes no HTTP/1 body framing).
                 Err(HandshakeError::Failure(WsError::Http(response))) => {
                     let code = response.status().as_u16();
                     let block = head_block(response.headers());
@@ -818,40 +731,35 @@ impl WsFramer {
                         retry_after_secs: retry_after(response.headers()),
                         ..Framed::plain(StreamId(0), &block, true)
                     });
-                    return Ok((
-                        Phase::Answered(Pipe {
-                            ended: true,
-                            ..Pipe::default()
-                        }),
-                        true,
-                    ));
+                    let tail = response.body().as_deref().unwrap_or_default();
+                    let declared = content_length(response.headers());
+                    let left = declared.map_or(0, |n| n.saturating_sub(tail.len() as u64));
+                    let taken = declared.map_or(tail.len(), |n| {
+                        tail.len().min(usize::try_from(n).unwrap_or(usize::MAX))
+                    });
+                    if taken != 0 {
+                        out.frame(Framed::plain(StreamId(0), &tail[..taken], left == 0));
+                    }
+                    let pipe = Pipe {
+                        ended: left == 0,
+                        ..Pipe::default()
+                    };
+                    return Ok((Phase::Answered { pipe, left }, left == 0, reason));
                 }
                 Err(HandshakeError::Failure(_)) => return Err(TransportError::HandshakeFailed),
             },
             open => open,
         };
-        let Phase::Open {
-            ws, scan, failed, ..
-        } = &mut phase
-        else {
+        let Phase::Open { ws, failed, .. } = &mut phase else {
             unreachable!("every other phase returned above");
         };
+        // The head just handed up carries its reason; an open session's later calls carry none.
+        let reason = if shaking { reason } else { None };
         if failed.is_some() {
             // The frames ended at the failure: what still arrives is nobody's.
             ws.get_mut().inbound.clear();
-            return Ok((phase, false));
+            return Ok((phase, false, None));
         }
-        // The check reads the stream from the first byte after the handshake's head.
-        let text_ok = if shaking {
-            let seen = std::mem::take(&mut ws.get_mut().seen);
-            let at = seen
-                .windows(4)
-                .position(|w| w == b"\r\n\r\n")
-                .map_or(seen.len(), |p| p + 4);
-            scan.feed(&seen[at..])
-        } else {
-            scan.feed(fresh)
-        };
         let mut ended = false;
         loop {
             match ws.read() {
@@ -891,11 +799,6 @@ impl WsFramer {
                 },
             }
         }
-        // A text payload that is not UTF-8 fails the connection now, behind every message that
-        // completed before it.
-        if failed.is_none() && !text_ok {
-            *failed = Some(CloseCode::Invalid);
-        }
         if failed.is_some() {
             ws.get_mut().inbound.clear();
             ended = true;
@@ -908,7 +811,7 @@ impl WsFramer {
         }
         let pipe = ws.get_mut();
         ended |= pipe.ended && pipe.inbound.is_empty();
-        Ok((phase, ended))
+        Ok((phase, ended, reason))
     }
 
     /// Run `op` on the open state `state`, handing what it wrote to core.
@@ -1053,8 +956,14 @@ impl Framer for WsFramer {
         if shaking {
             pipe.seen.extend_from_slice(bytes);
         }
-        match Self::drive(phase, bytes, out) {
-            Ok((mut phase, ended)) => {
+        match Self::drive(phase, out) {
+            Ok((mut phase, ended, reason)) => {
+                if let Some(reason) = reason {
+                    self.reasons
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .insert(state, reason);
+                }
                 drain(&mut phase, out);
                 if ended {
                     out.end();
@@ -1066,6 +975,7 @@ impl Framer for WsFramer {
             Err(e) => {
                 drop(held);
                 self.map().remove(&state);
+                self.take_reason(state);
                 Err(e)
             }
         }
