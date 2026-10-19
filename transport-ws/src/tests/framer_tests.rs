@@ -380,6 +380,44 @@ fn a_refused_upgrade_hands_up_a_large_body_and_the_carrier_end() {
     assert!(heard.ended, "the carrier ended: the frames end");
 }
 
+/// THE CEILING HOLDS FOR WHAT AN OPEN CONNECTION WRITES TOO (Q128 transport-ws LOW): a message over
+/// the ceiling, whole or gathered from pieces, is refused as a held one is, and one within it goes
+/// out. RED before the fix: the open path sent any size (the machine bounds only what it reads).
+#[test]
+fn an_open_connection_refuses_an_outbound_message_over_the_ceiling() {
+    let framer = WsFramer::new(8);
+    let mut out = Out::default();
+    let state = framer
+        .open_with(Side::Dial, "ws://127.0.0.1:9/x", &[], &mut out)
+        .expect("the dial opens");
+    let request = String::from_utf8(out.sent.clone()).expect("an upgrade request");
+    let mut opened = Out::default();
+    framer
+        .ingest(state, &switching(&request), false, &mut opened)
+        .expect("the handshake completes");
+    let mut w = Out::default();
+    assert!(
+        framer
+            .emit_text(state, b"123456789", true, false, &mut w)
+            .is_err(),
+        "whole"
+    );
+    framer
+        .emit_text(state, b"12345", false, false, &mut w)
+        .expect("a piece within the ceiling");
+    assert!(
+        framer
+            .emit_text(state, b"6789", true, false, &mut w)
+            .is_err(),
+        "gathered"
+    );
+    let mut ok = Out::default();
+    framer
+        .emit_text(state, b"12345678", true, false, &mut ok)
+        .expect("within the ceiling");
+    assert!(!ok.sent.is_empty(), "the message went out");
+}
+
 /// A dialled head's reason phrase is the status line's text after its code, once the line is whole.
 #[test]
 fn a_reason_phrase_is_read_off_a_whole_status_line() {
