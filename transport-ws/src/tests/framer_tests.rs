@@ -11,7 +11,9 @@ use busbar_contract::transport::wire::WireStatusClass;
 use busbar_contract::transport::{Framed, Framer, FramerOut, HostTime, Side};
 use tungstenite::handshake::derive_accept_key;
 
-use crate::transport::{reason_phrase, retry_after, AuthLine, UpgradeHead};
+use std::task::Poll;
+
+use crate::transport::{reason_phrase, retry_after, AuthLine, Parking, UpgradeHead};
 use crate::WsFramer;
 use tungstenite::http::{HeaderMap, HeaderValue};
 use zeroize::Zeroizing;
@@ -775,24 +777,25 @@ fn an_auth_that_signs_the_whole_head_sees_every_byte_on_the_wire() {
     let mut seen = Vec::new();
     let mut sign = |head: &UpgradeHead<'_>| {
         seen.push((as_sent(head), head.authority.to_owned()));
-        Ok(vec![
+        Poll::Ready(Ok(vec![
             field_line("X-Sig", b"signed"),
             AuthLine {
                 name: "sig".into(),
                 value: Zeroizing::new(b"q1".to_vec()),
                 query: true,
             },
-        ])
+        ]))
     };
     let mut out = Out::default();
-    let state = framer
-        .open_signed(
-            "ws://svc.test:9/x?a=1&sig=old",
-            &fields,
-            &mut sign,
-            &mut out,
-        )
-        .expect("the dial opens");
+    let Poll::Ready(Ok(state)) = framer.open_signed(
+        PARKING,
+        "ws://svc.test:9/x?a=1&sig=old",
+        &fields,
+        &mut sign,
+        &mut out,
+    ) else {
+        panic!("the dial opens");
+    };
     let request = String::from_utf8(out.sent.clone()).expect("an upgrade request");
     assert_eq!(seen.len(), 1, "the auth is called once");
     let (signed_over, authority) = &seen[0];
@@ -842,14 +845,72 @@ fn an_auth_answer_the_request_cannot_carry_refuses_the_dial() {
     for answer in answers {
         let framer = WsFramer::new(0);
         let mut once = Some(answer);
-        let mut sign = |_: &UpgradeHead<'_>| Ok(once.take().into_iter().collect());
+        let mut sign = |_: &UpgradeHead<'_>| Poll::Ready(Ok(once.take().into_iter().collect()));
         let mut out = Out::default();
         assert!(
-            framer
-                .open_signed("ws://svc.test/x", &[], &mut sign, &mut out)
-                .is_err(),
+            matches!(
+                framer.open_signed(PARKING, "ws://svc.test/x", &[], &mut sign, &mut out),
+                Poll::Ready(Err(_))
+            ),
             "refused"
         );
         assert!(out.sent.is_empty(), "nothing leaves on a refused dial");
     }
+}
+
+/// The op's parking: one ticket, a deadline ahead of now.
+const PARKING: Parking = Parking {
+    ticket: (7, 1),
+    deadline: 1_000,
+    now: 10,
+};
+
+/// A SIGN THAT IS NOT READY PARKS THE DIAL, AND THE RESUME SIGNS THE SAME BYTES (ruling 23; the
+/// framer pends only on a ticketed auth call): nothing goes out while the auth's answer is
+/// pending; the resumed op on the same ticket offers the auth the SAME head (its key among it), so
+/// the answer the host stored signs exactly what is sent; a parked dial whose op's deadline
+/// passed is dropped, never resumed.
+#[test]
+fn a_pending_sign_parks_the_dial_and_its_resume_signs_the_same_head() {
+    let framer = WsFramer::new(0);
+    let mut heads = Vec::new();
+    let mut out = Out::default();
+    let mut pending = |head: &UpgradeHead<'_>| {
+        heads.push(as_sent(head));
+        Poll::Pending
+    };
+    assert!(framer
+        .open_signed(PARKING, "ws://svc.test/x", &[], &mut pending, &mut out)
+        .is_pending());
+    assert!(out.sent.is_empty(), "nothing leaves while the auth pends");
+    assert_eq!(framer.parked(), 1);
+
+    let mut ready = |head: &UpgradeHead<'_>| {
+        heads.push(as_sent(head));
+        Poll::Ready(Ok(vec![field_line("x-sig", b"s")]))
+    };
+    let Poll::Ready(Ok(_)) =
+        framer.open_signed(PARKING, "ws://svc.test/x", &[], &mut ready, &mut out)
+    else {
+        panic!("the resumed dial opens");
+    };
+    assert_eq!(heads.len(), 2);
+    assert_eq!(
+        heads[0], heads[1],
+        "the resume signs the same head, its key among it"
+    );
+    let request = String::from_utf8(out.sent.clone()).expect("an upgrade request");
+    assert_eq!(request, format!("{}x-sig: s\r\n\r\n", heads[0]));
+    assert_eq!(framer.parked(), 0, "a resumed dial is no longer parked");
+
+    // A dial parked past its op's deadline is dropped by the next park.
+    let mut pending = |_: &UpgradeHead<'_>| Poll::Pending;
+    let _ = framer.open_signed(PARKING, "ws://svc.test/x", &[], &mut pending, &mut out);
+    let later = Parking {
+        ticket: (8, 1),
+        deadline: 2_000,
+        now: 1_500,
+    };
+    let _ = framer.open_signed(later, "ws://svc.test/x", &[], &mut pending, &mut out);
+    assert_eq!(framer.parked(), 1, "only the live dial stays parked");
 }

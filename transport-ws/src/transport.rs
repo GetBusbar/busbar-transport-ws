@@ -49,6 +49,7 @@ use std::collections::{HashMap, VecDeque};
 use std::io::{Read, Write};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::task::Poll;
 
 use busbar_contract::abi::transport::fields::{hop_by_hop, LINE_END, SEPARATOR};
 use busbar_contract::ids::StreamId;
@@ -176,6 +177,18 @@ impl Phase {
     }
 }
 
+/// Where a dial awaiting its auth's answer is parked: the op's ticket, its deadline and the host
+/// clock now (both on the host's monotonic clock; a deadline of `0` is none).
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Parking {
+    /// The op's ticket (`InHead::ticket`), as `(slot, generation)`.
+    pub(crate) ticket: (u32, u32),
+    /// The op's deadline.
+    pub(crate) deadline: u64,
+    /// Now.
+    pub(crate) now: u64,
+}
+
 /// The most whole messages a dial holds while its handshake has not completed.
 pub(crate) const MAX_HELD_MESSAGES: usize = 64;
 
@@ -188,6 +201,9 @@ pub(crate) struct WsFramer {
     /// Each dialled framing's head reason phrase, from the call that handed the head up until the
     /// door takes it ([`WsFramer::take_reason`]).
     reasons: Mutex<HashMap<u64, Vec<u8>>>,
+    /// Dials awaiting their auth's answer, by the op's ticket, each with the op's deadline
+    /// ([`WsFramer::open_signed`]).
+    parked: Mutex<HashMap<(u32, u32), (u64, Phase)>>,
     next: AtomicU64,
     max_message_bytes: usize,
 }
@@ -693,6 +709,7 @@ impl WsFramer {
         Self {
             states: Mutex::new(HashMap::new()),
             reasons: Mutex::new(HashMap::new()),
+            parked: Mutex::new(HashMap::new()),
             next: AtomicU64::new(1),
             max_message_bytes,
         }
@@ -719,26 +736,81 @@ impl WsFramer {
         fields: &[(String, Vec<u8>)],
         out: &mut dyn FramerOut,
     ) -> Result<u64, TransportError> {
-        let phase = self.start(side, target, fields, None, out)?;
+        let phase = self.start(side, target, fields, out)?;
         Ok(self.hold(phase))
     }
 
-    /// [`Self::open_with`] for a dial whose binding has an auth (`BeginIn::points` not `0`): the
-    /// upgrade request is built whole, `sign` is called ONCE over it exactly as it goes on the
-    /// wire, and its answer joins it last ([`signed_request`]).
+    /// [`Self::open_with`] for a dial whose binding has an auth at the head (`BeginIn::points`):
+    /// the upgrade request is built whole, `sign` is called over it exactly as it goes on the wire,
+    /// and its answer joins it last ([`signed_request`]). A sign that is not ready PARKS the built
+    /// dial under the op's `ticket` (its key and its head kept, so the answer that comes back
+    /// signs these bytes) until the op resumes on the same ticket, or `deadline` (the op's, on the
+    /// host clock, `0` = none) passes; nothing is written meanwhile.
     ///
     /// # Errors
     ///
     /// As [`Self::open_with`]; the auth refused, or answered a line the request cannot carry.
     pub(crate) fn open_signed(
         &self,
+        parking: Parking,
         target: &str,
         fields: &[(String, Vec<u8>)],
         sign: Signer<'_>,
         out: &mut dyn FramerOut,
-    ) -> Result<u64, TransportError> {
-        let phase = self.start(Side::Dial, target, fields, Some(sign), out)?;
-        Ok(self.hold(phase))
+    ) -> Poll<Result<u64, TransportError>> {
+        let mut phase = match self.unpark(parking) {
+            Some(phase) => phase,
+            None => match self.dial(target, fields) {
+                Ok(phase) => phase,
+                Err(e) => return Poll::Ready(Err(e)),
+            },
+        };
+        let signed = signed_request(&phase.pipe().outbound, sign);
+        let pipe = phase.pipe();
+        match signed {
+            Poll::Pending => {
+                self.park(parking, phase);
+                return Poll::Pending;
+            }
+            Poll::Ready(Err(e)) => {
+                pipe.outbound.zeroize();
+                return Poll::Ready(Err(e));
+            }
+            Poll::Ready(Ok(signed)) => {
+                pipe.outbound.zeroize();
+                pipe.outbound = signed;
+            }
+        }
+        drain(&mut phase, out);
+        // The upgrade request carries credential lines: what held it is wiped once sent.
+        phase.pipe().outbound.zeroize();
+        Poll::Ready(Ok(self.hold(phase)))
+    }
+
+    /// Park a dial awaiting its auth's answer, and drop every parked dial whose op's deadline has
+    /// passed (its op will never resume).
+    fn park(&self, parking: Parking, phase: Phase) {
+        let mut parked = self.parked.lock().unwrap_or_else(PoisonError::into_inner);
+        parked.retain(|_, (deadline, _)| *deadline == 0 || *deadline > parking.now);
+        parked.insert(parking.ticket, (parking.deadline, phase));
+    }
+
+    /// The dial parked under `parking`'s ticket, taken.
+    fn unpark(&self, parking: Parking) -> Option<Phase> {
+        self.parked
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&parking.ticket)
+            .map(|(_, phase)| phase)
+    }
+
+    /// How many dials are parked (a test reads that a resumed or expired dial is gone).
+    #[cfg(test)]
+    pub(crate) fn parked(&self) -> usize {
+        self.parked
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .len()
     }
 
     /// [`Framer::emit`]: with `text` (the emit's `EMIT_TEXT`) the message goes out as a text
@@ -870,7 +942,6 @@ impl WsFramer {
         side: Side,
         target: &str,
         fields: &[(String, Vec<u8>)],
-        sign: Option<Signer<'_>>,
         out: &mut dyn FramerOut,
     ) -> Result<Phase, TransportError> {
         let mut phase = match side {
@@ -883,58 +954,50 @@ impl WsFramer {
                     }
                 }
             }
-            Side::Dial => {
-                let url = request_url(target)?;
-                let mut request = url
-                    .as_str()
-                    .into_client_request()
-                    .map_err(|_| TransportError::AddressRefused)?;
-                for (name, value) in fields.iter().filter(|(n, _)| rides_upgrade(n)) {
-                    let (Ok(name), Ok(value)) = (
-                        HeaderName::from_bytes(name.as_bytes()),
-                        HeaderValue::from_bytes(value),
-                    ) else {
-                        return Err(TransportError::HandshakeFailed);
-                    };
-                    request.headers_mut().append(name, value);
-                }
-                #[cfg(feature = "test-seeded")]
-                request
-                    .headers_mut()
-                    .insert("sec-websocket-key", HeaderValue::from_static(seeded::KEY));
-                match tungstenite::client::client_with_config(
-                    request,
-                    Pipe {
-                        client: true,
-                        ..Pipe::default()
-                    },
-                    self.config(),
-                ) {
-                    Err(HandshakeError::Interrupted(mut mid)) => {
-                        // RULING 23: the request the machine wrote is the head the auth signs;
-                        // what goes out is that head and the auth's answer, nothing after.
-                        if let Some(sign) = sign {
-                            let pipe = mid.get_mut().get_mut();
-                            let signed = signed_request(&pipe.outbound, sign)?;
-                            pipe.outbound.zeroize();
-                            pipe.outbound = signed;
-                        }
-                        Phase::Dialling {
-                            mid,
-                            held: Vec::new(),
-                            message: Vec::new(),
-                        }
-                    }
-                    Ok(_) | Err(HandshakeError::Failure(_)) => {
-                        return Err(TransportError::HandshakeFailed)
-                    }
-                }
-            }
+            Side::Dial => self.dial(target, fields)?,
         };
         drain(&mut phase, out);
         // The upgrade request may carry credential lines: what held it is wiped once sent.
         phase.pipe().outbound.zeroize();
         Ok(phase)
+    }
+
+    /// A dial's upgrade request, built and written into its pipe and not yet handed out: the
+    /// protocol machine's handshake lines, then `fields` ([`rides_upgrade`]'s).
+    fn dial(&self, target: &str, fields: &[(String, Vec<u8>)]) -> Result<Phase, TransportError> {
+        let url = request_url(target)?;
+        let mut request = url
+            .as_str()
+            .into_client_request()
+            .map_err(|_| TransportError::AddressRefused)?;
+        for (name, value) in fields.iter().filter(|(n, _)| rides_upgrade(n)) {
+            let (Ok(name), Ok(value)) = (
+                HeaderName::from_bytes(name.as_bytes()),
+                HeaderValue::from_bytes(value),
+            ) else {
+                return Err(TransportError::HandshakeFailed);
+            };
+            request.headers_mut().append(name, value);
+        }
+        #[cfg(feature = "test-seeded")]
+        request
+            .headers_mut()
+            .insert("sec-websocket-key", HeaderValue::from_static(seeded::KEY));
+        match tungstenite::client::client_with_config(
+            request,
+            Pipe {
+                client: true,
+                ..Pipe::default()
+            },
+            self.config(),
+        ) {
+            Err(HandshakeError::Interrupted(mid)) => Ok(Phase::Dialling {
+                mid,
+                held: Vec::new(),
+                message: Vec::new(),
+            }),
+            Ok(_) | Err(HandshakeError::Failure(_)) => Err(TransportError::HandshakeFailed),
+        }
     }
 
     /// Drive `phase` over what its pipe holds: finish the handshake if it can, then hand every
@@ -1182,8 +1245,10 @@ pub(crate) struct AuthLine {
 }
 
 /// The binding's auth, called once over the upgrade request exactly as it goes on the wire.
+/// [`Poll::Pending`]: the auth's answer is not ready (the host stores it on the call's handle); the
+/// dial is parked and the same call is made again when the op resumes.
 pub(crate) type Signer<'s> =
-    &'s mut dyn FnMut(&UpgradeHead<'_>) -> Result<Vec<AuthLine>, TransportError>;
+    &'s mut dyn FnMut(&UpgradeHead<'_>) -> Poll<Result<Vec<AuthLine>, TransportError>>;
 
 /// A query key or value an auth answered: visible ASCII that neither ends the target (`#`, a
 /// space) nor splits its pairs (`&`); a key carries no `=`.
@@ -1201,7 +1266,16 @@ fn query_safe(bytes: &[u8], key: bool) -> bool {
 /// target's query, replacing any pair of the same key. Nothing is added after. An answer that
 /// names a handshake line ([`rides_upgrade`]'s refusals), or a line or key the request cannot
 /// carry, refuses the dial.
-fn signed_request(wire: &[u8], sign: Signer<'_>) -> Result<Vec<u8>, TransportError> {
+fn signed_request(wire: &[u8], sign: Signer<'_>) -> Poll<Result<Vec<u8>, TransportError>> {
+    match signed_inner(wire, sign) {
+        Ok(Some(signed)) => Poll::Ready(Ok(signed)),
+        Ok(None) => Poll::Pending,
+        Err(e) => Poll::Ready(Err(e)),
+    }
+}
+
+/// `None`: the auth's answer is not ready.
+fn signed_inner(wire: &[u8], sign: Signer<'_>) -> Result<Option<Vec<u8>>, TransportError> {
     let broken = || TransportError::HandshakeFailed;
     let head = wire.strip_suffix(b"\r\n\r\n").ok_or_else(broken)?;
     let mut lines = head
@@ -1233,12 +1307,15 @@ fn signed_request(wire: &[u8], sign: Signer<'_>) -> Result<Vec<u8>, TransportErr
         .find(|(n, _)| n.eq_ignore_ascii_case("host"))
         .and_then(|(_, v)| std::str::from_utf8(v).ok())
         .ok_or_else(broken)?;
-    let answer = sign(&UpgradeHead {
+    let answer = match sign(&UpgradeHead {
         target: path,
         query,
         authority,
         fields: &fields,
-    })?;
+    }) {
+        Poll::Pending => return Ok(None),
+        Poll::Ready(answer) => answer?,
+    };
 
     let mut pairs: Vec<&[u8]> = query
         .map(|q| q.as_bytes().split(|&b| b == b'&').collect())
@@ -1296,7 +1373,7 @@ fn signed_request(wire: &[u8], sign: Signer<'_>) -> Result<Vec<u8>, TransportErr
         signed.extend_from_slice(b"\r\n");
     }
     signed.extend_from_slice(b"\r\n");
-    Ok(signed)
+    Ok(Some(signed))
 }
 
 /// A host as an authority spells it: an IPv6 literal in its brackets (RFC 3986 section 3.2.2).
