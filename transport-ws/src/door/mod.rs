@@ -64,6 +64,7 @@ pub const BODY_MAX_BYTES: &str = "limits.request_body_max_bytes";
 const NONE: AbiStr = AbiStr {
     ptr: std::ptr::null(),
     len: 0,
+    ..AbiStr::ZERO
 };
 
 /// The transport's own key (`meta.rs`).
@@ -80,6 +81,7 @@ const fn bytes_str(b: &'static [u8]) -> AbiStr {
     AbiStr {
         ptr: b.as_ptr(),
         len: b.len(),
+        ..AbiStr::ZERO
     }
 }
 
@@ -125,6 +127,7 @@ const ROW: Claim = Claim {
     unit0_trigger: UNIT0,
     status_at: 0,
     _reserved: 0,
+    ..Claim::ZERO
 };
 
 /// Each claimed scheme's row, by index into [`CLAIM_NAMES`].
@@ -159,12 +162,14 @@ const SETTINGS: &[SettingDecl] = &[SettingDecl {
     kind: SETTING_COUNT,
     _reserved: 0,
     default: abi_str(DEFAULT_BODY_MAX),
+    ..SettingDecl::ZERO
 }];
 
 const TAIL: TransportTail = TransportTail {
     head: KindTailHead {
         size: std::mem::size_of::<TransportTail>() as u32,
         _reserved: 0,
+        ..KindTailHead::ZERO
     },
     role: ROLE_FRAMER,
     framing: FRAMING_STREAM,
@@ -192,6 +197,7 @@ const TAIL: TransportTail = TransportTail {
     settings_len: SETTINGS.len(),
     fault_rows: std::ptr::null(),
     fault_rows_len: 0,
+    ..TransportTail::ZERO
 };
 
 // THE TAIL IS THE DECLARATION'S (THE DESIGN §2: each fact declared once): every literal above is
@@ -718,6 +724,7 @@ fn framing(
             o.head.error = AbiStr {
                 ptr: owed.error.as_ptr(),
                 len: owed.error.len(),
+                ..AbiStr::ZERO
             };
             return Outcome::Failed;
         }
@@ -957,6 +964,7 @@ fn fill(owed: &mut Owed, sink: &FramerSink, o: &mut FramerOut) {
                     reason: FrameSpan {
                         offset: frame_len as u64,
                         len: reason.len() as u64,
+                        ..FrameSpan::ZERO
                     },
                     ..HeadSlots::default()
                 });
@@ -1008,6 +1016,7 @@ fn fill(owed: &mut Owed, sink: &FramerSink, o: &mut FramerOut) {
                 retry_after_secs: piece.retry_after.unwrap_or(0),
                 // A websocket head declares no body length: never `PIECE_HAS_DECLARED_LEN`.
                 declared_len: 0,
+                ..FramePiece::ZERO
             });
         }
         frame_len += take;

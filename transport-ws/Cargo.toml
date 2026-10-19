@@ -8,6 +8,9 @@ rust-version.workspace = true
 description = "The WebSocket transport: duplex message frames over an HTTP upgrade."
 license = "Apache-2.0"
 
+[lints]
+workspace = true
+
 [lib]
 name = "busbar_transport_ws"
 path = "src/lib.rs"

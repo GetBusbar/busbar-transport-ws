@@ -368,6 +368,7 @@ impl Host {
         b.target = AbiStr {
             ptr: std::ptr::null(),
             len: 0,
+            ..AbiStr::ZERO
         };
         b.sink = host.sink();
         let mut bo: DoorOut = z();

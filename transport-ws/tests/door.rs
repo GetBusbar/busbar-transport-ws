@@ -202,6 +202,7 @@ impl Host {
         i.target = AbiStr {
             ptr: target.as_ptr(),
             len: target.len(),
+            ..AbiStr::ZERO
         };
         i.sink = self.sink();
         let mut o: FramerOut = z();

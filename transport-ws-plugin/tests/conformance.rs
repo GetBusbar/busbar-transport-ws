@@ -75,6 +75,7 @@ fn open(p: &Plugin<Transport>) {
         len: 0,
         fmt: BLOB_ABSENT,
         flags: 0,
+        ..Blob::ZERO
     };
     let mut o: OpenOut = z();
     o.head = out_head();
@@ -178,6 +179,7 @@ impl Host {
         i.target = AbiStr {
             ptr: target.as_ptr(),
             len: target.len(),
+            ..AbiStr::ZERO
         };
         i.sink = self.sink();
         let mut o: FramerOut = z();
