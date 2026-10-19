@@ -329,12 +329,50 @@ fn status_class(code: u16) -> WireStatusClass {
     }
 }
 
-/// The `Retry-After` an answer states, in whole seconds (its delta-seconds form).
-fn retry_after(headers: &HeaderMap) -> Option<u64> {
-    headers
-        .get("retry-after")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.trim().parse().ok())
+/// The `Retry-After` an answer states, in whole seconds from `now_secs` (Unix seconds), in either
+/// of RFC 9110's forms, as the http framer reads it: `delay-seconds`, or an IMF-fixdate converted to
+/// the seconds left until it (`0` once past). A value read as neither is absent.
+pub(crate) fn retry_after(headers: &HeaderMap, now_secs: u64) -> Option<u64> {
+    let raw = headers.get("retry-after")?.to_str().ok()?.trim();
+    if let Ok(n) = raw.parse::<u64>() {
+        return Some(n);
+    }
+    imf_fixdate_secs(raw).map(|at| at.saturating_sub(now_secs))
+}
+
+/// An IMF-fixdate (`Sun, 06 Nov 1994 08:49:37 GMT`, RFC 9110 §5.6.7) as Unix seconds.
+fn imf_fixdate_secs(s: &str) -> Option<u64> {
+    let b = s.as_bytes();
+    if s.len() != 29 || !s.ends_with(" GMT") || b.get(3) != Some(&b',') || b.get(4) != Some(&b' ') {
+        return None;
+    }
+    let num = |r: std::ops::Range<usize>| s.get(r)?.parse::<u64>().ok();
+    let month = match s.get(8..11)? {
+        "Jan" => 1,
+        "Feb" => 2,
+        "Mar" => 3,
+        "Apr" => 4,
+        "May" => 5,
+        "Jun" => 6,
+        "Jul" => 7,
+        "Aug" => 8,
+        "Sep" => 9,
+        "Oct" => 10,
+        "Nov" => 11,
+        "Dec" => 12,
+        _ => return None,
+    };
+    let (day, year) = (num(5..7)?, num(12..16)?);
+    let (hour, minute, second) = (num(17..19)?, num(20..22)?, num(23..25)?);
+    // Days from the civil date (Howard Hinnant's public-domain algorithm), in UTC.
+    let y = i64::try_from(year).ok()? - i64::from(month <= 2);
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400;
+    let mp = (month + 9) % 12;
+    let doy = (153 * mp + 2) / 5 + i64::try_from(day).ok()? - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = u64::try_from(era * 146_097 + doe - 719_468).ok()?;
+    Some(days * 86_400 + hour * 3_600 + minute * 60 + second)
 }
 
 /// Whether an answer's body is `chunked` (RFC 9112 §6.1, §6.3: the LAST transfer coding the answer
@@ -948,7 +986,10 @@ impl WsFramer {
                     out.frame(Framed {
                         status: Some(status_class(code)),
                         status_code: Some(u32::from(code)),
-                        retry_after_secs: retry_after(response.headers()),
+                        retry_after_secs: retry_after(
+                            response.headers(),
+                            out.now().unix_nanos / 1_000_000_000,
+                        ),
                         ..Framed::plain(StreamId(0), &block, true)
                     });
                     let (seen, carrier_ended) = shaken.unwrap_or_default();
@@ -961,8 +1002,14 @@ impl WsFramer {
                         ended: carrier_ended,
                         ..Pipe::default()
                     };
-                    let chunked = is_chunked(response.headers()).then(Box::<Dechunk>::default);
-                    let declared = if chunked.is_some() {
+                    // A status that carries no body (1xx, 204, 304: RFC 9112 §6.3) ends at its
+                    // head, whatever its framing fields say.
+                    let bodiless = matches!(code, 100..=199 | 204 | 304);
+                    let chunked =
+                        (!bodiless && is_chunked(response.headers())).then(Box::<Dechunk>::default);
+                    let declared = if bodiless {
+                        Some(0)
+                    } else if chunked.is_some() {
                         None
                     } else {
                         content_length(response.headers())
@@ -1260,7 +1307,8 @@ impl Framer for WsFramer {
         }
     }
 
-    /// Nothing upgrades in-band out of a WebSocket, so there is no stream to hand on.
+    /// Nothing upgrades in-band out of a WebSocket (RFC 6455 defines no upgrade out of an
+    /// established connection), so there is no stream to hand on: refusing is the protocol's answer.
     fn detach(&self, _state: u64, _out: &mut dyn BytesOut) -> Result<(), TransportError> {
         Err(TransportError::HandoffMismatch)
     }
