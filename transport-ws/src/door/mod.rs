@@ -36,9 +36,9 @@ use busbar_contract::abi::sdk::door::{abi_str, statement, Slot};
 use busbar_contract::abi::sdk::transport::form_codes;
 use busbar_contract::abi::transport::{
     AcceptIn, AcceptOut, AdoptIn, ArrivalIn, ArrivalOut, BeginIn, Claim, ConnIn, ConnOut, DialIn,
-    EmitIn, EncodeIn, FinishIn, FramePiece, FramerOut, FramerSink, FramingIn, IngestIn, IoOut,
-    ListenIn, ListenOut, LocateIn, LocateOut, Ops, ReadIn, RefuseIn, SettingDecl, ShutIn,
-    TransportTail, WriteIn, CANCEL_NOTHING_MOVED, CLOSE_CAPACITY_EXHAUSTED, CLOSE_DRAIN,
+    EmitIn, EncodeIn, FinishIn, FramePiece, FrameSpan, FramerOut, FramerSink, FramingIn, HeadSlots,
+    IngestIn, IoOut, ListenIn, ListenOut, LocateIn, LocateOut, Ops, ReadIn, RefuseIn, SettingDecl,
+    ShutIn, TransportTail, WriteIn, CANCEL_NOTHING_MOVED, CLOSE_CAPACITY_EXHAUSTED, CLOSE_DRAIN,
     CLOSE_PEER_CLOSED, CLOSE_POISONED, CLOSE_REVOKED, CLOSE_TIMEOUT, CLOSE_TRANSPORT_FAILED,
     EMIT_TEXT, FAULT_NONE, FRAME_PIECE_SIZE, FRAMING_STREAM, PIECE_CONTINUED, PIECE_END,
     PIECE_END_OF_FRAME, PIECE_FIELDS, PIECE_HAS_CODE, PIECE_HAS_RETRY_AFTER, PIECE_STREAM_FAILED,
@@ -192,6 +192,25 @@ const TAIL: TransportTail = TransportTail {
     fault_rows_len: 0,
 };
 
+// THE TAIL IS THE DECLARATION'S (THE DESIGN §2: each fact declared once): every literal above is
+// held equal to the framer's `TransportMeta`, so the two can never drift.
+const _: () = {
+    assert!(matches!(
+        <WsFramer as TransportMeta>::FRAMING,
+        busbar_contract::transport::wire::Framing::Stream
+    ));
+    assert!(TAIL.framing == FRAMING_STREAM);
+    assert!(!<WsFramer as TransportMeta>::DECODES_PAYLOAD && TAIL.facts == 0);
+    assert!(<WsFramer as TransportMeta>::COMPOSES_OVER.is_empty() && TAIL.composes_over_len == 0);
+    assert!(<WsFramer as TransportMeta>::UPGRADES_TO.is_empty() && TAIL.upgrades_to_len == 0);
+    assert!(
+        <WsFramer as TransportMeta>::HANDOFF.is_none()
+            && TAIL.handoff_from.len == 0
+            && TAIL.handoff_to.len == 0
+            && TAIL.handoff_binding_fact.len == 0
+    );
+};
+
 /// The door's Statement: the `ws` framer.
 pub const STATEMENT: Statement = Statement {
     kind_tail: (&TAIL as *const TransportTail).cast::<KindTailHead>(),
@@ -225,6 +244,9 @@ struct Piece {
     status: Option<(u32, u8)>,
     /// The wait the far end asked for (`PIECE_HAS_RETRY_AFTER`), on a refused upgrade's head.
     retry_after: Option<u64>,
+    /// The dialled head's reason phrase, as the far end sent it: stated in the head's slots
+    /// (`HeadSlots::reason`) beside its first piece.
+    reason: Option<Vec<u8>>,
 }
 
 impl Piece {
@@ -241,6 +263,7 @@ impl Piece {
             continued: false,
             status: None,
             retry_after: None,
+            reason: None,
         }
     }
 }
@@ -757,6 +780,12 @@ impl Slot for Ingest {
             let ended_before = c.owed.ended;
             f.ingest(i.framing, bytes, end, c)
                 .map_err(|e| format!("{e:?}"))?;
+            // THE DIALLED HEAD'S REASON PHRASE rides the head piece this call queued.
+            if let Some(reason) = f.take_reason(i.framing) {
+                if let Some(head) = c.owed.pieces.iter_mut().rev().find(|p| p.fields) {
+                    head.reason = Some(reason);
+                }
+            }
             // A connection the far side FAILED ends its stream failed, not cleanly: the reader is
             // told (`PIECE_STREAM_FAILED` on the empty end piece), and the close carries the code.
             if !ended_before && c.owed.ended && f.failed(i.framing) {
@@ -871,10 +900,40 @@ fn fill(owed: &mut Owed, sink: &FramerSink, o: &mut FramerOut) {
     y.wire_len = w as u64;
     let mut frame_len = 0_usize;
     let mut n = 0_usize;
+    let mut heads = 0_usize;
     while n < sink.pieces_cap {
         let Some(piece) = owed.pieces.front_mut() else {
             break;
         };
+        // THE HEAD'S SLOTS (HEAD-FIELDS: the dialled side fills `reason`, HTTP/1 as sent): written
+        // into the frame buffer ahead of the head's first piece, in the same answer. A sink with no
+        // head slots, or no room for the phrase beside the piece, takes the head without it.
+        if let Some(reason) = piece.reason.take() {
+            let fits = heads < sink.heads_cap
+                && !sink.heads.is_null()
+                && reason.len() < sink.frame_cap - frame_len;
+            if fits {
+                // SAFETY: host buffers of the stated capacities: `reason` fits the frame's room,
+                // and `heads < heads_cap`.
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        reason.as_ptr(),
+                        sink.frame.add(frame_len),
+                        reason.len(),
+                    );
+                    sink.heads.add(heads).write(HeadSlots {
+                        stream: piece.stream,
+                        reason: FrameSpan {
+                            offset: frame_len as u64,
+                            len: reason.len() as u64,
+                        },
+                        ..HeadSlots::default()
+                    });
+                }
+                frame_len += reason.len();
+                heads += 1;
+            }
+        }
         let room = sink.frame_cap - frame_len;
         // A field block is cut only where the host takes a continuation: at a line's start or
         // inside a value. A name longer than the whole frame buffer is cut anyway (the host
@@ -952,6 +1011,7 @@ fn fill(owed: &mut Owed, sink: &FramerSink, o: &mut FramerOut) {
     }
     y.frame_len = frame_len as u64;
     y.pieces_len = n as u32;
+    y.heads_len = heads as u32;
     let more = !owed.wire.is_empty() || !owed.pieces.is_empty();
     let mut flags = 0;
     if more {
