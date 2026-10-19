@@ -562,7 +562,21 @@ impl WsFramer {
             }
             return Ok(());
         }
+        let max = self.max_message_bytes;
         Self::with_open(guard.as_mut(), out, |ws, message| {
+            // THE CEILING, OUTBOUND TOO: the machine bounds only what it reads, so a message this
+            // end writes is held to the same ceiling here, as a held one is above (a capacity
+            // failure), and its gathered pieces are dropped.
+            let size = message.len().saturating_add(bytes.len());
+            if max > 0 && size > max {
+                message.clear();
+                return Err(WsError::Capacity(
+                    tungstenite::error::CapacityError::MessageTooLong {
+                        size,
+                        max_size: max,
+                    },
+                ));
+            }
             if !end_of_frame {
                 message.extend_from_slice(bytes);
                 return Ok(());
@@ -967,11 +981,13 @@ impl Framer for WsFramer {
         let conn = self.conn(state)?;
         let mut held = Self::enter(&conn)?;
         let mut phase = held.take().ok_or(TransportError::Closed)?;
-        let shaking = !matches!(phase, Phase::Open { .. });
+        let dialling = matches!(phase, Phase::Dialling { .. });
         let pipe = phase.pipe();
         pipe.inbound.extend(bytes);
         pipe.ended |= end;
-        if shaking {
+        // Only a dialled head is read back off what the handshake saw (its reason phrase, a
+        // refusal's body); an accepting handshake keeps no copy.
+        if dialling {
             pipe.seen.extend_from_slice(bytes);
         }
         match Self::drive(phase, out) {
