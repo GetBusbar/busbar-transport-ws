@@ -11,6 +11,7 @@ use busbar_contract::transport::wire::WireStatusClass;
 use busbar_contract::transport::{Framed, Framer, FramerOut, HostTime, Side};
 use tungstenite::handshake::derive_accept_key;
 
+use crate::transport::reason_phrase;
 use crate::WsFramer;
 
 /// What one framer call produced.
@@ -291,6 +292,61 @@ fn a_far_end_that_refuses_the_upgrade_hands_up_its_answer() {
             "{code}: its fields ride the head: {head}"
         );
     }
+}
+
+/// A REFUSED UPGRADE'S BODY REACHES THE PLANE (Q128 transport-ws LOW): after its head, the far end's
+/// error document is handed up as the stream's body, what came with the head and what arrives
+/// after it, up to its declared `Content-Length`; then the frames end. The head's reason phrase is
+/// taken for the head's slots. RED before the fix: only the head went up, and no reason was kept.
+#[test]
+fn a_refused_upgrade_hands_up_its_body_and_its_reason() {
+    let framer = WsFramer::new(0);
+    let mut out = Out::default();
+    let state = framer
+        .open_with(Side::Dial, "ws://127.0.0.1:9/x", &[], &mut out)
+        .expect("the dial opens");
+    let body = br#"{"error":"bad key"}"#;
+    let answer = format!(
+        "HTTP/1.1 401 Unauthorized\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+        body.len()
+    );
+    let mut first = answer.into_bytes();
+    first.extend_from_slice(&body[..5]);
+    let mut heard = Out::default();
+    framer
+        .ingest(state, &first, false, &mut heard)
+        .expect("the far end answered");
+    assert_eq!(
+        heard.statuses[0],
+        Some((401, Some(WireStatusClass::CallerFault)))
+    );
+    assert_eq!(
+        framer.take_reason(state).as_deref(),
+        Some(&b"Unauthorized"[..])
+    );
+    assert_eq!(framer.take_reason(state), None, "taken once");
+    let mut rest = Out::default();
+    framer
+        .ingest(state, &body[5..], false, &mut rest)
+        .expect("the rest of the body");
+    let mut got: Vec<u8> = heard.frames[1..].concat();
+    got.extend(rest.frames.concat());
+    assert_eq!(got, body.to_vec(), "the whole error document, once");
+}
+
+/// A dialled head's reason phrase is the status line's text after its code, once the line is whole.
+#[test]
+fn a_reason_phrase_is_read_off_a_whole_status_line() {
+    assert_eq!(
+        reason_phrase(b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n"),
+        Some(b"Switching Protocols".to_vec())
+    );
+    assert_eq!(
+        reason_phrase(b"HTTP/1.1 401 Unauthorized"),
+        None,
+        "not whole yet"
+    );
+    assert_eq!(reason_phrase(b"HTTP/1.1 204 \r\n"), None, "no phrase");
 }
 
 /// The close code of the first close frame in a client's (masked) `wire`.
