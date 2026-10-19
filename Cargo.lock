@@ -90,6 +90,7 @@ dependencies = [
  "busbar-contract",
  "serde_json",
  "tungstenite",
+ "zeroize",
 ]
 
 [[package]]

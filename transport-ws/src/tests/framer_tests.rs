@@ -11,9 +11,10 @@ use busbar_contract::transport::wire::WireStatusClass;
 use busbar_contract::transport::{Framed, Framer, FramerOut, HostTime, Side};
 use tungstenite::handshake::derive_accept_key;
 
-use crate::transport::{reason_phrase, retry_after};
+use crate::transport::{reason_phrase, retry_after, AuthLine, UpgradeHead};
 use crate::WsFramer;
 use tungstenite::http::{HeaderMap, HeaderValue};
+use zeroize::Zeroizing;
 
 /// What one framer call produced.
 #[derive(Default)]
@@ -733,4 +734,122 @@ fn a_held_text_message_that_is_not_utf8_fails_at_the_call() {
         .ingest(state, &switching(&request), false, &mut done)
         .expect("the handshake completes");
     assert_eq!(opcodes(&done.sent), [0x1]);
+}
+
+/// An auth line of the head.
+fn field_line(name: &str, value: &[u8]) -> AuthLine {
+    AuthLine {
+        name: name.into(),
+        value: Zeroizing::new(value.to_vec()),
+        query: false,
+    }
+}
+
+/// The upgrade request `head` stands for, as the wire would carry it.
+fn as_sent(head: &UpgradeHead<'_>) -> String {
+    let mut wire = format!("GET {}", head.target);
+    if let Some(query) = head.query {
+        wire.push('?');
+        wire.push_str(query);
+    }
+    wire.push_str(" HTTP/1.1\r\n");
+    for (name, value) in head.fields {
+        wire.push_str(&format!("{name}: {}\r\n", String::from_utf8_lossy(value)));
+    }
+    wire
+}
+
+/// RULING 23 (nothing is added to a head after its auth runs; Q128 transport-ws r72 item 1): a
+/// dial's binding auth is called ONCE over the upgrade request exactly as it goes on the wire,
+/// the handshake's own lines among it; its answer joins last, a field line replacing any line of
+/// its name, a query key joining the target's query; nothing follows it. RED before the fix: the
+/// auth's answer never reached the wire.
+#[test]
+fn an_auth_that_signs_the_whole_head_sees_every_byte_on_the_wire() {
+    let framer = WsFramer::new(0);
+    let fields = [
+        ("x-plane".to_string(), b"1".to_vec()),
+        ("x-sig".to_string(), b"stale".to_vec()),
+        ("x-plane".to_string(), b"2".to_vec()),
+    ];
+    let mut seen = Vec::new();
+    let mut sign = |head: &UpgradeHead<'_>| {
+        seen.push((as_sent(head), head.authority.to_owned()));
+        Ok(vec![
+            field_line("X-Sig", b"signed"),
+            AuthLine {
+                name: "sig".into(),
+                value: Zeroizing::new(b"q1".to_vec()),
+                query: true,
+            },
+        ])
+    };
+    let mut out = Out::default();
+    let state = framer
+        .open_signed(
+            "ws://svc.test:9/x?a=1&sig=old",
+            &fields,
+            &mut sign,
+            &mut out,
+        )
+        .expect("the dial opens");
+    let request = String::from_utf8(out.sent.clone()).expect("an upgrade request");
+    assert_eq!(seen.len(), 1, "the auth is called once");
+    let (signed_over, authority) = &seen[0];
+    assert_eq!(authority, "svc.test:9");
+    for line in [
+        "Host: svc.test:9\r\n",
+        "Sec-WebSocket-Key: ",
+        "x-plane: 1\r\n",
+        "x-sig: stale\r\n",
+    ] {
+        assert!(
+            signed_over.contains(line),
+            "the auth saw {line:?}: {signed_over}"
+        );
+    }
+    let expected = signed_over
+        .replace("GET /x?a=1&sig=old HTTP/1.1", "GET /x?a=1&sig=q1 HTTP/1.1")
+        .replace("x-sig: stale\r\n", "")
+        + "X-Sig: signed\r\n\r\n";
+    assert_eq!(
+        request, expected,
+        "every byte sent is a byte the auth signed, or its own answer, last"
+    );
+
+    // The far end's answer still completes the handshake over the signed request's key.
+    let mut done = Out::default();
+    framer
+        .ingest(state, &switching(&request), false, &mut done)
+        .expect("the handshake completes");
+    assert_eq!(done.statuses, [Some((101, Some(WireStatusClass::Success)))]);
+}
+
+/// An auth answer the upgrade request cannot carry refuses the dial: a value that would split a
+/// line, a handshake line of the framer's own, or a query value that would end the target.
+#[test]
+fn an_auth_answer_the_request_cannot_carry_refuses_the_dial() {
+    let answers = [
+        field_line("x-sig", b"a\r\nx-evil: 1"),
+        field_line("sec-websocket-key", b"forged"),
+        field_line("Host", b"elsewhere.test"),
+        AuthLine {
+            name: "sig".into(),
+            value: Zeroizing::new(b"a#b".to_vec()),
+            query: true,
+        },
+    ];
+    for answer in answers {
+        let framer = WsFramer::new(0);
+        let mut once = Some(answer);
+        let mut sign = |_: &UpgradeHead<'_>| Ok(once.take().into_iter().collect());
+        let mut out = Out::default();
+        assert!(
+            framer
+                .open_signed("ws://svc.test/x", &[], &mut sign, &mut out)
+                .is_err(),
+            "refused"
+        );
+        assert!(out.sent.is_empty(), "nothing leaves on a refused dial");
+    }
 }
