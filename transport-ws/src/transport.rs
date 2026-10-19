@@ -760,6 +760,12 @@ impl WsFramer {
             .remove(&state)
     }
 
+    /// Whether framing `state` is still held (a test reads that a finished framing is gone).
+    #[cfg(test)]
+    pub(crate) fn holds(&self, state: u64) -> bool {
+        self.map().contains_key(&state)
+    }
+
     /// Framing `state`'s own lock, found under the map's.
     fn conn(&self, state: u64) -> Result<Conn, TransportError> {
         self.map()

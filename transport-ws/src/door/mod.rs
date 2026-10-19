@@ -1063,3 +1063,7 @@ busbar_contract::plugin_door! {
         timer: Timer,
     },
 }
+
+#[cfg(test)]
+#[path = "../tests/door_fill_tests.rs"]
+mod fill_tests;
