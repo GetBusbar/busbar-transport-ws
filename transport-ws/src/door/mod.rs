@@ -863,7 +863,10 @@ fn dial_with_auth(
             POINT_PEER,
             0,
             0,
-            &HeadViewArgs::default(),
+            &HeadViewArgs {
+                scheme: i.scheme,
+                ..HeadViewArgs::default()
+            },
             None,
         );
         match peer {
@@ -890,6 +893,7 @@ fn dial_with_auth(
             authority: head.authority,
             query: head.query,
             fields: head.fields,
+            scheme: i.scheme,
         };
         match services.auth_call::<Own>(
             handle(SEQ_HEAD),
