@@ -76,6 +76,7 @@ fn a_panicked_framing_is_forgotten_by_the_framer_at_its_finish() {
     let inst = Instance {
         framer: WsFramer::new(0),
         owed: Mutex::new(HashMap::new()),
+        services: None,
     };
     let mut sink_out = Owed::default();
     let mut c = Collect {

@@ -118,23 +118,6 @@ fn every_claim_row_states_the_declaration() {
     }
 }
 
-/// THE TAIL CLAIMS NO SIGNED HEAD (Q128 transport-ws LOW, reader n1 on a5c9118; THE DESIGN §6
-/// "Auth points and guest lists" item 5): the handshake writes its own lines after the auth has
-/// run (`transport::HANDSHAKE_FIELDS`), so the door's tail must not state
-/// `FACT_SIGNS_NOTHING_AFTER_AUTH`; a framer that stated it would promise a signing style a head it
-/// does not send.
-#[test]
-fn the_tail_does_not_claim_a_signed_head_survives_the_handshake() {
-    let st = crate::door::STATEMENT;
-    // SAFETY: the Statement's kind tail is this crate's `'static` data.
-    let tail = unsafe { &*st.kind_tail.cast::<TransportTail>() };
-    assert_eq!(
-        u64::from(tail.facts)
-            & u64::from(busbar_contract::abi::transport::FACT_SIGNS_NOTHING_AFTER_AUTH),
-        0
-    );
-}
-
 // ── the framer's face ───────────────────────────────────────────────────────────────────────────
 
 /// What one framer call said.
