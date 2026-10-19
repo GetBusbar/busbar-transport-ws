@@ -137,9 +137,10 @@ enum Phase {
         failed: Option<CloseCode>,
     },
     /// A dialled connection the far end answered with something other than `101`: its answer's
-    /// head was handed up as the stream's head, then its body, `left` bytes of which (its declared
-    /// `Content-Length`) are still to come; at `0` its frames have ended and nothing more is read.
-    Answered { pipe: Pipe, left: u64 },
+    /// head was handed up as the stream's head, then its body: `left` bytes of it still to come
+    /// (its declared `Content-Length`), or with none declared, every byte until the carrier ends.
+    /// At `Some(0)` its frames have ended and nothing more is read.
+    Answered { pipe: Pipe, left: Option<u64> },
 }
 
 impl Phase {
@@ -330,23 +331,34 @@ pub(crate) fn reason_phrase(seen: &[u8]) -> Option<Vec<u8>> {
     parts.next().filter(|r| !r.is_empty()).map(<[u8]>::to_vec)
 }
 
-/// A refused upgrade's body still arriving: frame what the pipe holds, up to the `left` bytes its
-/// `Content-Length` still owes, and end the frames once they are all handed up (or the carrier
-/// ended). Past that, what arrives is nobody's.
-fn answered_body(mut pipe: Pipe, left: u64, out: &mut dyn FramerOut) -> (Phase, bool) {
-    if left == 0 {
+/// A refused upgrade's BODY: frame what the pipe holds, up to the `left` bytes its declared
+/// `Content-Length` still owes (or, with none declared, until the carrier ends), and end the frames
+/// once they are all handed up or the carrier ended. `first`: the call that handed the head up (a
+/// declared length of `0` ends the frames then). Past the end, what arrives is nobody's.
+fn answered_body(
+    mut pipe: Pipe,
+    left: Option<u64>,
+    first: bool,
+    out: &mut dyn FramerOut,
+) -> (Phase, bool) {
+    if left == Some(0) {
         pipe.inbound.clear();
-        return (Phase::Answered { pipe, left }, false);
+        return (Phase::Answered { pipe, left }, first);
     }
-    let take = usize::try_from(left).map_or(pipe.inbound.len(), |l| l.min(pipe.inbound.len()));
+    let avail = pipe.inbound.len();
+    let take = left.map_or(avail, |l| {
+        usize::try_from(l).map_or(avail, |l| l.min(avail))
+    });
     let bytes: Vec<u8> = pipe.inbound.drain(..take).collect();
-    let left = left - take as u64;
-    let ended = left == 0 || (pipe.ended && pipe.inbound.is_empty());
+    let left = left.map(|l| l - take as u64);
+    let ended = left == Some(0) || (pipe.ended && pipe.inbound.is_empty());
     if !bytes.is_empty() || ended {
         out.frame(Framed::plain(StreamId(0), &bytes, ended));
     }
-    pipe.inbound.clear();
-    let left = if ended { 0 } else { left };
+    if ended {
+        pipe.inbound.clear();
+    }
+    let left = if ended { Some(0) } else { left };
     (Phase::Answered { pipe, left }, ended)
 }
 
@@ -670,7 +682,7 @@ impl WsFramer {
     ) -> Result<(Phase, bool, Option<Vec<u8>>), TransportError> {
         let mut phase = match phase {
             Phase::Answered { pipe, left } => {
-                let (phase, ended) = answered_body(pipe, left, out);
+                let (phase, ended) = answered_body(pipe, left, false, out);
                 return Ok((phase, ended, None));
             }
             phase => phase,
@@ -678,10 +690,17 @@ impl WsFramer {
         let shaking = !matches!(phase, Phase::Open { .. });
         // THE DIALLED HEAD'S REASON PHRASE (HEAD-FIELDS: the dialled side fills `reason`, as the
         // far end sent it), read off the status line before the machine takes the head.
-        let reason = match &mut phase {
-            Phase::Dialling { mid, .. } => reason_phrase(&mid.get_mut().get_mut().seen),
+        // What the dial's handshake has seen, and whether the carrier ended: a refusal's body is
+        // read from here, every byte past the head (the machine reads the wire in chunks and keeps
+        // what it read; what it did not read is still here).
+        let shaken = match &mut phase {
+            Phase::Dialling { mid, .. } => {
+                let pipe = mid.get_mut().get_mut();
+                Some((pipe.seen.clone(), pipe.ended))
+            }
             _ => None,
         };
+        let reason = shaken.as_ref().and_then(|(seen, _)| reason_phrase(seen));
         let mut phase = match phase {
             Phase::Accepting(mid) => match mid.handshake() {
                 Ok(mut ws) => {
@@ -718,10 +737,10 @@ impl WsFramer {
                 // THE FAR END REFUSED THE UPGRADE (HEAD-FIELDS: the head is always the first
                 // fields piece): its answer is handed up as ONE head with its status, its class and
                 // its fields, then its body (a far end's error document), and the frames end, so the
-                // breaker reads what it answered and the plane sees what it said. The body is the
-                // bytes its declared `Content-Length` names: what the machine read past the head
-                // first, then what still arrives. With no length declared, the bytes that came with
-                // the head are the body (this framer decodes no HTTP/1 body framing).
+                // breaker reads what it answered and the plane sees what it said. The body is every
+                // byte past the head (what came with it, then what still arrives) up to its declared
+                // `Content-Length`, or with none declared until the carrier ends; then the frames
+                // end. This framer decodes no other HTTP/1 body framing.
                 Err(HandshakeError::Failure(WsError::Http(response))) => {
                     let code = response.status().as_u16();
                     let block = head_block(response.headers());
@@ -731,20 +750,19 @@ impl WsFramer {
                         retry_after_secs: retry_after(response.headers()),
                         ..Framed::plain(StreamId(0), &block, true)
                     });
-                    let tail = response.body().as_deref().unwrap_or_default();
-                    let declared = content_length(response.headers());
-                    let left = declared.map_or(0, |n| n.saturating_sub(tail.len() as u64));
-                    let taken = declared.map_or(tail.len(), |n| {
-                        tail.len().min(usize::try_from(n).unwrap_or(usize::MAX))
-                    });
-                    if taken != 0 {
-                        out.frame(Framed::plain(StreamId(0), &tail[..taken], left == 0));
-                    }
+                    let (seen, carrier_ended) = shaken.unwrap_or_default();
+                    let at = seen
+                        .windows(4)
+                        .position(|w| w == b"\r\n\r\n")
+                        .map_or(seen.len(), |p| p + 4);
                     let pipe = Pipe {
-                        ended: left == 0,
+                        inbound: seen[at..].iter().copied().collect(),
+                        ended: carrier_ended,
                         ..Pipe::default()
                     };
-                    return Ok((Phase::Answered { pipe, left }, left == 0, reason));
+                    let declared = content_length(response.headers());
+                    let (phase, ended) = answered_body(pipe, declared, true, out);
+                    return Ok((phase, ended, reason));
                 }
                 Err(HandshakeError::Failure(_)) => return Err(TransportError::HandshakeFailed),
             },
