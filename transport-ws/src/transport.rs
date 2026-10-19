@@ -76,7 +76,9 @@ pub(crate) struct Pipe {
     /// Every byte ingested while the opening handshake runs: a dialled head's status line (its
     /// reason phrase) is read from here.
     seen: Vec<u8>,
-    /// This end dialled: its frames are masked (RFC 6455 section 5.3).
+    /// This end dialled: its frames are masked (RFC 6455 section 5.3). Read only by the test
+    /// harness's seed (`test-seeded`), which unmasks a dialled end's frames.
+    #[cfg_attr(not(feature = "test-seeded"), allow(dead_code))]
     client: bool,
 }
 
