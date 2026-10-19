@@ -139,8 +139,14 @@ enum Phase {
     /// A dialled connection the far end answered with something other than `101`: its answer's
     /// head was handed up as the stream's head, then its body: `left` bytes of it still to come
     /// (its declared `Content-Length`), or with none declared, every byte until the carrier ends.
-    /// At `Some(0)` its frames have ended and nothing more is read.
-    Answered { pipe: Pipe, left: Option<u64> },
+    /// At `Some(0)` its frames have ended and nothing more is read. `chunked`: the body's transfer
+    /// coding is `chunked` (RFC 9112 §7.1), decoded here and ended at its last chunk; `left` is then
+    /// `None` until it ends.
+    Answered {
+        pipe: Pipe,
+        left: Option<u64>,
+        chunked: Option<Box<Dechunk>>,
+    },
 }
 
 impl Phase {
@@ -166,10 +172,10 @@ impl Phase {
 }
 
 /// The most whole messages a dial holds while its handshake has not completed.
-pub const MAX_HELD_MESSAGES: usize = 64;
+pub(crate) const MAX_HELD_MESSAGES: usize = 64;
 
 /// The `ws` framer: its framing states, and the message ceiling every connection is built with.
-pub struct WsFramer {
+pub(crate) struct WsFramer {
     /// Every framing state, each behind its own lock: the map's lock is held only to find, add or
     /// remove one, never across a framing's work, so connections run side by side and a panic in
     /// one fails that one alone.
@@ -244,6 +250,15 @@ fn read_error(e: &WsError) -> TransportError {
 
 /// The upgrade request's own fields, which the handshake writes itself: an opening field of one of
 /// these names is not copied onto it.
+///
+/// THE ORDER OF THE DIALLED HEAD (Q128 ruling 17: auth fields, then the plane's own, then the
+/// transport's defaults; 1.5.5 parity): the opening fields (the auth's and the plane's, composed
+/// before `begin`) ride first, and the protocol machine then writes its handshake lines (`host`
+/// from the dialled URL, `connection`, `upgrade`, `sec-websocket-version` and a fresh
+/// `sec-websocket-key`) after the auth has run. An opening field of a handshake name is the
+/// machine's to write, so it is not copied. A signing style therefore cannot sign this head: the
+/// door's tail states no `FACT_SIGNS_NOTHING_AFTER_AUTH` (`door::TAIL.facts`), so the framer never
+/// claims that what an auth signed is what is sent.
 const HANDSHAKE_FIELDS: &[&str] = &[
     "host",
     "connection",
@@ -313,6 +328,108 @@ fn retry_after(headers: &HeaderMap) -> Option<u64> {
         .and_then(|v| v.trim().parse().ok())
 }
 
+/// Whether an answer's body is `chunked` (RFC 9112 §6.1, §6.3: the LAST transfer coding the answer
+/// names is `chunked`, which then frames the body whatever `Content-Length` says).
+fn is_chunked(headers: &HeaderMap) -> bool {
+    headers
+        .get_all("transfer-encoding")
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|v| v.split(','))
+        .map(str::trim)
+        .filter(|c| !c.is_empty())
+        .next_back()
+        .is_some_and(|c| c.eq_ignore_ascii_case("chunked"))
+}
+
+/// The longest chunk-size or trailer line a refused upgrade's chunked body may carry; a longer one is
+/// malformed, and the frames end there.
+const CHUNK_LINE_MAX: usize = 4096;
+
+/// Where a chunked body's decoder stands (RFC 9112 §7.1).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+enum Chunked {
+    /// Reading a chunk-size line (its extensions ignored).
+    #[default]
+    Size,
+    /// This many data bytes of the current chunk are still to come.
+    Data(u64),
+    /// The line end after a chunk's data.
+    DataEnd,
+    /// The trailer section, after the last chunk: it ends at an empty line.
+    Trailer,
+    /// The body ended (or its coding was malformed): nothing more is read.
+    Done,
+}
+
+/// A refused upgrade's CHUNKED BODY, decoded as it arrives: the data handed up without its chunk
+/// markers, ended at the last chunk and its trailers (which are dropped: the head was handed up
+/// already).
+#[derive(Debug, Default)]
+pub(crate) struct Dechunk {
+    state: Chunked,
+    line: Vec<u8>,
+}
+
+impl Dechunk {
+    /// Decode what `inbound` holds into `body`; `true` once the body has ended (its last chunk and
+    /// trailers read, or a malformed coding, past which nothing is read).
+    fn feed(&mut self, inbound: &mut VecDeque<u8>, body: &mut Vec<u8>) -> bool {
+        loop {
+            match self.state {
+                Chunked::Done => return true,
+                Chunked::Data(n) => {
+                    if inbound.is_empty() {
+                        return false;
+                    }
+                    let take = usize::try_from(n).map_or(inbound.len(), |n| n.min(inbound.len()));
+                    body.extend(inbound.drain(..take));
+                    let rest = n - take as u64;
+                    self.state = if rest == 0 {
+                        Chunked::DataEnd
+                    } else {
+                        Chunked::Data(rest)
+                    };
+                    continue;
+                }
+                Chunked::Size | Chunked::DataEnd | Chunked::Trailer => {}
+            }
+            let Some(b) = inbound.pop_front() else {
+                return false;
+            };
+            if b != b'\n' {
+                if self.line.len() >= CHUNK_LINE_MAX {
+                    self.state = Chunked::Done;
+                    return true;
+                }
+                self.line.push(b);
+                continue;
+            }
+            let mut line = std::mem::take(&mut self.line);
+            if line.last() == Some(&b'\r') {
+                line.pop();
+            }
+            self.state = match self.state {
+                Chunked::Size => {
+                    let size = line.split(|c| *c == b';').next().unwrap_or_default();
+                    match std::str::from_utf8(size)
+                        .ok()
+                        .and_then(|t| u64::from_str_radix(t.trim(), 16).ok())
+                    {
+                        Some(0) => Chunked::Trailer,
+                        Some(n) => Chunked::Data(n),
+                        None => Chunked::Done,
+                    }
+                }
+                Chunked::DataEnd if line.is_empty() => Chunked::Size,
+                Chunked::Trailer if line.is_empty() => Chunked::Done,
+                Chunked::Trailer => Chunked::Trailer,
+                _ => Chunked::Done,
+            };
+        }
+    }
+}
+
 /// The `Content-Length` an answer declares.
 fn content_length(headers: &HeaderMap) -> Option<u64> {
     headers
@@ -331,19 +448,43 @@ pub(crate) fn reason_phrase(seen: &[u8]) -> Option<Vec<u8>> {
     parts.next().filter(|r| !r.is_empty()).map(<[u8]>::to_vec)
 }
 
-/// A refused upgrade's BODY: frame what the pipe holds, up to the `left` bytes its declared
-/// `Content-Length` still owes (or, with none declared, until the carrier ends), and end the frames
-/// once they are all handed up or the carrier ended. `first`: the call that handed the head up (a
-/// declared length of `0` ends the frames then). Past the end, what arrives is nobody's.
+/// A refused upgrade's BODY: frame what the pipe holds, decoded by its transfer coding when it is
+/// `chunked` (to its last chunk), otherwise up to the `left` bytes its declared `Content-Length`
+/// still owes (or, with none declared, until the carrier ends), and end the frames once they are
+/// all handed up or the carrier ended. `first`: the call that handed the head up (a declared length
+/// of `0` ends the frames then). Past the end, what arrives is nobody's.
 fn answered_body(
     mut pipe: Pipe,
     left: Option<u64>,
+    chunked: Option<Box<Dechunk>>,
     first: bool,
     out: &mut dyn FramerOut,
 ) -> (Phase, bool) {
     if left == Some(0) {
         pipe.inbound.clear();
-        return (Phase::Answered { pipe, left }, first);
+        let phase = Phase::Answered {
+            pipe,
+            left,
+            chunked: None,
+        };
+        return (phase, first);
+    }
+    if let Some(mut decoder) = chunked {
+        let mut bytes = Vec::new();
+        let done = decoder.feed(&mut pipe.inbound, &mut bytes);
+        let ended = done || (pipe.ended && pipe.inbound.is_empty());
+        if !bytes.is_empty() || ended {
+            out.frame(Framed::plain(StreamId(0), &bytes, ended));
+        }
+        if ended {
+            pipe.inbound.clear();
+        }
+        let phase = Phase::Answered {
+            pipe,
+            left: ended.then_some(0),
+            chunked: (!ended).then_some(decoder),
+        };
+        return (phase, ended);
     }
     let avail = pipe.inbound.len();
     let take = left.map_or(avail, |l| {
@@ -359,7 +500,12 @@ fn answered_body(
         pipe.inbound.clear();
     }
     let left = if ended { Some(0) } else { left };
-    (Phase::Answered { pipe, left }, ended)
+    let phase = Phase::Answered {
+        pipe,
+        left,
+        chunked: None,
+    };
+    (phase, ended)
 }
 
 /// THE CLOSE CODE A REFUSAL'S NEUTRAL STATUS MAPS TO (the plane seam: a neutral status the transport
@@ -473,7 +619,7 @@ impl WsFramer {
     /// # Errors
     ///
     /// As [`Framer::refusal`].
-    pub fn refusal_with(
+    pub(crate) fn refusal_with(
         &self,
         state: u64,
         _stream: Option<StreamId>,
@@ -489,7 +635,7 @@ impl WsFramer {
     /// A framer whose messages (and frames) are capped at `max_message_bytes`; `0` = the protocol
     /// library's own default stands.
     #[must_use]
-    pub fn new(max_message_bytes: usize) -> Self {
+    pub(crate) fn new(max_message_bytes: usize) -> Self {
         Self {
             states: Mutex::new(HashMap::new()),
             reasons: Mutex::new(HashMap::new()),
@@ -512,7 +658,7 @@ impl WsFramer {
     /// # Errors
     ///
     /// The target is not a WebSocket URL, or a field is not a valid header.
-    pub fn open_with(
+    pub(crate) fn open_with(
         &self,
         side: Side,
         target: &str,
@@ -531,7 +677,7 @@ impl WsFramer {
     /// # Errors
     ///
     /// The state is gone, a text message is not UTF-8, or the machine refused it.
-    pub fn emit_text(
+    pub(crate) fn emit_text(
         &self,
         state: u64,
         bytes: &[u8],
@@ -607,7 +753,7 @@ impl WsFramer {
 
     /// The reason phrase of the head framing `state`'s last call handed up (a dialled framing's,
     /// HTTP/1 as sent), taken once: the door states it in the head's slots.
-    pub fn take_reason(&self, state: u64) -> Option<Vec<u8>> {
+    pub(crate) fn take_reason(&self, state: u64) -> Option<Vec<u8>> {
         self.reasons
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
@@ -695,8 +841,12 @@ impl WsFramer {
         out: &mut dyn FramerOut,
     ) -> Result<(Phase, bool, Option<Vec<u8>>), TransportError> {
         let mut phase = match phase {
-            Phase::Answered { pipe, left } => {
-                let (phase, ended) = answered_body(pipe, left, false, out);
+            Phase::Answered {
+                pipe,
+                left,
+                chunked,
+            } => {
+                let (phase, ended) = answered_body(pipe, left, chunked, false, out);
                 return Ok((phase, ended, None));
             }
             phase => phase,
@@ -753,8 +903,9 @@ impl WsFramer {
                 // its fields, then its body (a far end's error document), and the frames end, so the
                 // breaker reads what it answered and the plane sees what it said. The body is every
                 // byte past the head (what came with it, then what still arrives) up to its declared
-                // `Content-Length`, or with none declared until the carrier ends; then the frames
-                // end. This framer decodes no other HTTP/1 body framing.
+                // `Content-Length`, or with none declared until the carrier ends, unless its
+                // transfer coding is `chunked`, which frames it instead (decoded, to its last
+                // chunk; RFC 9112 §6.3); then the frames end.
                 Err(HandshakeError::Failure(WsError::Http(response))) => {
                     let code = response.status().as_u16();
                     let block = head_block(response.headers());
@@ -774,8 +925,13 @@ impl WsFramer {
                         ended: carrier_ended,
                         ..Pipe::default()
                     };
-                    let declared = content_length(response.headers());
-                    let (phase, ended) = answered_body(pipe, declared, true, out);
+                    let chunked = is_chunked(response.headers()).then(Box::<Dechunk>::default);
+                    let declared = if chunked.is_some() {
+                        None
+                    } else {
+                        content_length(response.headers())
+                    };
+                    let (phase, ended) = answered_body(pipe, declared, chunked, true, out);
                     return Ok((phase, ended, reason));
                 }
                 Err(HandshakeError::Failure(_)) => return Err(TransportError::HandshakeFailed),
