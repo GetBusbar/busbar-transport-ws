@@ -918,7 +918,7 @@ impl WsFramer {
                             let pipe = mid.get_mut().get_mut();
                             let signed = signed_request(&pipe.outbound, sign)?;
                             pipe.outbound.zeroize();
-                            drop(signed);
+                            pipe.outbound = signed;
                         }
                         Phase::Dialling {
                             mid,
