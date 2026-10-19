@@ -49,6 +49,7 @@ use std::collections::{HashMap, VecDeque};
 use std::io::{Read, Write};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::task::Poll;
 
 use busbar_contract::abi::transport::fields::{hop_by_hop, LINE_END, SEPARATOR};
 use busbar_contract::ids::StreamId;
@@ -64,6 +65,7 @@ use tungstenite::http::{HeaderMap, HeaderName, HeaderValue};
 use tungstenite::protocol::frame::coding::CloseCode;
 use tungstenite::protocol::{CloseFrame, WebSocketConfig};
 use tungstenite::{Bytes, Error as WsError, Message, Utf8Bytes, WebSocket};
+use zeroize::{Zeroize, Zeroizing};
 
 /// The in-memory stream one framing state's protocol machine reads and writes: what core ingested
 /// and the machine has not consumed, whether the carrier's clean end followed it, what the
@@ -175,6 +177,18 @@ impl Phase {
     }
 }
 
+/// Where a dial awaiting its auth's answer is parked: the op's ticket, its deadline and the host
+/// clock now (both on the host's monotonic clock; a deadline of `0` is none).
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Parking {
+    /// The op's ticket (`InHead::ticket`), as `(slot, generation)`.
+    pub(crate) ticket: (u32, u32),
+    /// The op's deadline.
+    pub(crate) deadline: u64,
+    /// Now.
+    pub(crate) now: u64,
+}
+
 /// The most whole messages a dial holds while its handshake has not completed.
 pub(crate) const MAX_HELD_MESSAGES: usize = 64;
 
@@ -187,6 +201,9 @@ pub(crate) struct WsFramer {
     /// Each dialled framing's head reason phrase, from the call that handed the head up until the
     /// door takes it ([`WsFramer::take_reason`]).
     reasons: Mutex<HashMap<u64, Vec<u8>>>,
+    /// Dials awaiting their auth's answer, by the op's ticket, each with the op's deadline
+    /// ([`WsFramer::open_signed`]).
+    parked: Mutex<HashMap<(u32, u32), (u64, Phase)>>,
     next: AtomicU64,
     max_message_bytes: usize,
 }
@@ -257,17 +274,16 @@ fn read_error(e: &WsError) -> TransportError {
 ///
 /// THE ORDER OF THE DIALLED HEAD, as it is written (tungstenite 0.29 `generate_request`): the
 /// request line, then the protocol machine's handshake lines (`Host` from the dialled URL,
-/// `Connection`, `Upgrade`, `Sec-WebSocket-Version`, `Sec-WebSocket-Key`), then the opening fields
-/// (the auth's and the plane's, composed before `begin`) in the request map's own iteration
-/// order (`http::HeaderMap`, which does not keep the order the fields were added in), a repeated
-/// name's lines together and in their own order. Ruling 17's order (auth, plane, then the transport's defaults)
-/// is the HTTP egress head's, from 1.5.5's proxy engine; 1.5.5 dialled no WebSocket at all, so this
-/// head has no 1.5.5 order to keep, and the handshake lines lead because the machine writes them
-/// (`framer_tests::the_dialled_heads_order_is_pinned` pins it). An opening field of a handshake
-/// name is the machine's to write, so it is not copied. The handshake's key is fresh per dial and
-/// the auth never sees it, so a signing style cannot sign this head: the door's tail states no
-/// `FACT_SIGNS_NOTHING_AFTER_AUTH` (`door::TAIL.facts`), and the framer never claims that what an
-/// auth signed is what is sent.
+/// `Connection`, `Upgrade`, `Sec-WebSocket-Version`, `Sec-WebSocket-Key`), then the plane's
+/// opening fields in the request map's own iteration order (`http::HeaderMap`, which does not keep
+/// the order the fields were added in), a repeated name's lines together and in their own order;
+/// then, LAST, what the binding's auth answered ([`signed_request`], ruling 23: the auth is called
+/// over exactly the bytes above, the fresh key among them, and nothing is added after it). 1.5.5
+/// dialled no WebSocket at all, so this head has no 1.5.5 order to keep, and the handshake lines
+/// lead because the machine writes them (`framer_tests::the_dialled_heads_order_is_pinned` pins
+/// it; `framer_tests::an_auth_that_signs_the_whole_head_sees_every_byte_on_the_wire` pins the
+/// auth's place). An opening field of a handshake name is the machine's to write, so it is not
+/// copied, and an auth that answers one refuses the dial.
 const HANDSHAKE_FIELDS: &[&str] = &[
     "host",
     "connection",
@@ -341,39 +357,14 @@ pub(crate) fn retry_after(headers: &HeaderMap, now_secs: u64) -> Option<u64> {
     imf_fixdate_secs(raw).map(|at| at.saturating_sub(now_secs))
 }
 
-/// An IMF-fixdate (`Sun, 06 Nov 1994 08:49:37 GMT`, RFC 9110 §5.6.7) as Unix seconds.
+/// An HTTP-date (RFC 9110 §5.6.7: the IMF-fixdate, and the two obsolete forms a recipient must
+/// accept) as Unix seconds, read by the protocol library (`httpdate`).
 fn imf_fixdate_secs(s: &str) -> Option<u64> {
-    let b = s.as_bytes();
-    if s.len() != 29 || !s.ends_with(" GMT") || b.get(3) != Some(&b',') || b.get(4) != Some(&b' ') {
-        return None;
-    }
-    let num = |r: std::ops::Range<usize>| s.get(r)?.parse::<u64>().ok();
-    let month = match s.get(8..11)? {
-        "Jan" => 1,
-        "Feb" => 2,
-        "Mar" => 3,
-        "Apr" => 4,
-        "May" => 5,
-        "Jun" => 6,
-        "Jul" => 7,
-        "Aug" => 8,
-        "Sep" => 9,
-        "Oct" => 10,
-        "Nov" => 11,
-        "Dec" => 12,
-        _ => return None,
-    };
-    let (day, year) = (num(5..7)?, num(12..16)?);
-    let (hour, minute, second) = (num(17..19)?, num(20..22)?, num(23..25)?);
-    // Days from the civil date (Howard Hinnant's public-domain algorithm), in UTC.
-    let y = i64::try_from(year).ok()? - i64::from(month <= 2);
-    let era = if y >= 0 { y } else { y - 399 } / 400;
-    let yoe = y - era * 400;
-    let mp = (month + 9) % 12;
-    let doy = (153 * mp + 2) / 5 + i64::try_from(day).ok()? - 1;
-    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    let days = u64::try_from(era * 146_097 + doe - 719_468).ok()?;
-    Some(days * 86_400 + hour * 3_600 + minute * 60 + second)
+    httpdate::parse_http_date(s)
+        .ok()?
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .map(|d| d.as_secs())
 }
 
 /// Whether an answer's body is `chunked` (RFC 9112 §6.1, §6.3: the LAST transfer coding the answer
@@ -405,8 +396,10 @@ enum Chunked {
     DataEnd,
     /// The trailer section, after the last chunk: it ends at an empty line.
     Trailer,
-    /// The body ended (or its coding was malformed): nothing more is read.
+    /// The body ended at its last chunk and trailers: nothing more is read.
     Done,
+    /// The coding was malformed: the body is not whole, and nothing more is read.
+    Malformed,
 }
 
 /// A refused upgrade's CHUNKED BODY, decoded as it arrives: the data handed up without its chunk
@@ -419,15 +412,16 @@ pub(crate) struct Dechunk {
 }
 
 impl Dechunk {
-    /// Decode what `inbound` holds into `body`; `true` once the body has ended (its last chunk and
-    /// trailers read, or a malformed coding, past which nothing is read).
-    fn feed(&mut self, inbound: &mut VecDeque<u8>, body: &mut Vec<u8>) -> bool {
+    /// Decode what `inbound` holds into `body`; `Some(whole)` once nothing more is read: `true` at
+    /// its last chunk and trailers, `false` at a malformed coding.
+    fn feed(&mut self, inbound: &mut VecDeque<u8>, body: &mut Vec<u8>) -> Option<bool> {
         loop {
             match self.state {
-                Chunked::Done => return true,
+                Chunked::Done => return Some(true),
+                Chunked::Malformed => return Some(false),
                 Chunked::Data(n) => {
                     if inbound.is_empty() {
-                        return false;
+                        return None;
                     }
                     let take = usize::try_from(n).map_or(inbound.len(), |n| n.min(inbound.len()));
                     body.extend(inbound.drain(..take));
@@ -441,13 +435,11 @@ impl Dechunk {
                 }
                 Chunked::Size | Chunked::DataEnd | Chunked::Trailer => {}
             }
-            let Some(b) = inbound.pop_front() else {
-                return false;
-            };
+            let b = inbound.pop_front()?;
             if b != b'\n' {
                 if self.line.len() >= CHUNK_LINE_MAX {
-                    self.state = Chunked::Done;
-                    return true;
+                    self.state = Chunked::Malformed;
+                    return Some(false);
                 }
                 self.line.push(b);
                 continue;
@@ -465,13 +457,13 @@ impl Dechunk {
                     {
                         Some(0) => Chunked::Trailer,
                         Some(n) => Chunked::Data(n),
-                        None => Chunked::Done,
+                        None => Chunked::Malformed,
                     }
                 }
                 Chunked::DataEnd if line.is_empty() => Chunked::Size,
                 Chunked::Trailer if line.is_empty() => Chunked::Done,
                 Chunked::Trailer => Chunked::Trailer,
-                _ => Chunked::Done,
+                _ => Chunked::Malformed,
             };
         }
     }
@@ -519,10 +511,10 @@ fn answered_body(
     }
     if let Some(mut decoder) = chunked {
         let mut bytes = Vec::new();
-        let done = decoder.feed(&mut pipe.inbound, &mut bytes);
-        let ended = done || (pipe.ended && pipe.inbound.is_empty());
-        // The carrier ended before the last chunk: a short body.
-        let short = ended && !done;
+        let fed = decoder.feed(&mut pipe.inbound, &mut bytes);
+        let ended = fed.is_some() || (pipe.ended && pipe.inbound.is_empty());
+        // The carrier ended before the last chunk, or the coding was malformed: not a whole body.
+        let short = ended && fed != Some(true);
         if !bytes.is_empty() || ended {
             out.frame(Framed::plain(StreamId(0), &bytes, ended));
         }
@@ -693,6 +685,7 @@ impl WsFramer {
         Self {
             states: Mutex::new(HashMap::new()),
             reasons: Mutex::new(HashMap::new()),
+            parked: Mutex::new(HashMap::new()),
             next: AtomicU64::new(1),
             max_message_bytes,
         }
@@ -721,6 +714,88 @@ impl WsFramer {
     ) -> Result<u64, TransportError> {
         let phase = self.start(side, target, fields, out)?;
         Ok(self.hold(phase))
+    }
+
+    /// [`Self::open_with`] for a dial whose binding has an auth at the head (`BeginIn::points`):
+    /// the upgrade request is built whole, `sign` is called over it exactly as it goes on the wire,
+    /// and its answer joins it last ([`signed_request`]). A sign that is not ready PARKS the built
+    /// dial under the op's `ticket` (its key and its head kept, so the answer that comes back
+    /// signs these bytes) until the op resumes on the same ticket, or `deadline` (the op's, on the
+    /// host clock, `0` = none) passes; nothing is written meanwhile.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::open_with`]; the auth refused, or answered a line the request cannot carry.
+    pub(crate) fn open_signed(
+        &self,
+        parking: Parking,
+        target: &str,
+        fields: &[(String, Vec<u8>)],
+        sign: Signer<'_>,
+        out: &mut dyn FramerOut,
+    ) -> Poll<Result<u64, TransportError>> {
+        let mut phase = match self.unpark(parking) {
+            Some(phase) => phase,
+            None => match self.dial(target, fields) {
+                Ok(phase) => phase,
+                Err(e) => return Poll::Ready(Err(e)),
+            },
+        };
+        let signed = signed_request(&phase.pipe().outbound, sign);
+        let pipe = phase.pipe();
+        match signed {
+            Poll::Pending => {
+                self.park(parking, phase);
+                return Poll::Pending;
+            }
+            Poll::Ready(Err(e)) => {
+                pipe.outbound.zeroize();
+                return Poll::Ready(Err(e));
+            }
+            Poll::Ready(Ok(signed)) => {
+                pipe.outbound.zeroize();
+                pipe.outbound = signed;
+            }
+        }
+        drain(&mut phase, out);
+        // The upgrade request carries credential lines: what held it is wiped once sent.
+        phase.pipe().outbound.zeroize();
+        Poll::Ready(Ok(self.hold(phase)))
+    }
+
+    /// Park a dial awaiting its auth's answer, and drop every parked dial whose op's deadline has
+    /// passed (its op will never resume).
+    fn park(&self, parking: Parking, phase: Phase) {
+        let mut parked = self.parked.lock().unwrap_or_else(PoisonError::into_inner);
+        parked.retain(|_, (deadline, _)| *deadline == 0 || *deadline > parking.now);
+        parked.insert(parking.ticket, (parking.deadline, phase));
+    }
+
+    /// The dial parked under `parking`'s ticket, taken.
+    fn unpark(&self, parking: Parking) -> Option<Phase> {
+        self.parked
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&parking.ticket)
+            .map(|(_, phase)| phase)
+    }
+
+    /// The host cancelled `ticket`'s op: drop the dial parked under it, if there is one. Nothing of
+    /// it went out, so nothing moved.
+    pub(crate) fn release(&self, ticket: (u32, u32)) {
+        self.parked
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&ticket);
+    }
+
+    /// How many dials are parked (a test reads that a resumed or expired dial is gone).
+    #[cfg(test)]
+    pub(crate) fn parked(&self) -> usize {
+        self.parked
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .len()
     }
 
     /// [`Framer::emit`]: with `text` (the emit's `EMIT_TEXT`) the message goes out as a text
@@ -864,46 +939,50 @@ impl WsFramer {
                     }
                 }
             }
-            Side::Dial => {
-                let url = request_url(target)?;
-                let mut request = url
-                    .as_str()
-                    .into_client_request()
-                    .map_err(|_| TransportError::AddressRefused)?;
-                for (name, value) in fields.iter().filter(|(n, _)| rides_upgrade(n)) {
-                    let (Ok(name), Ok(value)) = (
-                        HeaderName::from_bytes(name.as_bytes()),
-                        HeaderValue::from_bytes(value),
-                    ) else {
-                        return Err(TransportError::HandshakeFailed);
-                    };
-                    request.headers_mut().append(name, value);
-                }
-                #[cfg(feature = "test-seeded")]
-                request
-                    .headers_mut()
-                    .insert("sec-websocket-key", HeaderValue::from_static(seeded::KEY));
-                match tungstenite::client::client_with_config(
-                    request,
-                    Pipe {
-                        client: true,
-                        ..Pipe::default()
-                    },
-                    self.config(),
-                ) {
-                    Err(HandshakeError::Interrupted(mid)) => Phase::Dialling {
-                        mid,
-                        held: Vec::new(),
-                        message: Vec::new(),
-                    },
-                    Ok(_) | Err(HandshakeError::Failure(_)) => {
-                        return Err(TransportError::HandshakeFailed)
-                    }
-                }
-            }
+            Side::Dial => self.dial(target, fields)?,
         };
         drain(&mut phase, out);
+        // The upgrade request may carry credential lines: what held it is wiped once sent.
+        phase.pipe().outbound.zeroize();
         Ok(phase)
+    }
+
+    /// A dial's upgrade request, built and written into its pipe and not yet handed out: the
+    /// protocol machine's handshake lines, then `fields` ([`rides_upgrade`]'s).
+    fn dial(&self, target: &str, fields: &[(String, Vec<u8>)]) -> Result<Phase, TransportError> {
+        let url = request_url(target)?;
+        let mut request = url
+            .as_str()
+            .into_client_request()
+            .map_err(|_| TransportError::AddressRefused)?;
+        for (name, value) in fields.iter().filter(|(n, _)| rides_upgrade(n)) {
+            let (Ok(name), Ok(value)) = (
+                HeaderName::from_bytes(name.as_bytes()),
+                HeaderValue::from_bytes(value),
+            ) else {
+                return Err(TransportError::HandshakeFailed);
+            };
+            request.headers_mut().append(name, value);
+        }
+        #[cfg(feature = "test-seeded")]
+        request
+            .headers_mut()
+            .insert("sec-websocket-key", HeaderValue::from_static(seeded::KEY));
+        match tungstenite::client::client_with_config(
+            request,
+            Pipe {
+                client: true,
+                ..Pipe::default()
+            },
+            self.config(),
+        ) {
+            Err(HandshakeError::Interrupted(mid)) => Ok(Phase::Dialling {
+                mid,
+                held: Vec::new(),
+                message: Vec::new(),
+            }),
+            Ok(_) | Err(HandshakeError::Failure(_)) => Err(TransportError::HandshakeFailed),
+        }
     }
 
     /// Drive `phase` over what its pipe holds: finish the handshake if it can, then hand every
@@ -1123,6 +1202,163 @@ pub(crate) fn split_ws_url(url: &str) -> Result<(bool, String, u16, String), Tra
     }
     let port = parts.port.unwrap_or(if secure { 443 } else { 80 });
     Ok((secure, parts.host, port, parts.path))
+}
+
+/// THE DIALLED UPGRADE REQUEST AS IT GOES ON THE WIRE (ruling 23: nothing is added to a head after
+/// its auth runs): what the binding's auth is called over, borrowed from the bytes that are sent.
+pub(crate) struct UpgradeHead<'a> {
+    /// The request line's path, as sent.
+    pub(crate) target: &'a str,
+    /// The request line's query, without `?`; `None` = none.
+    pub(crate) query: Option<&'a str>,
+    /// The `Host` line's value.
+    pub(crate) authority: &'a str,
+    /// Every field line, in wire order, names as sent: the handshake's own lines first, then the
+    /// plane's.
+    pub(crate) fields: &'a [(&'a str, &'a [u8])],
+}
+
+/// One line the binding's auth answered: a field line of the head, or (`query`) a key of the
+/// target's query. Its value is credential material, wiped when dropped.
+pub(crate) struct AuthLine {
+    /// The name.
+    pub(crate) name: String,
+    /// The value.
+    pub(crate) value: Zeroizing<Vec<u8>>,
+    /// A query key, never a field line.
+    pub(crate) query: bool,
+}
+
+/// The binding's auth, called once over the upgrade request exactly as it goes on the wire.
+/// [`Poll::Pending`]: the auth's answer is not ready (the host stores it on the call's handle); the
+/// dial is parked and the same call is made again when the op resumes.
+pub(crate) type Signer<'s> =
+    &'s mut dyn FnMut(&UpgradeHead<'_>) -> Poll<Result<Vec<AuthLine>, TransportError>>;
+
+/// A query key or value an auth answered: visible ASCII that neither ends the target (`#`, a
+/// space) nor splits its pairs (`&`); a key carries no `=`.
+fn query_safe(bytes: &[u8], key: bool) -> bool {
+    (!key || !bytes.is_empty())
+        && bytes
+            .iter()
+            .all(|&b| b.is_ascii_graphic() && b != b'#' && b != b'&' && !(key && b == b'='))
+}
+
+/// THE SIGNED UPGRADE REQUEST (ruling 23, the framer's order): `wire` is the request the protocol
+/// machine wrote, the framer's own lines (the handshake's) and the plane's; `sign` is called over
+/// exactly those bytes; each field line it answers is appended after every other line, replacing
+/// any line of the same name (ASCII case-insensitive), and each query key it answers joins the
+/// target's query, replacing any pair of the same key. Nothing is added after. An answer that
+/// names a handshake line ([`rides_upgrade`]'s refusals), or a line or key the request cannot
+/// carry, refuses the dial.
+fn signed_request(wire: &[u8], sign: Signer<'_>) -> Poll<Result<Vec<u8>, TransportError>> {
+    match signed_inner(wire, sign) {
+        Ok(Some(signed)) => Poll::Ready(Ok(signed)),
+        Ok(None) => Poll::Pending,
+        Err(e) => Poll::Ready(Err(e)),
+    }
+}
+
+/// `None`: the auth's answer is not ready.
+fn signed_inner(wire: &[u8], sign: Signer<'_>) -> Result<Option<Vec<u8>>, TransportError> {
+    let broken = || TransportError::HandshakeFailed;
+    let head = wire.strip_suffix(b"\r\n\r\n").ok_or_else(broken)?;
+    let mut lines = head
+        .split(|&b| b == b'\n')
+        .map(|l| l.strip_suffix(b"\r").unwrap_or(l));
+    let request_line =
+        std::str::from_utf8(lines.next().ok_or_else(broken)?).map_err(|_| broken())?;
+    let (path, query) = request_line
+        .strip_prefix("GET ")
+        .and_then(|l| l.rsplit_once(' '))
+        .filter(|(_, version)| *version == "HTTP/1.1")
+        .map(|(target, _)| {
+            target
+                .split_once('?')
+                .map_or((target, None), |(p, q)| (p, Some(q)))
+        })
+        .ok_or_else(broken)?;
+    let mut fields = Vec::new();
+    for line in lines {
+        let at = line
+            .windows(2)
+            .position(|w| w == b": ")
+            .ok_or_else(broken)?;
+        let name = std::str::from_utf8(&line[..at]).map_err(|_| broken())?;
+        fields.push((name, &line[at + 2..]));
+    }
+    let authority = fields
+        .iter()
+        .find(|(n, _)| n.eq_ignore_ascii_case("host"))
+        .and_then(|(_, v)| std::str::from_utf8(v).ok())
+        .ok_or_else(broken)?;
+    let answer = match sign(&UpgradeHead {
+        target: path,
+        query,
+        authority,
+        fields: &fields,
+    }) {
+        Poll::Pending => return Ok(None),
+        Poll::Ready(answer) => answer?,
+    };
+
+    let mut pairs: Vec<&[u8]> = query
+        .map(|q| q.as_bytes().split(|&b| b == b'&').collect())
+        .unwrap_or_default();
+    for line in &answer {
+        let name = line.name.as_bytes();
+        if line.query {
+            if !query_safe(name, true) || !query_safe(&line.value, false) {
+                return Err(broken());
+            }
+            pairs.retain(|p| p.split(|&b| b == b'=').next() != Some(name));
+        } else {
+            if HeaderName::from_bytes(name).is_err()
+                || HeaderValue::from_bytes(&line.value).is_err()
+                || !rides_upgrade(&line.name)
+            {
+                return Err(broken());
+            }
+            fields.retain(|(n, _)| !n.eq_ignore_ascii_case(&line.name));
+        }
+    }
+
+    let mut signed = Vec::with_capacity(
+        wire.len()
+            + answer
+                .iter()
+                .map(|l| l.name.len() + l.value.len() + 4)
+                .sum::<usize>(),
+    );
+    signed.extend_from_slice(b"GET ");
+    signed.extend_from_slice(path.as_bytes());
+    let mut sep = b'?';
+    for pair in pairs {
+        signed.push(sep);
+        signed.extend_from_slice(pair);
+        sep = b'&';
+    }
+    for line in answer.iter().filter(|l| l.query) {
+        signed.push(sep);
+        signed.extend_from_slice(line.name.as_bytes());
+        signed.push(b'=');
+        signed.extend_from_slice(&line.value);
+        sep = b'&';
+    }
+    signed.extend_from_slice(b" HTTP/1.1\r\n");
+    let own = fields.iter().copied();
+    let auth = answer
+        .iter()
+        .filter(|l| !l.query)
+        .map(|l| (l.name.as_str(), l.value.as_slice()));
+    for (name, value) in own.chain(auth) {
+        signed.extend_from_slice(name.as_bytes());
+        signed.extend_from_slice(b": ");
+        signed.extend_from_slice(value);
+        signed.extend_from_slice(b"\r\n");
+    }
+    signed.extend_from_slice(b"\r\n");
+    Ok(Some(signed))
 }
 
 /// A host as an authority spells it: an IPv6 literal in its brackets (RFC 3986 section 3.2.2).
