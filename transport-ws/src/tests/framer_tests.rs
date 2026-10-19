@@ -380,6 +380,48 @@ fn a_refused_upgrade_hands_up_a_large_body_and_the_carrier_end() {
     assert!(heard.ended, "the carrier ended: the frames end");
 }
 
+/// A REFUSED UPGRADE'S CHUNKED BODY IS DECODED BY ITS TRANSFER CODING (Q128 transport-ws LOW, both
+/// readers on a5c9118; RFC 9112 §6.3 and §7.1: `Transfer-Encoding: chunked` overrides any
+/// `Content-Length`, and the body ends at its last chunk): on a kept-alive connection the plane gets
+/// the error document without chunk markers, across pieces split mid-size-line and mid-chunk, and
+/// the frames end at the zero-length chunk and its trailers, not at the carrier's end. RED before
+/// the fix: the chunk-size lines reached the plane, and the frames never ended.
+#[test]
+fn a_refused_upgrades_chunked_body_is_decoded_and_ends_at_its_last_chunk() {
+    let framer = WsFramer::new(0);
+    let mut out = Out::default();
+    let state = framer
+        .open_with(Side::Dial, "ws://127.0.0.1:9/x", &[], &mut out)
+        .expect("the dial opens");
+    let wire: &[u8] = b"HTTP/1.1 401 Unauthorized\r\nTransfer-Encoding: chunked\r\n\
+        Content-Length: 3\r\n\r\n7;ext=1\r\n{\"error\r\nC\r\n\":\"bad key\"}\r\n0\r\nx-trace: 1\r\n\r\n";
+    let split = wire
+        .windows(2)
+        .position(|w| w == b"C\r")
+        .expect("the second size line")
+        + 1;
+    let mut heard = Out::default();
+    framer
+        .ingest(state, &wire[..split], false, &mut heard)
+        .expect("the far end answered");
+    assert_eq!(
+        heard.statuses[0],
+        Some((401, Some(WireStatusClass::CallerFault)))
+    );
+    assert!(!heard.ended, "the last chunk has not come");
+    let mut rest = Out::default();
+    framer
+        .ingest(state, &wire[split..], false, &mut rest)
+        .expect("the rest of the body");
+    let mut got: Vec<u8> = heard.frames[1..].concat();
+    got.extend(rest.frames.concat());
+    assert_eq!(got, br#"{"error":"bad key"}"#.to_vec(), "decoded, once");
+    assert!(
+        rest.ended,
+        "the last chunk ends the frames on a kept-alive carrier"
+    );
+}
+
 /// THE CEILING HOLDS FOR WHAT AN OPEN CONNECTION WRITES TOO (Q128 transport-ws LOW): a message over
 /// the ceiling, whole or gathered from pieces, is refused as a held one is, and one within it goes
 /// out. RED before the fix: the open path sent any size (the machine bounds only what it reads).
