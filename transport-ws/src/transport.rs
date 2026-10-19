@@ -139,8 +139,18 @@ enum Phase {
     /// A dialled connection the far end answered with something other than `101`: its answer's
     /// head was handed up as the stream's head, then its body: `left` bytes of it still to come
     /// (its declared `Content-Length`), or with none declared, every byte until the carrier ends.
-    /// At `Some(0)` its frames have ended and nothing more is read.
-    Answered { pipe: Pipe, left: Option<u64> },
+    /// At `Some(0)` its frames have ended and nothing more is read. `chunked`: the body's transfer
+    /// coding is `chunked` (RFC 9112 §7.1), decoded here and ended at its last chunk; `left` is then
+    /// `None` until it ends.
+    ///
+    /// `short`: the carrier ended before the body did (short of its declared `Content-Length`, or
+    /// of its last chunk): the frames end FAILED, not whole ([`WsFramer::failed`]).
+    Answered {
+        pipe: Pipe,
+        left: Option<u64>,
+        chunked: Option<Box<Dechunk>>,
+        short: bool,
+    },
 }
 
 impl Phase {
@@ -166,10 +176,10 @@ impl Phase {
 }
 
 /// The most whole messages a dial holds while its handshake has not completed.
-pub const MAX_HELD_MESSAGES: usize = 64;
+pub(crate) const MAX_HELD_MESSAGES: usize = 64;
 
 /// The `ws` framer: its framing states, and the message ceiling every connection is built with.
-pub struct WsFramer {
+pub(crate) struct WsFramer {
     /// Every framing state, each behind its own lock: the map's lock is held only to find, add or
     /// remove one, never across a framing's work, so connections run side by side and a panic in
     /// one fails that one alone.
@@ -244,6 +254,20 @@ fn read_error(e: &WsError) -> TransportError {
 
 /// The upgrade request's own fields, which the handshake writes itself: an opening field of one of
 /// these names is not copied onto it.
+///
+/// THE ORDER OF THE DIALLED HEAD, as it is written (tungstenite 0.29 `generate_request`): the
+/// request line, then the protocol machine's handshake lines (`Host` from the dialled URL,
+/// `Connection`, `Upgrade`, `Sec-WebSocket-Version`, `Sec-WebSocket-Key`), then the opening fields
+/// (the auth's and the plane's, composed before `begin`) in the request map's own iteration
+/// order (`http::HeaderMap`, which does not keep the order the fields were added in), a repeated
+/// name's lines together and in their own order. Ruling 17's order (auth, plane, then the transport's defaults)
+/// is the HTTP egress head's, from 1.5.5's proxy engine; 1.5.5 dialled no WebSocket at all, so this
+/// head has no 1.5.5 order to keep, and the handshake lines lead because the machine writes them
+/// (`framer_tests::the_dialled_heads_order_is_pinned` pins it). An opening field of a handshake
+/// name is the machine's to write, so it is not copied. The handshake's key is fresh per dial and
+/// the auth never sees it, so a signing style cannot sign this head: the door's tail states no
+/// `FACT_SIGNS_NOTHING_AFTER_AUTH` (`door::TAIL.facts`), and the framer never claims that what an
+/// auth signed is what is sent.
 const HANDSHAKE_FIELDS: &[&str] = &[
     "host",
     "connection",
@@ -259,8 +283,9 @@ fn rides_upgrade(name: &str) -> bool {
 }
 
 /// THE ANSWER'S HEAD as a field block (`busbar_contract::abi::transport::fields`): the switching
-/// response's fields in the far end's order, names lower-case, a repeated name's values each on its
-/// own line. Hop-by-hop fields (and every field a `connection` field names) never enter it, nor do
+/// response's fields as the parsed head holds them (`HeaderMap`: names in the order they first
+/// appear, a repeated name's values together under its first appearance, in their own order), names
+/// lower-case, each value on its own line. Hop-by-hop fields (and every field a `connection` field names) never enter it, nor do
 /// the handshake's own fields ([`rides_upgrade`]'s refusals: `content-length` among them, and every
 /// `sec-websocket-*` field, which answer this hop's handshake and nothing above it). No field left
 /// is the EMPTY block, still handed up: an empty head is a head.
@@ -305,12 +330,151 @@ fn status_class(code: u16) -> WireStatusClass {
     }
 }
 
-/// The `Retry-After` an answer states, in whole seconds (its delta-seconds form).
-fn retry_after(headers: &HeaderMap) -> Option<u64> {
+/// The `Retry-After` an answer states, in whole seconds from `now_secs` (Unix seconds), in either
+/// of RFC 9110's forms, as the http framer reads it: `delay-seconds`, or an IMF-fixdate converted to
+/// the seconds left until it (`0` once past). A value read as neither is absent.
+pub(crate) fn retry_after(headers: &HeaderMap, now_secs: u64) -> Option<u64> {
+    let raw = headers.get("retry-after")?.to_str().ok()?.trim();
+    if let Ok(n) = raw.parse::<u64>() {
+        return Some(n);
+    }
+    imf_fixdate_secs(raw).map(|at| at.saturating_sub(now_secs))
+}
+
+/// An IMF-fixdate (`Sun, 06 Nov 1994 08:49:37 GMT`, RFC 9110 §5.6.7) as Unix seconds.
+fn imf_fixdate_secs(s: &str) -> Option<u64> {
+    let b = s.as_bytes();
+    if s.len() != 29 || !s.ends_with(" GMT") || b.get(3) != Some(&b',') || b.get(4) != Some(&b' ') {
+        return None;
+    }
+    let num = |r: std::ops::Range<usize>| s.get(r)?.parse::<u64>().ok();
+    let month = match s.get(8..11)? {
+        "Jan" => 1,
+        "Feb" => 2,
+        "Mar" => 3,
+        "Apr" => 4,
+        "May" => 5,
+        "Jun" => 6,
+        "Jul" => 7,
+        "Aug" => 8,
+        "Sep" => 9,
+        "Oct" => 10,
+        "Nov" => 11,
+        "Dec" => 12,
+        _ => return None,
+    };
+    let (day, year) = (num(5..7)?, num(12..16)?);
+    let (hour, minute, second) = (num(17..19)?, num(20..22)?, num(23..25)?);
+    // Days from the civil date (Howard Hinnant's public-domain algorithm), in UTC.
+    let y = i64::try_from(year).ok()? - i64::from(month <= 2);
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400;
+    let mp = (month + 9) % 12;
+    let doy = (153 * mp + 2) / 5 + i64::try_from(day).ok()? - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = u64::try_from(era * 146_097 + doe - 719_468).ok()?;
+    Some(days * 86_400 + hour * 3_600 + minute * 60 + second)
+}
+
+/// Whether an answer's body is `chunked` (RFC 9112 §6.1, §6.3: the LAST transfer coding the answer
+/// names is `chunked`, which then frames the body whatever `Content-Length` says).
+fn is_chunked(headers: &HeaderMap) -> bool {
     headers
-        .get("retry-after")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.trim().parse().ok())
+        .get_all("transfer-encoding")
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|v| v.split(','))
+        .map(str::trim)
+        .rfind(|c| !c.is_empty())
+        .is_some_and(|c| c.eq_ignore_ascii_case("chunked"))
+}
+
+/// The longest chunk-size or trailer line a refused upgrade's chunked body may carry; a longer one is
+/// malformed, and the frames end there.
+const CHUNK_LINE_MAX: usize = 4096;
+
+/// Where a chunked body's decoder stands (RFC 9112 §7.1).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+enum Chunked {
+    /// Reading a chunk-size line (its extensions ignored).
+    #[default]
+    Size,
+    /// This many data bytes of the current chunk are still to come.
+    Data(u64),
+    /// The line end after a chunk's data.
+    DataEnd,
+    /// The trailer section, after the last chunk: it ends at an empty line.
+    Trailer,
+    /// The body ended (or its coding was malformed): nothing more is read.
+    Done,
+}
+
+/// A refused upgrade's CHUNKED BODY, decoded as it arrives: the data handed up without its chunk
+/// markers, ended at the last chunk and its trailers (which are dropped: the head was handed up
+/// already).
+#[derive(Debug, Default)]
+pub(crate) struct Dechunk {
+    state: Chunked,
+    line: Vec<u8>,
+}
+
+impl Dechunk {
+    /// Decode what `inbound` holds into `body`; `true` once the body has ended (its last chunk and
+    /// trailers read, or a malformed coding, past which nothing is read).
+    fn feed(&mut self, inbound: &mut VecDeque<u8>, body: &mut Vec<u8>) -> bool {
+        loop {
+            match self.state {
+                Chunked::Done => return true,
+                Chunked::Data(n) => {
+                    if inbound.is_empty() {
+                        return false;
+                    }
+                    let take = usize::try_from(n).map_or(inbound.len(), |n| n.min(inbound.len()));
+                    body.extend(inbound.drain(..take));
+                    let rest = n - take as u64;
+                    self.state = if rest == 0 {
+                        Chunked::DataEnd
+                    } else {
+                        Chunked::Data(rest)
+                    };
+                    continue;
+                }
+                Chunked::Size | Chunked::DataEnd | Chunked::Trailer => {}
+            }
+            let Some(b) = inbound.pop_front() else {
+                return false;
+            };
+            if b != b'\n' {
+                if self.line.len() >= CHUNK_LINE_MAX {
+                    self.state = Chunked::Done;
+                    return true;
+                }
+                self.line.push(b);
+                continue;
+            }
+            let mut line = std::mem::take(&mut self.line);
+            if line.last() == Some(&b'\r') {
+                line.pop();
+            }
+            self.state = match self.state {
+                Chunked::Size => {
+                    let size = line.split(|c| *c == b';').next().unwrap_or_default();
+                    match std::str::from_utf8(size)
+                        .ok()
+                        .and_then(|t| u64::from_str_radix(t.trim(), 16).ok())
+                    {
+                        Some(0) => Chunked::Trailer,
+                        Some(n) => Chunked::Data(n),
+                        None => Chunked::Done,
+                    }
+                }
+                Chunked::DataEnd if line.is_empty() => Chunked::Size,
+                Chunked::Trailer if line.is_empty() => Chunked::Done,
+                Chunked::Trailer => Chunked::Trailer,
+                _ => Chunked::Done,
+            };
+        }
+    }
 }
 
 /// The `Content-Length` an answer declares.
@@ -331,19 +495,47 @@ pub(crate) fn reason_phrase(seen: &[u8]) -> Option<Vec<u8>> {
     parts.next().filter(|r| !r.is_empty()).map(<[u8]>::to_vec)
 }
 
-/// A refused upgrade's BODY: frame what the pipe holds, up to the `left` bytes its declared
-/// `Content-Length` still owes (or, with none declared, until the carrier ends), and end the frames
-/// once they are all handed up or the carrier ended. `first`: the call that handed the head up (a
-/// declared length of `0` ends the frames then). Past the end, what arrives is nobody's.
+/// A refused upgrade's BODY: frame what the pipe holds, decoded by its transfer coding when it is
+/// `chunked` (to its last chunk), otherwise up to the `left` bytes its declared `Content-Length`
+/// still owes (or, with none declared, until the carrier ends), and end the frames once they are
+/// all handed up or the carrier ended. `first`: the call that handed the head up (a declared length
+/// of `0` ends the frames then). Past the end, what arrives is nobody's.
 fn answered_body(
     mut pipe: Pipe,
     left: Option<u64>,
+    chunked: Option<Box<Dechunk>>,
     first: bool,
     out: &mut dyn FramerOut,
 ) -> (Phase, bool) {
     if left == Some(0) {
         pipe.inbound.clear();
-        return (Phase::Answered { pipe, left }, first);
+        let phase = Phase::Answered {
+            pipe,
+            left,
+            chunked: None,
+            short: false,
+        };
+        return (phase, first);
+    }
+    if let Some(mut decoder) = chunked {
+        let mut bytes = Vec::new();
+        let done = decoder.feed(&mut pipe.inbound, &mut bytes);
+        let ended = done || (pipe.ended && pipe.inbound.is_empty());
+        // The carrier ended before the last chunk: a short body.
+        let short = ended && !done;
+        if !bytes.is_empty() || ended {
+            out.frame(Framed::plain(StreamId(0), &bytes, ended));
+        }
+        if ended {
+            pipe.inbound.clear();
+        }
+        let phase = Phase::Answered {
+            pipe,
+            left: ended.then_some(0),
+            chunked: (!ended).then_some(decoder),
+            short,
+        };
+        return (phase, ended);
     }
     let avail = pipe.inbound.len();
     let take = left.map_or(avail, |l| {
@@ -358,8 +550,16 @@ fn answered_body(
     if ended {
         pipe.inbound.clear();
     }
+    // The carrier ended with declared bytes still owed: a short body.
+    let short = ended && left.is_some_and(|l| l > 0);
     let left = if ended { Some(0) } else { left };
-    (Phase::Answered { pipe, left }, ended)
+    let phase = Phase::Answered {
+        pipe,
+        left,
+        chunked: None,
+        short,
+    };
+    (phase, ended)
 }
 
 /// THE CLOSE CODE A REFUSAL'S NEUTRAL STATUS MAPS TO (the plane seam: a neutral status the transport
@@ -473,7 +673,7 @@ impl WsFramer {
     /// # Errors
     ///
     /// As [`Framer::refusal`].
-    pub fn refusal_with(
+    pub(crate) fn refusal_with(
         &self,
         state: u64,
         _stream: Option<StreamId>,
@@ -489,7 +689,7 @@ impl WsFramer {
     /// A framer whose messages (and frames) are capped at `max_message_bytes`; `0` = the protocol
     /// library's own default stands.
     #[must_use]
-    pub fn new(max_message_bytes: usize) -> Self {
+    pub(crate) fn new(max_message_bytes: usize) -> Self {
         Self {
             states: Mutex::new(HashMap::new()),
             reasons: Mutex::new(HashMap::new()),
@@ -512,7 +712,7 @@ impl WsFramer {
     /// # Errors
     ///
     /// The target is not a WebSocket URL, or a field is not a valid header.
-    pub fn open_with(
+    pub(crate) fn open_with(
         &self,
         side: Side,
         target: &str,
@@ -531,7 +731,7 @@ impl WsFramer {
     /// # Errors
     ///
     /// The state is gone, a text message is not UTF-8, or the machine refused it.
-    pub fn emit_text(
+    pub(crate) fn emit_text(
         &self,
         state: u64,
         bytes: &[u8],
@@ -548,6 +748,9 @@ impl WsFramer {
             let over = self.max_message_bytes > 0
                 && message.len().saturating_add(bytes.len()) > self.max_message_bytes;
             if over || (end_of_frame && held.len() >= MAX_HELD_MESSAGES) {
+                // The refused message's gathered pieces go with it, as the open path drops them:
+                // none is sent glued to the front of the next message.
+                message.clear();
                 return Err(TransportError::Framing);
             }
             message.extend_from_slice(bytes);
@@ -607,11 +810,27 @@ impl WsFramer {
 
     /// The reason phrase of the head framing `state`'s last call handed up (a dialled framing's,
     /// HTTP/1 as sent), taken once: the door states it in the head's slots.
-    pub fn take_reason(&self, state: u64) -> Option<Vec<u8>> {
+    pub(crate) fn take_reason(&self, state: u64) -> Option<Vec<u8>> {
         self.reasons
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .remove(&state)
+    }
+
+    /// Drop framing `state` and anything kept for it, writing nothing: the door's finish of a
+    /// framing whose op panicked, which never reached the framer to close it.
+    pub(crate) fn forget(&self, state: u64) {
+        self.map().remove(&state);
+        self.reasons
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&state);
+    }
+
+    /// Whether framing `state` is still held (a test reads that a finished framing is gone).
+    #[cfg(test)]
+    pub(crate) fn holds(&self, state: u64) -> bool {
+        self.map().contains_key(&state)
     }
 
     /// Framing `state`'s own lock, found under the map's.
@@ -695,8 +914,13 @@ impl WsFramer {
         out: &mut dyn FramerOut,
     ) -> Result<(Phase, bool, Option<Vec<u8>>), TransportError> {
         let mut phase = match phase {
-            Phase::Answered { pipe, left } => {
-                let (phase, ended) = answered_body(pipe, left, false, out);
+            Phase::Answered {
+                pipe,
+                left,
+                chunked,
+                ..
+            } => {
+                let (phase, ended) = answered_body(pipe, left, chunked, false, out);
                 return Ok((phase, ended, None));
             }
             phase => phase,
@@ -753,15 +977,19 @@ impl WsFramer {
                 // its fields, then its body (a far end's error document), and the frames end, so the
                 // breaker reads what it answered and the plane sees what it said. The body is every
                 // byte past the head (what came with it, then what still arrives) up to its declared
-                // `Content-Length`, or with none declared until the carrier ends; then the frames
-                // end. This framer decodes no other HTTP/1 body framing.
+                // `Content-Length`, or with none declared until the carrier ends, unless its
+                // transfer coding is `chunked`, which frames it instead (decoded, to its last
+                // chunk; RFC 9112 §6.3); then the frames end.
                 Err(HandshakeError::Failure(WsError::Http(response))) => {
                     let code = response.status().as_u16();
                     let block = head_block(response.headers());
                     out.frame(Framed {
                         status: Some(status_class(code)),
                         status_code: Some(u32::from(code)),
-                        retry_after_secs: retry_after(response.headers()),
+                        retry_after_secs: retry_after(
+                            response.headers(),
+                            out.now().unix_nanos / 1_000_000_000,
+                        ),
                         ..Framed::plain(StreamId(0), &block, true)
                     });
                     let (seen, carrier_ended) = shaken.unwrap_or_default();
@@ -774,8 +1002,19 @@ impl WsFramer {
                         ended: carrier_ended,
                         ..Pipe::default()
                     };
-                    let declared = content_length(response.headers());
-                    let (phase, ended) = answered_body(pipe, declared, true, out);
+                    // A status that carries no body (1xx, 204, 304: RFC 9112 §6.3) ends at its
+                    // head, whatever its framing fields say.
+                    let bodiless = matches!(code, 100..=199 | 204 | 304);
+                    let chunked =
+                        (!bodiless && is_chunked(response.headers())).then(Box::<Dechunk>::default);
+                    let declared = if bodiless {
+                        Some(0)
+                    } else if chunked.is_some() {
+                        None
+                    } else {
+                        content_length(response.headers())
+                    };
+                    let (phase, ended) = answered_body(pipe, declared, chunked, true, out);
                     return Ok((phase, ended, reason));
                 }
                 Err(HandshakeError::Failure(_)) => return Err(TransportError::HandshakeFailed),
@@ -913,7 +1152,8 @@ fn request_url(url: &str) -> Result<String, TransportError> {
 
 impl WsFramer {
     /// Whether the far side FAILED the connection in `state` (a protocol violation, text that is
-    /// not UTF-8, a message over the ceiling): its frames ended failed, not cleanly.
+    /// not UTF-8, a message over the ceiling), or a refused upgrade's body was cut short by the
+    /// carrier's end: its frames ended failed, not cleanly.
     pub(crate) fn failed(&self, state: u64) -> bool {
         let Ok(conn) = self.conn(state) else {
             return false;
@@ -923,10 +1163,12 @@ impl WsFramer {
         };
         matches!(
             held.as_ref(),
-            Some(Phase::Open {
-                failed: Some(_),
-                ..
-            })
+            Some(
+                Phase::Open {
+                    failed: Some(_),
+                    ..
+                } | Phase::Answered { short: true, .. }
+            )
         )
     }
 }
@@ -1065,7 +1307,8 @@ impl Framer for WsFramer {
         }
     }
 
-    /// Nothing upgrades in-band out of a WebSocket, so there is no stream to hand on.
+    /// Nothing upgrades in-band out of a WebSocket (RFC 6455 defines no upgrade out of an
+    /// established connection), so there is no stream to hand on: refusing is the protocol's answer.
     fn detach(&self, _state: u64, _out: &mut dyn BytesOut) -> Result<(), TransportError> {
         Err(TransportError::HandoffMismatch)
     }

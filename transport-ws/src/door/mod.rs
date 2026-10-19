@@ -168,6 +168,8 @@ const TAIL: TransportTail = TransportTail {
     },
     role: ROLE_FRAMER,
     framing: FRAMING_STREAM,
+    // NO `FACT_SIGNS_NOTHING_AFTER_AUTH`: the handshake writes its own lines after the auth has
+    // run (`transport::HANDSHAKE_FIELDS`), so the framer does not claim a signed head survives.
     facts: 0,
     handshake_max_steps: 0,
     frame_piece_size: FRAME_PIECE_SIZE,
@@ -860,7 +862,13 @@ impl Slot for Finish {
             Ok(())
         });
         if o.yielded.flags & YIELD_MORE == 0 {
-            instance(p).queues().remove(&i.framing);
+            let inst = instance(p);
+            // A framing whose op panicked answered FAILED above without reaching the framer, so
+            // its state is closed here too: the framing is gone, and nothing of it is kept for the
+            // life of the instance.
+            if inst.queues().remove(&i.framing).is_some() && out == Outcome::Failed {
+                inst.framer.forget(i.framing);
+            }
         }
         out
     }
@@ -906,41 +914,26 @@ fn fill(owed: &mut Owed, sink: &FramerSink, o: &mut FramerOut) {
             break;
         };
         // THE HEAD'S SLOTS (HEAD-FIELDS: the dialled side fills `reason`, HTTP/1 as sent): written
-        // into the frame buffer ahead of the head's first piece, in the same answer. A sink with no
-        // head slots, or no room for the phrase beside the piece, takes the head without it.
-        if let Some(reason) = piece.reason.take() {
-            let fits = heads < sink.heads_cap
-                && !sink.heads.is_null()
-                && reason.len() < sink.frame_cap - frame_len;
-            if fits {
-                // SAFETY: host buffers of the stated capacities: `reason` fits the frame's room,
-                // and `heads < heads_cap`.
-                unsafe {
-                    std::ptr::copy_nonoverlapping(
-                        reason.as_ptr(),
-                        sink.frame.add(frame_len),
-                        reason.len(),
-                    );
-                    sink.heads.add(heads).write(HeadSlots {
-                        stream: piece.stream,
-                        reason: FrameSpan {
-                            offset: frame_len as u64,
-                            len: reason.len() as u64,
-                        },
-                        ..HeadSlots::default()
-                    });
-                }
-                frame_len += reason.len();
-                heads += 1;
-            }
-        }
-        let room = sink.frame_cap - frame_len;
+        // into the frame buffer ahead of the head's first piece, and ONLY in the answer that also
+        // carries that piece (the host reads the phrase beside its head's first piece, and drops
+        // one that arrives alone). A piece that does not fit this answer keeps its phrase for the
+        // next; a piece that goes out with no room or no slot for the phrase takes the head
+        // without it.
+        let with_reason = piece.reason.as_ref().is_some_and(|r| {
+            heads < sink.heads_cap && !sink.heads.is_null() && r.len() < sink.frame_cap - frame_len
+        });
+        let reason_len = if with_reason {
+            piece.reason.as_ref().map_or(0, Vec::len)
+        } else {
+            0
+        };
+        let room = sink.frame_cap - frame_len - reason_len;
         // A field block is cut only where the host takes a continuation: at a line's start or
         // inside a value. A name longer than the whole frame buffer is cut anyway (the host
         // refuses it by name) rather than never moving.
         let take = if piece.fields {
             match field_cut(&piece.bytes, room, piece.continued) {
-                0 if frame_len == 0 => piece.bytes.len().min(room),
+                0 if frame_len + reason_len == 0 => piece.bytes.len().min(room),
                 cut => cut,
             }
         } else {
@@ -948,6 +941,28 @@ fn fill(owed: &mut Owed, sink: &FramerSink, o: &mut FramerOut) {
         };
         if take == 0 && !piece.bytes.is_empty() {
             break;
+        }
+        // The piece goes out in this answer: its phrase, when it fits, goes ahead of it.
+        if let Some(reason) = piece.reason.take().filter(|_| with_reason) {
+            // SAFETY: host buffers of the stated capacities: `reason` fits the frame's room
+            // (`reason_len < frame_cap - frame_len`), and `heads < heads_cap`.
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    reason.as_ptr(),
+                    sink.frame.add(frame_len),
+                    reason.len(),
+                );
+                sink.heads.add(heads).write(HeadSlots {
+                    stream: piece.stream,
+                    reason: FrameSpan {
+                        offset: frame_len as u64,
+                        len: reason.len() as u64,
+                    },
+                    ..HeadSlots::default()
+                });
+            }
+            frame_len += reason.len();
+            heads += 1;
         }
         let whole = take == piece.bytes.len();
         let (code, status_class) = piece.status.unwrap_or((0, STATUS_NONE));
@@ -1061,3 +1076,7 @@ busbar_contract::plugin_door! {
         timer: Timer,
     },
 }
+
+#[cfg(test)]
+#[path = "../tests/door_fill_tests.rs"]
+mod fill_tests;
