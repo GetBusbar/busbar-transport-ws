@@ -435,9 +435,7 @@ impl Dechunk {
                 }
                 Chunked::Size | Chunked::DataEnd | Chunked::Trailer => {}
             }
-            let Some(b) = inbound.pop_front() else {
-                return None;
-            };
+            let b = inbound.pop_front()?;
             if b != b'\n' {
                 if self.line.len() >= CHUNK_LINE_MAX {
                     self.state = Chunked::Malformed;
