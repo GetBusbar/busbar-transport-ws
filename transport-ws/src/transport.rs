@@ -258,17 +258,16 @@ fn read_error(e: &WsError) -> TransportError {
 ///
 /// THE ORDER OF THE DIALLED HEAD, as it is written (tungstenite 0.29 `generate_request`): the
 /// request line, then the protocol machine's handshake lines (`Host` from the dialled URL,
-/// `Connection`, `Upgrade`, `Sec-WebSocket-Version`, `Sec-WebSocket-Key`), then the opening fields
-/// (the auth's and the plane's, composed before `begin`) in the request map's own iteration
-/// order (`http::HeaderMap`, which does not keep the order the fields were added in), a repeated
-/// name's lines together and in their own order. Ruling 17's order (auth, plane, then the transport's defaults)
-/// is the HTTP egress head's, from 1.5.5's proxy engine; 1.5.5 dialled no WebSocket at all, so this
-/// head has no 1.5.5 order to keep, and the handshake lines lead because the machine writes them
-/// (`framer_tests::the_dialled_heads_order_is_pinned` pins it). An opening field of a handshake
-/// name is the machine's to write, so it is not copied. The handshake's key is fresh per dial and
-/// the auth never sees it, so a signing style cannot sign this head: the door's tail states no
-/// `FACT_SIGNS_NOTHING_AFTER_AUTH` (`door::TAIL.facts`), and the framer never claims that what an
-/// auth signed is what is sent.
+/// `Connection`, `Upgrade`, `Sec-WebSocket-Version`, `Sec-WebSocket-Key`), then the plane's
+/// opening fields in the request map's own iteration order (`http::HeaderMap`, which does not keep
+/// the order the fields were added in), a repeated name's lines together and in their own order;
+/// then, LAST, what the binding's auth answered ([`signed_request`], ruling 23: the auth is called
+/// over exactly the bytes above, the fresh key among them, and nothing is added after it). 1.5.5
+/// dialled no WebSocket at all, so this head has no 1.5.5 order to keep, and the handshake lines
+/// lead because the machine writes them (`framer_tests::the_dialled_heads_order_is_pinned` pins
+/// it; `framer_tests::an_auth_that_signs_the_whole_head_sees_every_byte_on_the_wire` pins the
+/// auth's place). An opening field of a handshake name is the machine's to write, so it is not
+/// copied, and an auth that answers one refuses the dial.
 const HANDSHAKE_FIELDS: &[&str] = &[
     "host",
     "connection",
