@@ -47,11 +47,11 @@ use busbar_contract::abi::transport::{
     IngestIn, IoOut, ListenIn, ListenOut, LocateIn, LocateOut, Ops, ReadIn, RefuseIn, SettingDecl,
     ShutIn, TransportTail, WriteIn, CANCEL_NOTHING_MOVED, CLOSE_CAPACITY_EXHAUSTED, CLOSE_DRAIN,
     CLOSE_PEER_CLOSED, CLOSE_POISONED, CLOSE_REVOKED, CLOSE_TIMEOUT, CLOSE_TRANSPORT_FAILED,
-    EMIT_TEXT, FAULT_NONE, FRAME_PIECE_SIZE, FRAMING_STREAM, PIECE_CONTINUED, PIECE_END,
-    PIECE_END_OF_FRAME, PIECE_FIELDS, PIECE_HAS_CODE, PIECE_HAS_RETRY_AFTER, PIECE_STREAM_FAILED,
-    PIECE_TEXT, ROLE_FRAMER, SETTING_COUNT, SIDE_ACCEPT, SIDE_DIAL, STATUS_CALLER_FAULT,
-    STATUS_FAR_END_FAULT, STATUS_NONE, STATUS_OTHER, STATUS_SUCCESS, UNIT0_UPGRADE, YIELD_ENDED,
-    YIELD_HAS_DEADLINE, YIELD_MORE,
+    EMIT_TEXT, FACT_ACCEPTS, FACT_ADOPTS, FACT_DIALS, FAULT_NONE, FRAME_PIECE_SIZE, FRAMING_STREAM,
+    PIECE_CONTINUED, PIECE_END, PIECE_END_OF_FRAME, PIECE_FIELDS, PIECE_HAS_CODE,
+    PIECE_HAS_RETRY_AFTER, PIECE_STREAM_FAILED, PIECE_TEXT, ROLE_FRAMER, SETTING_COUNT,
+    SIDE_ACCEPT, SIDE_DIAL, STATUS_CALLER_FAULT, STATUS_FAR_END_FAULT, STATUS_NONE, STATUS_OTHER,
+    STATUS_SUCCESS, UNIT0_UPGRADE, YIELD_ENDED, YIELD_HAS_DEADLINE, YIELD_MORE,
 };
 use busbar_contract::ids::StreamId;
 use busbar_contract::transport::registry::DEFAULT_REQUEST_BODY_MAX_BYTES;
@@ -186,9 +186,10 @@ const TAIL: TransportTail = TransportTail {
     },
     role: ROLE_FRAMER,
     framing: FRAMING_STREAM,
-    // No fact: a dialled head is signed by the binding's auth over exactly the bytes sent, with
-    // nothing added after it (ruling 23, `dial_with_auth`), as every framer's is.
-    facts: 0,
+    // Its ops (coordinator ruling L1): `begin` on either side, and `adopt`: the opening handshake
+    // is an HTTP/1.1 Upgrade (RFC 6455 section 4), so it takes the stream the HTTP framer gave up.
+    // RFC 6455 defines no upgrade out of an established connection, so detach is absent (REFUSED).
+    facts: FACT_ACCEPTS | FACT_DIALS | FACT_ADOPTS,
     handshake_max_steps: 0,
     frame_piece_size: FRAME_PIECE_SIZE,
     _reserved: 0,
@@ -221,7 +222,10 @@ const _: () = {
         busbar_contract::transport::wire::Framing::Stream
     ));
     assert!(TAIL.framing == FRAMING_STREAM);
-    assert!(!<WsFramer as TransportMeta>::DECODES_PAYLOAD && TAIL.facts == 0);
+    assert!(
+        !<WsFramer as TransportMeta>::DECODES_PAYLOAD
+            && TAIL.facts & busbar_contract::abi::transport::FACT_DECODES_PAYLOAD == 0
+    );
     assert!(<WsFramer as TransportMeta>::COMPOSES_OVER.is_empty() && TAIL.composes_over_len == 0);
     assert!(<WsFramer as TransportMeta>::UPGRADES_TO.is_empty() && TAIL.upgrades_to_len == 0);
     assert!(
