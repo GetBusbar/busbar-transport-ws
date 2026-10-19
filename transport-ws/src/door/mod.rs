@@ -933,7 +933,7 @@ fn fill(owed: &mut Owed, sink: &FramerSink, o: &mut FramerOut) {
         // refuses it by name) rather than never moving.
         let take = if piece.fields {
             match field_cut(&piece.bytes, room, piece.continued) {
-                0 if frame_len == 0 => piece.bytes.len().min(room),
+                0 if frame_len + reason_len == 0 => piece.bytes.len().min(room),
                 cut => cut,
             }
         } else {

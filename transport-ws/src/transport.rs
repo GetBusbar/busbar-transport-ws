@@ -385,8 +385,7 @@ fn is_chunked(headers: &HeaderMap) -> bool {
         .filter_map(|v| v.to_str().ok())
         .flat_map(|v| v.split(','))
         .map(str::trim)
-        .filter(|c| !c.is_empty())
-        .next_back()
+        .rfind(|c| !c.is_empty())
         .is_some_and(|c| c.eq_ignore_ascii_case("chunked"))
 }
 
