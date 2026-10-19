@@ -357,39 +357,14 @@ pub(crate) fn retry_after(headers: &HeaderMap, now_secs: u64) -> Option<u64> {
     imf_fixdate_secs(raw).map(|at| at.saturating_sub(now_secs))
 }
 
-/// An IMF-fixdate (`Sun, 06 Nov 1994 08:49:37 GMT`, RFC 9110 §5.6.7) as Unix seconds.
+/// An HTTP-date (RFC 9110 §5.6.7: the IMF-fixdate, and the two obsolete forms a recipient must
+/// accept) as Unix seconds, read by the protocol library (`httpdate`).
 fn imf_fixdate_secs(s: &str) -> Option<u64> {
-    let b = s.as_bytes();
-    if s.len() != 29 || !s.ends_with(" GMT") || b.get(3) != Some(&b',') || b.get(4) != Some(&b' ') {
-        return None;
-    }
-    let num = |r: std::ops::Range<usize>| s.get(r)?.parse::<u64>().ok();
-    let month = match s.get(8..11)? {
-        "Jan" => 1,
-        "Feb" => 2,
-        "Mar" => 3,
-        "Apr" => 4,
-        "May" => 5,
-        "Jun" => 6,
-        "Jul" => 7,
-        "Aug" => 8,
-        "Sep" => 9,
-        "Oct" => 10,
-        "Nov" => 11,
-        "Dec" => 12,
-        _ => return None,
-    };
-    let (day, year) = (num(5..7)?, num(12..16)?);
-    let (hour, minute, second) = (num(17..19)?, num(20..22)?, num(23..25)?);
-    // Days from the civil date (Howard Hinnant's public-domain algorithm), in UTC.
-    let y = i64::try_from(year).ok()? - i64::from(month <= 2);
-    let era = if y >= 0 { y } else { y - 399 } / 400;
-    let yoe = y - era * 400;
-    let mp = (month + 9) % 12;
-    let doy = (153 * mp + 2) / 5 + i64::try_from(day).ok()? - 1;
-    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    let days = u64::try_from(era * 146_097 + doe - 719_468).ok()?;
-    Some(days * 86_400 + hour * 3_600 + minute * 60 + second)
+    httpdate::parse_http_date(s)
+        .ok()?
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .map(|d| d.as_secs())
 }
 
 /// Whether an answer's body is `chunked` (RFC 9112 §6.1, §6.3: the LAST transfer coding the answer
@@ -421,8 +396,10 @@ enum Chunked {
     DataEnd,
     /// The trailer section, after the last chunk: it ends at an empty line.
     Trailer,
-    /// The body ended (or its coding was malformed): nothing more is read.
+    /// The body ended at its last chunk and trailers: nothing more is read.
     Done,
+    /// The coding was malformed: the body is not whole, and nothing more is read.
+    Malformed,
 }
 
 /// A refused upgrade's CHUNKED BODY, decoded as it arrives: the data handed up without its chunk
@@ -435,15 +412,16 @@ pub(crate) struct Dechunk {
 }
 
 impl Dechunk {
-    /// Decode what `inbound` holds into `body`; `true` once the body has ended (its last chunk and
-    /// trailers read, or a malformed coding, past which nothing is read).
-    fn feed(&mut self, inbound: &mut VecDeque<u8>, body: &mut Vec<u8>) -> bool {
+    /// Decode what `inbound` holds into `body`; `Some(whole)` once nothing more is read: `true` at
+    /// its last chunk and trailers, `false` at a malformed coding.
+    fn feed(&mut self, inbound: &mut VecDeque<u8>, body: &mut Vec<u8>) -> Option<bool> {
         loop {
             match self.state {
-                Chunked::Done => return true,
+                Chunked::Done => return Some(true),
+                Chunked::Malformed => return Some(false),
                 Chunked::Data(n) => {
                     if inbound.is_empty() {
-                        return false;
+                        return None;
                     }
                     let take = usize::try_from(n).map_or(inbound.len(), |n| n.min(inbound.len()));
                     body.extend(inbound.drain(..take));
@@ -458,12 +436,12 @@ impl Dechunk {
                 Chunked::Size | Chunked::DataEnd | Chunked::Trailer => {}
             }
             let Some(b) = inbound.pop_front() else {
-                return false;
+                return None;
             };
             if b != b'\n' {
                 if self.line.len() >= CHUNK_LINE_MAX {
-                    self.state = Chunked::Done;
-                    return true;
+                    self.state = Chunked::Malformed;
+                    return Some(false);
                 }
                 self.line.push(b);
                 continue;
@@ -481,13 +459,13 @@ impl Dechunk {
                     {
                         Some(0) => Chunked::Trailer,
                         Some(n) => Chunked::Data(n),
-                        None => Chunked::Done,
+                        None => Chunked::Malformed,
                     }
                 }
                 Chunked::DataEnd if line.is_empty() => Chunked::Size,
                 Chunked::Trailer if line.is_empty() => Chunked::Done,
                 Chunked::Trailer => Chunked::Trailer,
-                _ => Chunked::Done,
+                _ => Chunked::Malformed,
             };
         }
     }
@@ -535,10 +513,10 @@ fn answered_body(
     }
     if let Some(mut decoder) = chunked {
         let mut bytes = Vec::new();
-        let done = decoder.feed(&mut pipe.inbound, &mut bytes);
-        let ended = done || (pipe.ended && pipe.inbound.is_empty());
-        // The carrier ended before the last chunk: a short body.
-        let short = ended && !done;
+        let fed = decoder.feed(&mut pipe.inbound, &mut bytes);
+        let ended = fed.is_some() || (pipe.ended && pipe.inbound.is_empty());
+        // The carrier ended before the last chunk, or the coding was malformed: not a whole body.
+        let short = ended && fed != Some(true);
         if !bytes.is_empty() || ended {
             out.frame(Framed::plain(StreamId(0), &bytes, ended));
         }
@@ -802,6 +780,15 @@ impl WsFramer {
             .unwrap_or_else(PoisonError::into_inner)
             .remove(&parking.ticket)
             .map(|(_, phase)| phase)
+    }
+
+    /// The host cancelled `ticket`'s op: drop the dial parked under it, if there is one. Nothing of
+    /// it went out, so nothing moved.
+    pub(crate) fn release(&self, ticket: (u32, u32)) {
+        self.parked
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&ticket);
     }
 
     /// How many dials are parked (a test reads that a resumed or expired dial is gone).
