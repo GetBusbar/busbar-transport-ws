@@ -596,6 +596,35 @@ fn a_refused_upgrades_short_body_ends_failed() {
     assert!(heard.ended && !framer.failed(state));
 }
 
+/// A MALFORMED CHUNKED CODING ENDS FAILED (Q128 transport-ws MEDIUM, reader r162 on 0769fe6): a
+/// refused upgrade's chunked body whose chunk-size is not hex, or whose chunk data is not followed
+/// by its line end, is not a whole body: the frames end, failed. RED before the fix: the decoder
+/// stopped there and the body read as whole and cleanly ended.
+#[test]
+fn a_malformed_chunked_body_ends_failed() {
+    for body in [
+        &b"zz\r\nhello\r\n0\r\n\r\n"[..],
+        &b"5\r\nhelloXX\r\n0\r\n\r\n"[..],
+    ] {
+        let framer = WsFramer::new(0);
+        let mut out = Out::default();
+        let state = framer
+            .open_with(Side::Dial, "ws://127.0.0.1:9/x", &[], &mut out)
+            .expect("the dial opens");
+        let mut wire = b"HTTP/1.1 401 Unauthorized\r\nTransfer-Encoding: chunked\r\n\r\n".to_vec();
+        wire.extend_from_slice(body);
+        let mut heard = Out::default();
+        framer
+            .ingest(state, &wire, false, &mut heard)
+            .expect("the far end answered");
+        assert!(heard.ended, "{body:?}: the frames end");
+        assert!(
+            framer.failed(state),
+            "{body:?}: a malformed coding ends failed"
+        );
+    }
+}
+
 /// A REFUSED UPGRADE'S `Retry-After` IS READ IN BOTH OF RFC 9110's FORMS (Q128 transport-ws LOW,
 /// reader r72 on f876543), as the http framer reads it: delay-seconds, and an IMF-fixdate as the
 /// seconds left until it (`0` once past). RED before the fix: the HTTP-date form was dropped.

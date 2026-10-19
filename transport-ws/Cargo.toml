@@ -32,5 +32,7 @@ busbar-contract = { workspace = true }
 tungstenite = { workspace = true, features = ["handshake"] }
 # The dialled upgrade request may carry an auth's credential lines: wiped once sent.
 zeroize = { workspace = true }
+# The HTTP-date a refused upgrade's Retry-After states, read by the protocol library.
+httpdate = { workspace = true }
 # The door's settings blob is JSON (`door::read_settings`).
 serde_json = { workspace = true }
