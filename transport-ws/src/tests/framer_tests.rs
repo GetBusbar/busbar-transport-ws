@@ -11,8 +11,9 @@ use busbar_contract::transport::wire::WireStatusClass;
 use busbar_contract::transport::{Framed, Framer, FramerOut, HostTime, Side};
 use tungstenite::handshake::derive_accept_key;
 
-use crate::transport::reason_phrase;
+use crate::transport::{reason_phrase, retry_after};
 use crate::WsFramer;
+use tungstenite::http::{HeaderMap, HeaderValue};
 
 /// What one framer call produced.
 #[derive(Default)]
@@ -580,6 +581,52 @@ fn a_refused_upgrades_short_body_ends_failed() {
         )
         .expect("the far end answered");
     assert!(heard.ended && !framer.failed(state));
+}
+
+/// A REFUSED UPGRADE'S `Retry-After` IS READ IN BOTH OF RFC 9110's FORMS (Q128 transport-ws LOW,
+/// reader r72 on f876543), as the http framer reads it: delay-seconds, and an IMF-fixdate as the
+/// seconds left until it (`0` once past). RED before the fix: the HTTP-date form was dropped.
+#[test]
+fn a_retry_after_is_read_in_both_forms() {
+    let mut h = HeaderMap::new();
+    h.insert("retry-after", HeaderValue::from_static("7"));
+    assert_eq!(retry_after(&h, 0), Some(7));
+    // 1445412480 = Wed, 21 Oct 2015 07:28:00 GMT.
+    h.insert(
+        "retry-after",
+        HeaderValue::from_static("Wed, 21 Oct 2015 07:28:00 GMT"),
+    );
+    assert_eq!(retry_after(&h, 1_445_412_470), Some(10));
+    assert_eq!(retry_after(&h, 1_445_412_490), Some(0), "past: no wait");
+    h.insert("retry-after", HeaderValue::from_static("soon"));
+    assert_eq!(retry_after(&h, 0), None);
+}
+
+/// A REFUSED UPGRADE WITH A STATUS THAT CARRIES NO BODY ENDS AT ITS HEAD (Q128 transport-ws LOW,
+/// reader r72 on f876543; RFC 9112 §6.3: 1xx, 204 and 304 carry none), on a kept-alive carrier.
+/// RED before the fix: the frames waited for the carrier to close.
+#[test]
+fn a_bodiless_refusal_ends_at_its_head() {
+    for answer in [
+        &b"HTTP/1.1 304 Not Modified\r\n\r\n"[..],
+        &b"HTTP/1.1 204 No Content\r\nContent-Length: 9\r\n\r\n"[..],
+    ] {
+        let framer = WsFramer::new(0);
+        let mut out = Out::default();
+        let state = framer
+            .open_with(Side::Dial, "ws://127.0.0.1:9/x", &[], &mut out)
+            .expect("the dial opens");
+        let mut heard = Out::default();
+        framer
+            .ingest(state, answer, false, &mut heard)
+            .expect("the far end answered");
+        assert!(
+            heard.ended,
+            "{}: ended at its head",
+            String::from_utf8_lossy(answer)
+        );
+        assert!(!framer.failed(state));
+    }
 }
 
 /// A dialled head's reason phrase is the status line's text after its code, once the line is whole.
