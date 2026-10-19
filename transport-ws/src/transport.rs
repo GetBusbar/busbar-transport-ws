@@ -142,10 +142,14 @@ enum Phase {
     /// At `Some(0)` its frames have ended and nothing more is read. `chunked`: the body's transfer
     /// coding is `chunked` (RFC 9112 §7.1), decoded here and ended at its last chunk; `left` is then
     /// `None` until it ends.
+    ///
+    /// `short`: the carrier ended before the body did (short of its declared `Content-Length`, or
+    /// of its last chunk): the frames end FAILED, not whole ([`WsFramer::failed`]).
     Answered {
         pipe: Pipe,
         left: Option<u64>,
         chunked: Option<Box<Dechunk>>,
+        short: bool,
     },
 }
 
@@ -251,14 +255,18 @@ fn read_error(e: &WsError) -> TransportError {
 /// The upgrade request's own fields, which the handshake writes itself: an opening field of one of
 /// these names is not copied onto it.
 ///
-/// THE ORDER OF THE DIALLED HEAD (Q128 ruling 17: auth fields, then the plane's own, then the
-/// transport's defaults; 1.5.5 parity): the opening fields (the auth's and the plane's, composed
-/// before `begin`) ride first, and the protocol machine then writes its handshake lines (`host`
-/// from the dialled URL, `connection`, `upgrade`, `sec-websocket-version` and a fresh
-/// `sec-websocket-key`) after the auth has run. An opening field of a handshake name is the
-/// machine's to write, so it is not copied. A signing style therefore cannot sign this head: the
-/// door's tail states no `FACT_SIGNS_NOTHING_AFTER_AUTH` (`door::TAIL.facts`), so the framer never
-/// claims that what an auth signed is what is sent.
+/// THE ORDER OF THE DIALLED HEAD, as it is written (tungstenite 0.29 `generate_request`): the
+/// request line, then the protocol machine's handshake lines (`Host` from the dialled URL,
+/// `Connection`, `Upgrade`, `Sec-WebSocket-Version`, `Sec-WebSocket-Key`), then the opening fields
+/// (the auth's and the plane's, composed before `begin`) in first-appearance order of their names,
+/// a repeated name's lines together. Ruling 17's order (auth, plane, then the transport's defaults)
+/// is the HTTP egress head's, from 1.5.5's proxy engine; 1.5.5 dialled no WebSocket at all, so this
+/// head has no 1.5.5 order to keep, and the handshake lines lead because the machine writes them
+/// (`framer_tests::the_dialled_heads_order_is_pinned` pins it). An opening field of a handshake
+/// name is the machine's to write, so it is not copied. The handshake's key is fresh per dial and
+/// the auth never sees it, so a signing style cannot sign this head: the door's tail states no
+/// `FACT_SIGNS_NOTHING_AFTER_AUTH` (`door::TAIL.facts`), and the framer never claims that what an
+/// auth signed is what is sent.
 const HANDSHAKE_FIELDS: &[&str] = &[
     "host",
     "connection",
@@ -274,8 +282,9 @@ fn rides_upgrade(name: &str) -> bool {
 }
 
 /// THE ANSWER'S HEAD as a field block (`busbar_contract::abi::transport::fields`): the switching
-/// response's fields in the far end's order, names lower-case, a repeated name's values each on its
-/// own line. Hop-by-hop fields (and every field a `connection` field names) never enter it, nor do
+/// response's fields as the parsed head holds them (`HeaderMap`: names in the order they first
+/// appear, a repeated name's values together under its first appearance, in their own order), names
+/// lower-case, each value on its own line. Hop-by-hop fields (and every field a `connection` field names) never enter it, nor do
 /// the handshake's own fields ([`rides_upgrade`]'s refusals: `content-length` among them, and every
 /// `sec-websocket-*` field, which answer this hop's handshake and nothing above it). No field left
 /// is the EMPTY block, still handed up: an empty head is a head.
@@ -466,6 +475,7 @@ fn answered_body(
             pipe,
             left,
             chunked: None,
+            short: false,
         };
         return (phase, first);
     }
@@ -473,6 +483,8 @@ fn answered_body(
         let mut bytes = Vec::new();
         let done = decoder.feed(&mut pipe.inbound, &mut bytes);
         let ended = done || (pipe.ended && pipe.inbound.is_empty());
+        // The carrier ended before the last chunk: a short body.
+        let short = ended && !done;
         if !bytes.is_empty() || ended {
             out.frame(Framed::plain(StreamId(0), &bytes, ended));
         }
@@ -483,6 +495,7 @@ fn answered_body(
             pipe,
             left: ended.then_some(0),
             chunked: (!ended).then_some(decoder),
+            short,
         };
         return (phase, ended);
     }
@@ -499,11 +512,14 @@ fn answered_body(
     if ended {
         pipe.inbound.clear();
     }
+    // The carrier ended with declared bytes still owed: a short body.
+    let short = ended && left.is_some_and(|l| l > 0);
     let left = if ended { Some(0) } else { left };
     let phase = Phase::Answered {
         pipe,
         left,
         chunked: None,
+        short,
     };
     (phase, ended)
 }
@@ -694,6 +710,9 @@ impl WsFramer {
             let over = self.max_message_bytes > 0
                 && message.len().saturating_add(bytes.len()) > self.max_message_bytes;
             if over || (end_of_frame && held.len() >= MAX_HELD_MESSAGES) {
+                // The refused message's gathered pieces go with it, as the open path drops them:
+                // none is sent glued to the front of the next message.
+                message.clear();
                 return Err(TransportError::Framing);
             }
             message.extend_from_slice(bytes);
@@ -758,6 +777,22 @@ impl WsFramer {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .remove(&state)
+    }
+
+    /// Drop framing `state` and anything kept for it, writing nothing: the door's finish of a
+    /// framing whose op panicked, which never reached the framer to close it.
+    pub(crate) fn forget(&self, state: u64) {
+        self.map().remove(&state);
+        self.reasons
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&state);
+    }
+
+    /// Whether framing `state` is still held (a test reads that a finished framing is gone).
+    #[cfg(test)]
+    pub(crate) fn holds(&self, state: u64) -> bool {
+        self.map().contains_key(&state)
     }
 
     /// Framing `state`'s own lock, found under the map's.
@@ -845,6 +880,7 @@ impl WsFramer {
                 pipe,
                 left,
                 chunked,
+                ..
             } => {
                 let (phase, ended) = answered_body(pipe, left, chunked, false, out);
                 return Ok((phase, ended, None));
@@ -1069,7 +1105,8 @@ fn request_url(url: &str) -> Result<String, TransportError> {
 
 impl WsFramer {
     /// Whether the far side FAILED the connection in `state` (a protocol violation, text that is
-    /// not UTF-8, a message over the ceiling): its frames ended failed, not cleanly.
+    /// not UTF-8, a message over the ceiling), or a refused upgrade's body was cut short by the
+    /// carrier's end: its frames ended failed, not cleanly.
     pub(crate) fn failed(&self, state: u64) -> bool {
         let Ok(conn) = self.conn(state) else {
             return false;
@@ -1079,10 +1116,12 @@ impl WsFramer {
         };
         matches!(
             held.as_ref(),
-            Some(Phase::Open {
-                failed: Some(_),
-                ..
-            })
+            Some(
+                Phase::Open {
+                    failed: Some(_),
+                    ..
+                } | Phase::Answered { short: true, .. }
+            )
         )
     }
 }
