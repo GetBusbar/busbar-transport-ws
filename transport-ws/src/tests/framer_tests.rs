@@ -460,6 +460,128 @@ fn an_open_connection_refuses_an_outbound_message_over_the_ceiling() {
     assert!(!ok.sent.is_empty(), "the message went out");
 }
 
+/// A REFUSED PIECE TAKES ITS MESSAGE'S GATHERED PIECES WITH IT ON A DIAL STILL HANDSHAKING (Q128
+/// transport-ws LOW, reader r52 on 3286006), as the open path drops them: the next message is held
+/// alone, not glued to the refused one's front. RED before the fix: the refused message's first
+/// pieces stayed gathered, so a next message within the ceiling read as over it.
+#[test]
+fn a_refused_piece_on_a_dial_drops_its_gathered_pieces() {
+    let framer = WsFramer::new(8);
+    let mut out = Out::default();
+    let state = framer
+        .open_with(Side::Dial, "ws://127.0.0.1:9/x", &[], &mut out)
+        .expect("the dial opens");
+    let mut w = Out::default();
+    framer
+        .emit_text(state, b"12345", false, false, &mut w)
+        .expect("a piece within the ceiling");
+    assert!(
+        framer
+            .emit_text(state, b"6789", true, false, &mut w)
+            .is_err(),
+        "the gathered message is over the ceiling"
+    );
+    framer
+        .emit_text(state, b"1234", true, false, &mut w)
+        .expect("a next message within the ceiling is held alone");
+}
+
+/// THE DIALLED HEAD'S ORDER IS PINNED (Q128 transport-ws LOW, reader r51 on 3286006): the request
+/// line, the machine's handshake lines in their fixed order, then the opening fields in
+/// first-appearance order of their names, a repeated name's lines together; an opening field of a
+/// handshake name is not copied. The doc at `HANDSHAKE_FIELDS` states this order.
+#[test]
+fn the_dialled_heads_order_is_pinned() {
+    let framer = WsFramer::new(0);
+    let mut out = Out::default();
+    let fields = [
+        ("authorization".to_string(), b"Bearer k".to_vec()),
+        ("x-plane".to_string(), b"1".to_vec()),
+        ("host".to_string(), b"elsewhere.test".to_vec()),
+        ("authorization".to_string(), b"Second k".to_vec()),
+    ];
+    framer
+        .open_with(Side::Dial, "ws://svc.test:9/x", &fields, &mut out)
+        .expect("the dial opens");
+    let request = String::from_utf8(out.sent.clone()).expect("an upgrade request");
+    let names: Vec<&str> = request
+        .split("\r\n")
+        .skip(1)
+        .take_while(|l| !l.is_empty())
+        .map(|l| l.split(':').next().unwrap_or_default())
+        .collect();
+    assert!(request.starts_with("GET /x HTTP/1.1\r\n"), "{request}");
+    assert_eq!(
+        names,
+        [
+            "Host",
+            "Connection",
+            "Upgrade",
+            "Sec-WebSocket-Version",
+            "Sec-WebSocket-Key",
+            "authorization",
+            "authorization",
+            "x-plane",
+        ],
+        "{request}"
+    );
+    assert!(
+        request.contains("Host: svc.test:9\r\n"),
+        "the opening host is not copied"
+    );
+    assert!(
+        request.find("Bearer k") < request.find("Second k"),
+        "a repeated name's lines keep their order"
+    );
+}
+
+/// A REFUSED UPGRADE'S BODY CUT SHORT BY THE CARRIER ENDS FAILED (Q128 transport-ws LOW, reader r51
+/// on 3286006): a carrier that ends before the declared `Content-Length` (or before the last chunk)
+/// ends the frames failed, not whole. RED before the fix: a short body read as a whole one.
+#[test]
+fn a_refused_upgrades_short_body_ends_failed() {
+    for (head, body) in [
+        (
+            "HTTP/1.1 401 Unauthorized\r\nContent-Length: 10\r\n\r\n",
+            &b"short"[..],
+        ),
+        (
+            "HTTP/1.1 401 Unauthorized\r\nTransfer-Encoding: chunked\r\n\r\n",
+            &b"a\r\nshort"[..],
+        ),
+    ] {
+        let framer = WsFramer::new(0);
+        let mut out = Out::default();
+        let state = framer
+            .open_with(Side::Dial, "ws://127.0.0.1:9/x", &[], &mut out)
+            .expect("the dial opens");
+        let mut wire = head.as_bytes().to_vec();
+        wire.extend_from_slice(body);
+        let mut heard = Out::default();
+        framer
+            .ingest(state, &wire, true, &mut heard)
+            .expect("the far end answered");
+        assert!(heard.ended, "{head}: the frames end");
+        assert!(framer.failed(state), "{head}: a short body ends failed");
+    }
+    // A body the carrier's end does not cut is whole.
+    let framer = WsFramer::new(0);
+    let mut out = Out::default();
+    let state = framer
+        .open_with(Side::Dial, "ws://127.0.0.1:9/x", &[], &mut out)
+        .expect("the dial opens");
+    let mut heard = Out::default();
+    framer
+        .ingest(
+            state,
+            b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 2\r\n\r\nok",
+            true,
+            &mut heard,
+        )
+        .expect("the far end answered");
+    assert!(heard.ended && !framer.failed(state));
+}
+
 /// A dialled head's reason phrase is the status line's text after its code, once the line is whole.
 #[test]
 fn a_reason_phrase_is_read_off_a_whole_status_line() {
