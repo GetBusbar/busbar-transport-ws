@@ -168,6 +168,8 @@ const TAIL: TransportTail = TransportTail {
     },
     role: ROLE_FRAMER,
     framing: FRAMING_STREAM,
+    // NO `FACT_SIGNS_NOTHING_AFTER_AUTH`: the handshake writes its own lines after the auth has
+    // run (`transport::HANDSHAKE_FIELDS`), so the framer does not claim a signed head survives.
     facts: 0,
     handshake_max_steps: 0,
     frame_piece_size: FRAME_PIECE_SIZE,
