@@ -488,9 +488,9 @@ fn a_refused_piece_on_a_dial_drops_its_gathered_pieces() {
 }
 
 /// THE DIALLED HEAD'S ORDER IS PINNED (Q128 transport-ws LOW, reader r51 on 3286006): the request
-/// line, the machine's handshake lines in their fixed order, then the opening fields in
-/// first-appearance order of their names, a repeated name's lines together; an opening field of a
-/// handshake name is not copied. The doc at `HANDSHAKE_FIELDS` states this order.
+/// line, the machine's handshake lines in their fixed order, then the opening fields (in the
+/// request map's own order, a repeated name's lines together and in their order); an opening field
+/// of a handshake name is not copied. The doc at `HANDSHAKE_FIELDS` states this order.
 #[test]
 fn the_dialled_heads_order_is_pinned() {
     let framer = WsFramer::new(0);
@@ -513,17 +513,27 @@ fn the_dialled_heads_order_is_pinned() {
         .collect();
     assert!(request.starts_with("GET /x HTTP/1.1\r\n"), "{request}");
     assert_eq!(
-        names,
+        names[..5],
         [
             "Host",
             "Connection",
             "Upgrade",
             "Sec-WebSocket-Version",
             "Sec-WebSocket-Key",
-            "authorization",
-            "authorization",
-            "x-plane",
         ],
+        "the handshake's lines lead: {request}"
+    );
+    // Then the opening fields, each line once, a repeated name's lines together.
+    let mut rest = names[5..].to_vec();
+    let auth_at = rest
+        .iter()
+        .position(|n| *n == "authorization")
+        .expect("authorization");
+    assert_eq!(rest.get(auth_at + 1), Some(&"authorization"), "{request}");
+    rest.sort_unstable();
+    assert_eq!(
+        rest,
+        ["authorization", "authorization", "x-plane"],
         "{request}"
     );
     assert!(

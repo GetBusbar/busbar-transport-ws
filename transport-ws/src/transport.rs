@@ -258,8 +258,9 @@ fn read_error(e: &WsError) -> TransportError {
 /// THE ORDER OF THE DIALLED HEAD, as it is written (tungstenite 0.29 `generate_request`): the
 /// request line, then the protocol machine's handshake lines (`Host` from the dialled URL,
 /// `Connection`, `Upgrade`, `Sec-WebSocket-Version`, `Sec-WebSocket-Key`), then the opening fields
-/// (the auth's and the plane's, composed before `begin`) in first-appearance order of their names,
-/// a repeated name's lines together. Ruling 17's order (auth, plane, then the transport's defaults)
+/// (the auth's and the plane's, composed before `begin`) in the request map's own iteration
+/// order (`http::HeaderMap`, which does not keep the order the fields were added in), a repeated
+/// name's lines together and in their own order. Ruling 17's order (auth, plane, then the transport's defaults)
 /// is the HTTP egress head's, from 1.5.5's proxy engine; 1.5.5 dialled no WebSocket at all, so this
 /// head has no 1.5.5 order to keep, and the handshake lines lead because the machine writes them
 /// (`framer_tests::the_dialled_heads_order_is_pinned` pins it). An opening field of a handshake
