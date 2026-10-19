@@ -176,6 +176,8 @@ impl Host {
         let mut i: BeginIn = z();
         i.head = in_head();
         i.side = side;
+        // The host declares every stream's scheme; a zero is refused at `begin`.
+        i.scheme = busbar_contract::abi::host::service::SCHEME_PLAIN;
         i.target = AbiStr {
             ptr: target.as_ptr(),
             len: target.len(),
