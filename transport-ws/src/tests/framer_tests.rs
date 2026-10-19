@@ -21,6 +21,8 @@ struct Out {
     frames: Vec<Vec<u8>>,
     /// Per frame in `frames`: the status it stated, and its class.
     statuses: Vec<Option<(u32, Option<WireStatusClass>)>>,
+    /// The frames ended (`end`).
+    ended: bool,
 }
 
 impl FramerOut for Out {
@@ -32,7 +34,9 @@ impl FramerOut for Out {
         self.statuses
             .push(piece.status_code.map(|code| (code, piece.status)));
     }
-    fn end(&mut self) {}
+    fn end(&mut self) {
+        self.ended = true;
+    }
     fn now(&self) -> HostTime {
         HostTime::default()
     }
@@ -332,6 +336,48 @@ fn a_refused_upgrade_hands_up_its_body_and_its_reason() {
     let mut got: Vec<u8> = heard.frames[1..].concat();
     got.extend(rest.frames.concat());
     assert_eq!(got, body.to_vec(), "the whole error document, once");
+}
+
+/// A REFUSED UPGRADE'S WHOLE BODY, PAST THE MACHINE'S ONE READ (Q128 transport-ws MEDIUM): head and
+/// a body larger than the protocol machine's handshake read arrive in ONE chunk, and every byte of
+/// it is handed up, then the frames end; with no declared length, the body runs to the carrier's
+/// end, and that end is forwarded. RED before the fix: the bytes past the machine's read were
+/// dropped, and a carrier that had already ended never ended the frames.
+#[test]
+fn a_refused_upgrade_hands_up_a_large_body_and_the_carrier_end() {
+    let body = vec![b'x'; 9000];
+    // Declared length, head and body in one chunk.
+    let framer = WsFramer::new(0);
+    let mut out = Out::default();
+    let state = framer
+        .open_with(Side::Dial, "ws://127.0.0.1:9/x", &[], &mut out)
+        .expect("the dial opens");
+    let mut chunk = format!(
+        "HTTP/1.1 503 Busy\r\nContent-Length: {}\r\n\r\n",
+        body.len()
+    )
+    .into_bytes();
+    chunk.extend_from_slice(&body);
+    let mut heard = Out::default();
+    framer
+        .ingest(state, &chunk, false, &mut heard)
+        .expect("the far end answered");
+    assert_eq!(heard.frames[1..].concat(), body, "the whole body, once");
+    assert!(heard.ended, "the declared length is met: the frames end");
+    // No declared length; the carrier ended with the chunk.
+    let framer = WsFramer::new(0);
+    let mut out = Out::default();
+    let state = framer
+        .open_with(Side::Dial, "ws://127.0.0.1:9/x", &[], &mut out)
+        .expect("the dial opens");
+    let mut chunk = b"HTTP/1.1 502 Bad Gateway\r\n\r\n".to_vec();
+    chunk.extend_from_slice(&body);
+    let mut heard = Out::default();
+    framer
+        .ingest(state, &chunk, true, &mut heard)
+        .expect("the far end answered");
+    assert_eq!(heard.frames[1..].concat(), body, "the whole body, once");
+    assert!(heard.ended, "the carrier ended: the frames end");
 }
 
 /// A dialled head's reason phrase is the status line's text after its code, once the line is whole.
