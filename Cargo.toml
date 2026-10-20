@@ -28,6 +28,12 @@ license = "Apache-2.0"
 publish = false
 repository = "https://github.com/GetBusbar/busbar-transport-ws"
 
+# The ONE fleet clippy allowance (coordinator ruling (a), 2026-10-19): every plugin-built ABI literal
+# spreads `..Type::ZERO` (the zero-spread guard, busbar #1207), which a literal naming every field
+# today trips as needless_update. Members take it with `[lints] workspace = true`.
+[workspace.lints.clippy]
+needless_update = "allow"
+
 [workspace.dependencies]
 busbar-contract = { git = "https://github.com/GetBusbar/busbar", rev = "9aff8cf7b784ea52ede316d40b2408527c0d79a7" }
 busbar-plugin-loader = { git = "https://github.com/GetBusbar/busbar", rev = "9aff8cf7b784ea52ede316d40b2408527c0d79a7" }
@@ -113,7 +119,7 @@ percent-encoding = "2"
 postgres = "0.19"
 postgres-protocol = "0.6.11"
 postgres-types = "0.2"
-prost-build = "0.14"
+prost-build = { version = "0.14", default-features = false }
 protoc-bin-vendored = "3"
 redis = { version = "1", default-features = false, features = ["script"] }
 rusqlite = { version = "0.40", features = ["bundled"] }
