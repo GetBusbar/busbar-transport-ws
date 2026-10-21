@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Busbar Inc and contributors
 
-//! **ONE `ws` DOOR, BOTH WAYS IN**: the linked door (`busbar_transport_ws::linked::door`) and this
+//! **ONE `ws` DOOR, BOTH WAYS IN**: the linked door (`busbar_transport_ws::door`) and this
 //! crate's built cdylib (the same door behind the one `export_door!`), each admitted through the
 //! loader's ONE door validation and driven through the ONE dispatcher's crossing, give the same
 //! Statement and the same answers. A dialling framing's bytes are random by design (the handshake
@@ -16,7 +16,7 @@ use std::mem::zeroed;
 use std::sync::Arc;
 
 use busbar_contract::abi::host::service::SCHEME_PLAIN;
-use busbar_contract::abi::mechanism::call::{AbiStr, Blob, Outcome, BLOB_ABSENT};
+use busbar_contract::abi::mechanism::call::{AbiStr, Blob, Outcome};
 use busbar_contract::abi::mechanism::lifecycle::{slot as life, OpenIn, OpenOut};
 use busbar_contract::abi::mechanism::KindCode;
 use busbar_contract::abi::transport::{
@@ -27,9 +27,8 @@ use busbar_plugin_loader::dispatch::kinds::hook::Hook;
 use busbar_plugin_loader::dispatch::kinds::transport::Transport;
 use busbar_plugin_loader::dispatch::{
     in_head, load_dropped, load_linked, out_head, Bind, ConnTable, DispatchConfig, Dispatcher,
-    Frame, LinkedRow, LoadError, NoSink, Plugin,
+    Frame, LinkedRow, LoadError, LoadedDoor, NoSink, Plugin,
 };
-use busbar_transport_ws_plugin::linked;
 
 fn z<T>() -> T {
     // SAFETY: every `in`/`out` here is plain C data; all-zero is a valid value of each.
@@ -53,9 +52,19 @@ fn cdylib() -> std::path::PathBuf {
         .unwrap_or_else(|| panic!("the busbar-transport-ws-plugin cdylib ({file}) is not built"))
 }
 
+/// This crate's one door, restated for the loader.
+fn loaded() -> LoadedDoor {
+    // SAFETY: `busbar_transport_ws::door` is the crate's one door function, answering its `'static`
+    // door.
+    #[allow(unused_unsafe)]
+    unsafe {
+        LoadedDoor::from_raw(busbar_transport_ws::door)
+    }
+}
+
 /// The row a compiled-in build holds for this door.
 fn row() -> LinkedRow {
-    LinkedRow::of(linked::door).expect("the door states itself")
+    LinkedRow::of_loaded(loaded()).expect("the door states itself")
 }
 
 fn bind(d: &Dispatcher) -> Bind {
@@ -71,12 +80,7 @@ fn bind(d: &Dispatcher) -> Bind {
 fn open(p: &Plugin<Transport>) {
     let mut i: OpenIn = z();
     i.head = in_head();
-    i.settings = Blob {
-        ptr: std::ptr::null(),
-        len: 0,
-        fmt: BLOB_ABSENT,
-        flags: 0,
-    };
+    i.settings = Blob::ABSENT;
     let mut o: OpenOut = z();
     o.head = out_head();
     let mut f = Frame::new(i, o);
@@ -177,10 +181,7 @@ impl Host {
         i.head = in_head();
         i.side = side;
         i.scheme = SCHEME_PLAIN;
-        i.target = AbiStr {
-            ptr: target.as_ptr(),
-            len: target.len(),
-        };
+        i.target = AbiStr::of(target);
         i.sink = self.sink();
         let mut o: FramerOut = z();
         o.head = out_head();
@@ -276,7 +277,7 @@ fn the_linked_and_the_dropped_in_door_are_one_framer() {
     let linked: Plugin<Transport> = load_linked(&row(), bind(&d)).expect("the linked door loads");
     let dropped: Plugin<Transport> =
         load_dropped(&cdylib(), &row().statement, bind(&d)).expect("the dropped-in door loads");
-    assert_eq!(linked.name(), linked::KEY);
+    assert_eq!(linked.name(), "ws");
     assert_eq!(dropped.name(), linked.name());
     open(&linked);
     open(&dropped);
@@ -314,7 +315,17 @@ fn the_door_asked_for_as_another_kind_is_refused_both_ways() {
 // THE PUBLISHED SUITE (busbar-plugin-loader's `conformance_suite!`): both legs through the one
 // loader, every step at its pinned crossing count, over `conformance.json`.
 busbar_plugin_loader::conformance_suite! {
-    door: busbar_transport_ws_plugin::linked::door,
+    loaded: loaded(),
     cdylib: "busbar_transport_ws_plugin",
     inputs: include_str!("conformance.json"),
+}
+
+#[test]
+fn the_statement_carries_the_declares_document() {
+    let row = row();
+    let read = busbar_contract::abi::mechanism::rendering::read(&row.statement).unwrap();
+    assert_eq!(
+        busbar_contract::abi::mechanism::extensions::declares(&read.extensions.bytes),
+        Some(&include_bytes!("../../transport-ws/declares.json")[..]),
+    );
 }

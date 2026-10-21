@@ -671,6 +671,43 @@ fn a_bodiless_refusal_ends_at_its_head() {
     }
 }
 
+/// A REFUSED UPGRADE WHOSE HEAD ENDS ITS LINES WITH A BARE LF (RFC 9112 section 2.2: a recipient
+/// may read a bare LF as a line end, and the protocol library's parser does): its body is every
+/// byte past the head's empty line, and its reason phrase is read off the status line all the
+/// same. RED before the fix: only a CRLF CRLF ended the head, so the body that came with it was
+/// dropped and the phrase was never read.
+#[test]
+fn a_refused_upgrade_with_bare_lf_line_ends_hands_up_its_body_and_reason() {
+    let framer = WsFramer::new(0);
+    let mut out = Out::default();
+    let state = framer
+        .open_with(Side::Dial, "ws://127.0.0.1:9/x", &[], &mut out)
+        .expect("the dial opens");
+    let mut heard = Out::default();
+    framer
+        .ingest(
+            state,
+            b"HTTP/1.1 401 Unauthorized\nContent-Length: 5\n\nhello",
+            false,
+            &mut heard,
+        )
+        .expect("the far end answered");
+    assert_eq!(
+        heard.statuses[0],
+        Some((401, Some(WireStatusClass::CallerFault)))
+    );
+    assert_eq!(
+        heard.frames[1..].concat(),
+        b"hello".to_vec(),
+        "the body, whole"
+    );
+    assert!(heard.ended, "the declared length is met: the frames end");
+    assert_eq!(
+        framer.take_reason(state).as_deref(),
+        Some(&b"Unauthorized"[..])
+    );
+}
+
 /// A dialled head's reason phrase is the status line's text after its code, once the line is whole.
 #[test]
 fn a_reason_phrase_is_read_off_a_whole_status_line() {

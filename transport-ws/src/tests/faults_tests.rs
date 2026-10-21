@@ -10,8 +10,6 @@
 //!   framing in steady state, one message in and one out per call, adds no allocation beyond the
 //!   door crossing itself and what the protocol library allocates for the message.
 
-use std::alloc::{GlobalAlloc, Layout, System};
-use std::cell::Cell;
 use std::collections::VecDeque;
 use std::ffi::c_void;
 use std::io::{Read, Write};
@@ -29,6 +27,7 @@ use busbar_contract::abi::transport::{
     BeginIn, Claim, EmitIn, FramePiece, FramerOut as DoorOut, FramerSink, IngestIn, TransportTail,
     SIDE_ACCEPT, UNIT0_UPGRADE, YIELD_MORE,
 };
+use busbar_contract::alloc_counter::allocations_of;
 use busbar_contract::transport::{ConnFacts, Framed, Framer, FramerOut, HostTime, Side};
 use busbar_contract::TransportMeta;
 use tungstenite::protocol::Role;
@@ -39,20 +38,23 @@ const UPGRADE: &[u8] = b"GET /echo HTTP/1.1\r\nHost: svc.test\r\nUpgrade: websoc
 // ── the claims ───────────────────────────────────────────────────────────────────────────────────
 
 fn text(s: &AbiStr) -> &'static [u8] {
-    if s.len == 0 {
+    if s.is_empty() {
         return &[];
     }
     // SAFETY: the Statement's strings are `'static` plugin data of their stated length.
-    unsafe { std::slice::from_raw_parts(s.ptr, s.len) }
+    #[allow(unused_unsafe)]
+    unsafe {
+        s.bytes()
+    }
 }
 
 fn claims() -> (Vec<String>, &'static [Claim]) {
     let st = crate::door::STATEMENT;
     // SAFETY: the Statement's claim list and kind tail are this crate's `'static` data.
-    let names: &[AbiStr] = unsafe { std::slice::from_raw_parts(st.claims, st.claims_len) };
-    let tail = unsafe { &*st.kind_tail.cast::<TransportTail>() };
+    let names: &[AbiStr] = unsafe { std::slice::from_raw_parts(st.claims_ptr(), st.claims_len()) };
+    let tail = unsafe { &*st.kind_tail().cast::<TransportTail>() };
     let rows: &[Claim] =
-        unsafe { std::slice::from_raw_parts(tail.claim_rows, tail.claim_rows_len) };
+        unsafe { std::slice::from_raw_parts(tail.claim_rows_ptr(), tail.claim_rows_len()) };
     let names = names
         .iter()
         .map(|n| String::from_utf8_lossy(text(n)).into_owned())
@@ -88,10 +90,10 @@ fn every_claim_row_states_the_declaration() {
             "no egress forms"
         );
         // SAFETY: `facts_len` `'static` strings at `facts`.
-        let stated: Vec<&[u8]> = if row.facts_len == 0 {
+        let stated: Vec<&[u8]> = if row.facts_len() == 0 {
             Vec::new()
         } else {
-            unsafe { std::slice::from_raw_parts(row.facts, row.facts_len) }
+            unsafe { std::slice::from_raw_parts(row.facts_ptr(), row.facts_len()) }
                 .iter()
                 .map(text)
                 .collect()
@@ -201,9 +203,10 @@ fn an_ipv6_literal_target_dials() {
 }
 
 /// RED (audit: every dial's Host field gains the default port): the upgrade request's `Host` is
-/// the target's authority as written, a port only where the target spelled one.
+/// the target's host as the URL reader normalises it, with a port only where the target spelled
+/// one.
 #[test]
-fn a_dial_sends_the_host_as_the_target_writes_it() {
+fn a_dial_sends_the_targets_host_and_only_a_spelled_port() {
     let request = opening("wss://api.example/v1/realtime?model=m");
     assert!(
         request.starts_with("GET /v1/realtime?model=m HTTP/1.1\r\n"),
@@ -214,11 +217,32 @@ fn a_dial_sends_the_host_as_the_target_writes_it() {
     assert!(request.contains("\r\nHost: svc.test:8080\r\n"), "{request}");
 }
 
-/// RED (audit: an abrupt disconnect is reported as a framing failure): a carrier that ends with
-/// no closing handshake (a dropped connection) ends the stream, after every message that arrived
-/// before it; it is no protocol violation.
+/// RED (audit: an upper-case scheme is refused): a URL's scheme is read without case (RFC 3986
+/// section 3.1), so `WS://` and `WSS://` locate and dial exactly as `ws://` and `wss://` do.
 #[test]
-fn a_carrier_end_without_a_close_ends_the_stream() {
+fn a_scheme_is_read_without_case() {
+    let f = WsFramer::new(0);
+    let at = f
+        .locate("WSS://svc.test/x")
+        .expect("an upper-case wss URL locates");
+    assert!(at.secure, "WSS is the secured scheme");
+    assert_eq!(at.authority, "svc.test:443");
+    let at = f
+        .locate("Ws://svc.test/x")
+        .expect("a mixed-case ws URL locates");
+    assert!(!at.secure);
+    assert_eq!(at.authority, "svc.test:80");
+    let request = opening("WS://svc.test:8080/x");
+    assert!(request.starts_with("GET /x HTTP/1.1\r\n"), "{request}");
+    assert!(request.contains("\r\nHost: svc.test:8080\r\n"), "{request}");
+}
+
+/// RED (audit: a connection lost without a closing handshake is reported as a stream that ended
+/// whole): a carrier that ends with no closing handshake (a dropped connection) ends the stream
+/// FAILED, after every message that arrived whole before it: the connection closed abnormally
+/// (RFC 6455 section 7.1.5, code 1006), not cleanly, and it is no protocol violation either.
+#[test]
+fn a_carrier_end_without_a_close_ends_the_stream_failed() {
     let f = WsFramer::new(0);
     let s = accepted(&f);
     let mut out = Out::default();
@@ -233,12 +257,104 @@ fn a_carrier_end_without_a_close_ends_the_stream() {
         "the message before it is handed up"
     );
     assert!(out.ended, "and the stream ends");
+    assert!(f.failed(s), "failed: no closing handshake ended it");
 
     let s = accepted(&f);
     let mut out = Out::default();
     let r = f.ingest(s, &[], true, &mut out);
     assert!(r.is_ok(), "an end with nothing before it: {r:?}");
     assert!(out.ended);
+    assert!(f.failed(s), "an end with nothing before it is abnormal too");
+
+    // Half a message, then the carrier ends: nothing of it is handed up as a message.
+    let s = accepted(&f);
+    let mut out = Out::default();
+    let half: &[u8] = &[0x02, 0x82, 0, 0, 0, 0, b'h', b'a'];
+    let r = f.ingest(s, half, true, &mut out);
+    assert!(r.is_ok(), "{r:?}");
+    assert!(
+        out.frames.is_empty(),
+        "a part of a message is never a message"
+    );
+    assert!(
+        out.ended && f.failed(s),
+        "the stream ends failed: the part is lost"
+    );
+}
+
+/// An upgrade request: its request line, `Host`, `Upgrade` and `Connection`, then `fields`.
+fn upgrade_with(fields: &str) -> Vec<u8> {
+    format!(
+        "GET /echo HTTP/1.1\r\nHost: svc.test\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\
+         {fields}\r\n"
+    )
+    .into_bytes()
+}
+
+/// RED (audit: an accepted upgrade request that breaks the handshake rules is answered with
+/// nothing): RFC 6455 section 4.2.1 has the server answer a request with no `Sec-WebSocket-Key`,
+/// or one that is not a base64-encoded 16-byte nonce, with an HTTP error (`400 Bad Request`), and
+/// section 4.4 has it answer a `Sec-WebSocket-Version` it does not speak with `426 Upgrade
+/// Required` and a `Sec-WebSocket-Version` field naming 13. The answer goes out on the wire, then
+/// the frames end failed; an adopted stream (the upgrade request handed over with the stream)
+/// answers the same.
+#[test]
+fn a_broken_upgrade_request_is_answered_with_its_http_error() {
+    let key = "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n";
+    let cases = [
+        ("no key", "Sec-WebSocket-Version: 13\r\n".to_owned(), 400),
+        (
+            "a key that is no nonce",
+            "Sec-WebSocket-Key: not-a-nonce\r\nSec-WebSocket-Version: 13\r\n".to_owned(),
+            400,
+        ),
+        (
+            "another version",
+            format!("{key}Sec-WebSocket-Version: 8\r\n"),
+            426,
+        ),
+        ("no version", key.to_owned(), 426),
+    ];
+    for (case, fields, status) in cases {
+        let request = upgrade_with(&fields);
+        let f = WsFramer::new(0);
+        let s = f
+            .open(Side::Accept, "", &ConnFacts::default(), &mut Out::default())
+            .expect("an accepted framing opens");
+        let mut out = Out::default();
+        let r = f.ingest(s, &request, false, &mut out);
+        assert!(
+            r.is_ok(),
+            "{case}: the request is answered, not dropped: {r:?}"
+        );
+        let wire = String::from_utf8_lossy(&out.wire).to_ascii_lowercase();
+        assert!(
+            wire.starts_with(&format!("http/1.1 {status} ")),
+            "{case}: {wire}"
+        );
+        assert!(wire.ends_with("\r\n\r\n"), "{case}: a whole head: {wire}");
+        if status == 426 {
+            assert!(
+                wire.contains("\r\nsec-websocket-version: 13\r\n"),
+                "{case}: the version this end speaks is named: {wire}"
+            );
+        }
+        assert!(out.frames.is_empty(), "{case}: no message");
+        assert!(out.ended && f.failed(s), "{case}: the frames end failed");
+
+        let mut out = Out::default();
+        let adopted = f.adopt(Side::Accept, &ConnFacts::default(), &request, &mut out);
+        assert!(
+            adopted.is_ok(),
+            "{case}: the adopted request is answered: {adopted:?}"
+        );
+        let wire = String::from_utf8_lossy(&out.wire).to_ascii_lowercase();
+        assert!(
+            wire.starts_with(&format!("http/1.1 {status} ")),
+            "{case}: adopted: {wire}"
+        );
+        assert!(out.ended, "{case}: adopted: the frames end");
+    }
 }
 
 /// RED (audit: one panic poisons every connection of the instance): a panic while one framing
@@ -282,43 +398,6 @@ fn a_panic_in_one_framing_leaves_the_others_working() {
 
 // ── the allocations ──────────────────────────────────────────────────────────────────────────────
 
-/// Counts every allocation (and reallocation) the CURRENT thread makes while its count is on, so
-/// the tests of this binary running side by side never count each other.
-struct Counting;
-
-thread_local! {
-    static COUNT: Cell<Option<usize>> = const { Cell::new(None) };
-}
-
-fn bump() {
-    let _ = COUNT.try_with(|c| {
-        if let Some(n) = c.get() {
-            c.set(Some(n + 1));
-        }
-    });
-}
-
-// SAFETY: every call is `System`'s, unchanged; the counter only bumps a per-thread cell.
-unsafe impl GlobalAlloc for Counting {
-    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        bump();
-        // SAFETY: the caller's layout, passed on.
-        unsafe { System.alloc(layout) }
-    }
-    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        // SAFETY: as allocated above.
-        unsafe { System.dealloc(ptr, layout) }
-    }
-    unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-        bump();
-        // SAFETY: as allocated above.
-        unsafe { System.realloc(ptr, layout, new_size) }
-    }
-}
-
-#[global_allocator]
-static COUNTING: Counting = Counting;
-
 fn z<T>() -> T {
     // SAFETY: plain C data; all-zero is valid.
     unsafe { zeroed() }
@@ -350,10 +429,7 @@ impl Host {
         let mut b: BeginIn = z();
         b.side = SIDE_ACCEPT;
         b.scheme = SCHEME_PLAIN;
-        b.target = AbiStr {
-            ptr: std::ptr::null(),
-            len: 0,
-        };
+        b.target = AbiStr::ABSENT;
         b.sink = host.sink();
         let mut bo: DoorOut = z();
         assert_eq!(Begin::call(host.inst, &b, &mut bo), Outcome::Ready);
@@ -426,11 +502,13 @@ fn per_call<T>(state: &mut T, op: &mut dyn FnMut(&mut T)) -> f64 {
     for _ in 0..64 {
         op(state);
     }
-    COUNT.with(|c| c.set(Some(0)));
-    for _ in 0..ROUNDS {
-        op(state);
-    }
-    let n = COUNT.with(|c| c.replace(None)).unwrap_or(0);
+    // busbar-contract's counting allocator counts per thread, so the other tests of this binary
+    // running side by side never move it.
+    let n = allocations_of(|| {
+        for _ in 0..ROUNDS {
+            op(state);
+        }
+    });
     n as f64 / ROUNDS as f64
 }
 
