@@ -192,8 +192,9 @@ fn a_refresh_applies_its_ceiling_or_refuses_its_settings() {
     let refresh = |settings: &[u8]| {
         // SAFETY: plain C data; all-zero is valid.
         let mut i: RefreshIn = unsafe { std::mem::zeroed() };
-        i.settings.ptr = settings.as_ptr();
-        i.settings.len = settings.len();
+        // SAFETY: `settings` outlives the call below; the format and flags stay zero, as the
+        // zeroed blob had them.
+        i.settings = unsafe { Blob::from_raw_parts(settings.as_ptr(), settings.len(), 0, 0) };
         // SAFETY: plain C data; all-zero is valid.
         let mut o: OutHead = unsafe { std::mem::zeroed() };
         Refresh::call(p, &i, &mut o)

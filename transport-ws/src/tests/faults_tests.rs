@@ -18,6 +18,7 @@ use std::panic::{catch_unwind, AssertUnwindSafe};
 
 use crate::door::{Begin, Emit, Ingest, Open};
 use crate::WsFramer;
+use busbar_contract::abi::host::service::SCHEME_PLAIN;
 use busbar_contract::abi::mechanism::call::{AbiStr, Outcome};
 use busbar_contract::abi::mechanism::lifecycle::{OpenIn, OpenOut};
 use busbar_contract::abi::sdk::door::Slot;
@@ -37,20 +38,23 @@ const UPGRADE: &[u8] = b"GET /echo HTTP/1.1\r\nHost: svc.test\r\nUpgrade: websoc
 // ── the claims ───────────────────────────────────────────────────────────────────────────────────
 
 fn text(s: &AbiStr) -> &'static [u8] {
-    if s.len == 0 {
+    if s.is_empty() {
         return &[];
     }
     // SAFETY: the Statement's strings are `'static` plugin data of their stated length.
-    unsafe { std::slice::from_raw_parts(s.ptr, s.len) }
+    #[allow(unused_unsafe)]
+    unsafe {
+        s.bytes()
+    }
 }
 
 fn claims() -> (Vec<String>, &'static [Claim]) {
     let st = crate::door::STATEMENT;
     // SAFETY: the Statement's claim list and kind tail are this crate's `'static` data.
-    let names: &[AbiStr] = unsafe { std::slice::from_raw_parts(st.claims, st.claims_len) };
-    let tail = unsafe { &*st.kind_tail.cast::<TransportTail>() };
+    let names: &[AbiStr] = unsafe { std::slice::from_raw_parts(st.claims_ptr(), st.claims_len()) };
+    let tail = unsafe { &*st.kind_tail().cast::<TransportTail>() };
     let rows: &[Claim] =
-        unsafe { std::slice::from_raw_parts(tail.claim_rows, tail.claim_rows_len) };
+        unsafe { std::slice::from_raw_parts(tail.claim_rows_ptr(), tail.claim_rows_len()) };
     let names = names
         .iter()
         .map(|n| String::from_utf8_lossy(text(n)).into_owned())
@@ -86,10 +90,10 @@ fn every_claim_row_states_the_declaration() {
             "no egress forms"
         );
         // SAFETY: `facts_len` `'static` strings at `facts`.
-        let stated: Vec<&[u8]> = if row.facts_len == 0 {
+        let stated: Vec<&[u8]> = if row.facts_len() == 0 {
             Vec::new()
         } else {
-            unsafe { std::slice::from_raw_parts(row.facts, row.facts_len) }
+            unsafe { std::slice::from_raw_parts(row.facts_ptr(), row.facts_len()) }
                 .iter()
                 .map(text)
                 .collect()
@@ -424,10 +428,8 @@ impl Host {
         };
         let mut b: BeginIn = z();
         b.side = SIDE_ACCEPT;
-        b.target = AbiStr {
-            ptr: std::ptr::null(),
-            len: 0,
-        };
+        b.scheme = SCHEME_PLAIN;
+        b.target = AbiStr::ABSENT;
         b.sink = host.sink();
         let mut bo: DoorOut = z();
         assert_eq!(Begin::call(host.inst, &b, &mut bo), Outcome::Ready);

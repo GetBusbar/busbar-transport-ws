@@ -15,7 +15,8 @@
 use std::mem::zeroed;
 use std::sync::Arc;
 
-use busbar_contract::abi::mechanism::call::{AbiStr, Blob, Outcome, BLOB_ABSENT};
+use busbar_contract::abi::host::service::SCHEME_PLAIN;
+use busbar_contract::abi::mechanism::call::{AbiStr, Blob, Outcome};
 use busbar_contract::abi::mechanism::lifecycle::{slot as life, OpenIn, OpenOut};
 use busbar_contract::abi::mechanism::KindCode;
 use busbar_contract::abi::transport::{
@@ -26,7 +27,7 @@ use busbar_plugin_loader::dispatch::kinds::hook::Hook;
 use busbar_plugin_loader::dispatch::kinds::transport::Transport;
 use busbar_plugin_loader::dispatch::{
     in_head, load_dropped, load_linked, out_head, Bind, ConnTable, DispatchConfig, Dispatcher,
-    Frame, LinkedRow, LoadError, NoSink, Plugin,
+    Frame, LinkedRow, LoadError, LoadedDoor, NoSink, Plugin,
 };
 
 fn z<T>() -> T {
@@ -51,9 +52,19 @@ fn cdylib() -> std::path::PathBuf {
         .unwrap_or_else(|| panic!("the busbar-transport-ws-plugin cdylib ({file}) is not built"))
 }
 
+/// This crate's one door, restated for the loader.
+fn loaded() -> LoadedDoor {
+    // SAFETY: `busbar_transport_ws::door` is the crate's one door function, answering its `'static`
+    // door.
+    #[allow(unused_unsafe)]
+    unsafe {
+        LoadedDoor::from_raw(busbar_transport_ws::door)
+    }
+}
+
 /// The row a compiled-in build holds for this door.
 fn row() -> LinkedRow {
-    LinkedRow::of(busbar_transport_ws::door).expect("the door states itself")
+    LinkedRow::of_loaded(loaded()).expect("the door states itself")
 }
 
 fn bind(d: &Dispatcher) -> Bind {
@@ -69,12 +80,7 @@ fn bind(d: &Dispatcher) -> Bind {
 fn open(p: &Plugin<Transport>) {
     let mut i: OpenIn = z();
     i.head = in_head();
-    i.settings = Blob {
-        ptr: std::ptr::null(),
-        len: 0,
-        fmt: BLOB_ABSENT,
-        flags: 0,
-    };
+    i.settings = Blob::ABSENT;
     let mut o: OpenOut = z();
     o.head = out_head();
     let mut f = Frame::new(i, o);
@@ -174,10 +180,8 @@ impl Host {
         let mut i: BeginIn = z();
         i.head = in_head();
         i.side = side;
-        i.target = AbiStr {
-            ptr: target.as_ptr(),
-            len: target.len(),
-        };
+        i.scheme = SCHEME_PLAIN;
+        i.target = AbiStr::of(target);
         i.sink = self.sink();
         let mut o: FramerOut = z();
         o.head = out_head();
@@ -311,7 +315,7 @@ fn the_door_asked_for_as_another_kind_is_refused_both_ways() {
 // THE PUBLISHED SUITE (busbar-plugin-loader's `conformance_suite!`): both legs through the one
 // loader, every step at its pinned crossing count, over `conformance.json`.
 busbar_plugin_loader::conformance_suite! {
-    door: busbar_transport_ws::door,
+    loaded: loaded(),
     cdylib: "busbar_transport_ws_plugin",
     inputs: include_str!("conformance.json"),
 }
