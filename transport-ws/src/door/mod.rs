@@ -196,9 +196,9 @@ const _: () = {
     assert!(<WsFramer as TransportMeta>::UPGRADES_TO.is_empty() && TAIL.upgrades_to_len() == 0);
     assert!(
         <WsFramer as TransportMeta>::HANDOFF.is_none()
-            && TAIL.handoff_from.len() == 0
-            && TAIL.handoff_to.len() == 0
-            && TAIL.handoff_binding_fact.len() == 0
+            && TAIL.handoff_from.is_empty()
+            && TAIL.handoff_to.is_empty()
+            && TAIL.handoff_binding_fact.is_empty()
     );
 };
 
