@@ -161,7 +161,8 @@ impl Host {
         o.yielded.flags & YIELD_MORE != 0
     }
 
-    fn accept(&mut self) -> u64 {
+    /// An accepted framing that has read nothing yet.
+    fn begin_accept(&mut self) -> u64 {
         let mut i: BeginIn = z();
         i.side = SIDE_ACCEPT;
         i.target = AbiStr {
@@ -172,7 +173,11 @@ impl Host {
         let mut o: FramerOut = z();
         let r = call(self.ops.begin, self.inst, &mut i, &mut o, slot::BEGIN);
         assert_eq!(r, Outcome::Ready);
-        let framing = o.framing;
+        o.framing
+    }
+
+    fn accept(&mut self) -> u64 {
+        let framing = self.begin_accept();
         let said = self.ingest(framing, UPGRADE);
         assert!(
             String::from_utf8_lossy(&said.wire).starts_with("HTTP/1.1 101"),
@@ -183,11 +188,18 @@ impl Host {
 
     /// `ingest` `bytes`, then the re-calls; answers the outcome of the first call too.
     fn ingest_answer(&mut self, framing: u64, bytes: &[u8]) -> (Outcome, Said) {
+        self.ingest_call(framing, bytes, false)
+    }
+
+    /// `ingest` `bytes` (with the carrier's end when `end`), then the re-calls; answers the
+    /// outcome of the first call too.
+    fn ingest_call(&mut self, framing: u64, bytes: &[u8], end: bool) -> (Outcome, Said) {
         let mut said = Said::default();
         let mut i: IngestIn = z();
         i.framing = framing;
         i.bytes = bytes.as_ptr();
         i.len = bytes.len();
+        i.end = u32::from(end);
         i.sink = self.sink();
         let mut o: FramerOut = z();
         let r = call(self.ops.ingest, self.inst, &mut i, &mut o, slot::INGEST);
@@ -845,4 +857,49 @@ fn autobahn_9_7_1_a_thousand_empty_text_messages() {
 #[test]
 fn autobahn_9_8_1_a_thousand_empty_binary_messages() {
     empty_echoed("9.8.1", &client(true, 0, BINARY, b""), OCTETS, 1000);
+}
+
+// ── 5. A CONNECTION LOST, AND AN UPGRADE BROKEN ─────────────────────────────────────────────────
+
+/// RED (audit: a connection lost without a closing handshake is reported as a stream that ended
+/// whole): the carrier ends after the first fragment of a message, with no Close frame. RFC 6455
+/// section 7.1.5 names that close 1006, abnormal: the stream ends FAILED (`PIECE_STREAM_FAILED`),
+/// never whole (`PIECE_END`), and the part of the message that came is not handed up as a message.
+#[test]
+fn a_carrier_lost_mid_message_ends_the_stream_failed() {
+    let mut h = Host::new();
+    let f = h.accept();
+    let (r, said) = h.ingest_call(f, &client(false, 0, TEXT, b"the first half"), true);
+    assert_eq!(r, Outcome::Ready);
+    assert!(
+        said.frames.is_empty(),
+        "a part of a message is never a message"
+    );
+    assert!(said.stream_end, "the stream ends");
+    assert!(said.failed, "failed: no closing handshake ended it");
+    assert!(said.ended);
+}
+
+/// RED (audit: an accepted upgrade request that breaks the handshake rules is answered with
+/// nothing): an upgrade request naming a version this end does not speak is answered, through the
+/// door, `426 Upgrade Required` with a `Sec-WebSocket-Version: 13` field (RFC 6455 section 4.4), and
+/// then the stream ends failed.
+#[test]
+fn an_upgrade_of_another_version_is_answered_426_through_the_door() {
+    let mut h = Host::new();
+    let f = h.begin_accept();
+    let said = h.ingest(
+        f,
+        b"GET /echo HTTP/1.1\r\nHost: svc.test\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\
+          Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 8\r\n\r\n",
+    );
+    let wire = String::from_utf8_lossy(&said.wire).to_ascii_lowercase();
+    assert!(
+        wire.starts_with("http/1.1 426 upgrade required\r\n"),
+        "{wire}"
+    );
+    assert!(wire.contains("\r\nsec-websocket-version: 13\r\n"), "{wire}");
+    assert!(said.frames.is_empty());
+    assert!(said.stream_end && said.failed, "the stream ends failed");
+    assert!(said.ended, "and the connection's frames end");
 }
