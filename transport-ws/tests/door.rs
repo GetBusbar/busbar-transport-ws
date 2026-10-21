@@ -561,7 +561,7 @@ fn the_ws_claim_opens_at_the_upgrade_and_composes_over_nothing() {
     use busbar_contract::abi::transport::{Claim, TransportTail, UNIT0_UPGRADE};
     // SAFETY: the door's Statement is this crate's `'static` one; its kind tail is a `'static`
     // `TransportTail`, and its claim rows are `claim_rows_len` `'static` rows.
-    let st = unsafe { &*busbar_transport_ws::door().statement };
+    let st = unsafe { &*(*busbar_transport_ws::door()).statement };
     let tail = unsafe { &*st.kind_tail.cast::<TransportTail>() };
     let rows: &[Claim] =
         unsafe { std::slice::from_raw_parts(tail.claim_rows, tail.claim_rows_len) };
