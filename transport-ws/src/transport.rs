@@ -65,6 +65,7 @@ use std::task::Poll;
 
 use busbar_contract::abi::transport::fields::{hop_by_hop, LINE_END, SEPARATOR};
 use busbar_contract::ids::StreamId;
+use busbar_contract::net::{dial_authority, DialAuthority};
 use busbar_contract::transport::wire::{CloseReason, Encode, TransportError, WireStatusClass};
 use busbar_contract::transport::{
     BytesOut, ConnFacts, Framed, Framer, FramerOut, HostTime, Located, Side,
@@ -1445,12 +1446,25 @@ impl WsFramer {
     }
 }
 
-/// One `ws://`/`wss://` URL, read into `(secure, host, port, path)` by the contract's one URL
-/// reader ([`busbar_contract::net::parse_url`], WHATWG rules): the scheme is read without case
-/// (RFC 3986 §3.1: `WSS://` is `wss://`), and only `ws` or `wss` is taken; the authority ends at
-/// `/`, `?`, `#` or `\` exactly where the handshake's parser ends it, the host comes back
-/// unbracketed, and a userinfo is refused. The path always opens with `/`.
-pub(crate) fn split_ws_url(url: &str) -> Result<(bool, String, u16, String), TransportError> {
+/// One `ws://`/`wss://` dial target, read once.
+#[derive(Debug)]
+pub(crate) struct WsTarget {
+    /// `wss`: the bytes are secured before they leave.
+    pub(crate) secure: bool,
+    /// Where the target is dialled and what its `Host` says, exactly as busbar 1.5.5 dialled and
+    /// sent it ([`busbar_contract::net::dial_authority`]): the host serialised as `url` serialises
+    /// it (UTS #46, so an IDN as punycode; an IPv6 literal bracketed), the port to dial, and the
+    /// `Host` value with the port only when it is not the scheme's default.
+    pub(crate) dial: DialAuthority,
+    /// The request target: the path (always opening with `/`) and the query.
+    pub(crate) path: String,
+}
+
+/// Read a dial target. The scheme is read without case (RFC 3986 §3.1: `WSS://` is `wss://`) and
+/// only `ws` or `wss` is taken; the path ends the authority at `/`, `?`, `#` or `\` exactly where
+/// the handshake's parser ends it ([`busbar_contract::net::parse_url`]), and a userinfo is refused.
+/// The host and the port come from the contract's one dial-authority reader, never parsed here.
+pub(crate) fn ws_target(url: &str) -> Result<WsTarget, TransportError> {
     let parts = busbar_contract::net::parse_url(url).map_err(|_| TransportError::AddressRefused)?;
     let secure = match parts.scheme.as_str() {
         "wss" => true,
@@ -1460,8 +1474,12 @@ pub(crate) fn split_ws_url(url: &str) -> Result<(bool, String, u16, String), Tra
     if parts.userinfo {
         return Err(TransportError::AddressRefused);
     }
-    let port = parts.port.unwrap_or(if secure { 443 } else { 80 });
-    Ok((secure, parts.host, port, parts.path))
+    let dial = dial_authority(url).map_err(|_| TransportError::AddressRefused)?;
+    Ok(WsTarget {
+        secure,
+        dial,
+        path: parts.path,
+    })
 }
 
 /// THE DIALLED UPGRADE REQUEST AS IT GOES ON THE WIRE (ruling 23: nothing is added to a head after
@@ -1621,29 +1639,17 @@ fn signed_inner(wire: &[u8], sign: Signer<'_>) -> Result<Option<Vec<u8>>, Transp
     Ok(Some(signed))
 }
 
-/// A host as an authority spells it: an IPv6 literal in its brackets (RFC 3986 section 3.2.2).
-fn authority_host(host: &str) -> String {
-    if host.contains(':') {
-        format!("[{host}]")
-    } else {
-        host.to_owned()
-    }
-}
-
-/// The upgrade request's URL for a dial to `url`: its scheme (lower-case), its host as the URL
-/// reader normalises it (percent-decoded, a trailing dot dropped; an IPv6 literal bracketed), the
-/// port only where the target spelled one, and its path. The request's `Host` is that host and
-/// port: the target's normalised host, not its authority as written.
+/// The upgrade request's URL for a dial to `url`: its scheme (lower-case), its `Host` value
+/// ([`DialAuthority::host_header`]: busbar 1.5.5's bytes, the host as `url` serialises it and the
+/// port only when it is not the scheme's default) and its path. The protocol machine writes the
+/// request's `Host` line from this URL's authority, so it carries exactly that value.
 fn request_url(url: &str) -> Result<String, TransportError> {
-    let (secure, host, _, path) = split_ws_url(url)?;
-    let port = busbar_contract::net::parse_url(url)
-        .map_err(|_| TransportError::AddressRefused)?
-        .port;
+    let t = ws_target(url)?;
     Ok(format!(
-        "{}://{}{}{path}",
-        if secure { "wss" } else { "ws" },
-        authority_host(&host),
-        port.map(|p| format!(":{p}")).unwrap_or_default()
+        "{}://{}{}",
+        if t.secure { "wss" } else { "ws" },
+        t.dial.host_header,
+        t.path
     ))
 }
 
@@ -1762,11 +1768,20 @@ impl Framer for WsFramer {
     /// A `ws://` target is reached at its `host:port`; a `wss://` one asks for its bytes to be
     /// secured before they leave, and names the host its certificate is checked against.
     fn locate(&self, target: &str) -> Result<Located, TransportError> {
-        let (secure, host, port, _path) = split_ws_url(target)?;
+        let t = ws_target(target)?;
+        let port = t.dial.dial_port.ok_or(TransportError::AddressRefused)?;
+        let host = t.dial.host;
+        // The certificate is checked against the host itself: an IPv6 literal without brackets.
+        let server_name = t.secure.then(|| {
+            host.strip_prefix('[')
+                .and_then(|h| h.strip_suffix(']'))
+                .unwrap_or(&host)
+                .to_owned()
+        });
         Ok(Located {
-            authority: format!("{}:{port}", authority_host(&host)),
-            secure,
-            server_name: secure.then_some(host),
+            authority: format!("{host}:{port}"),
+            secure: t.secure,
+            server_name,
         })
     }
 

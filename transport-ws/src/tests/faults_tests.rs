@@ -199,8 +199,8 @@ fn an_ipv6_literal_target_dials() {
 }
 
 /// RED (audit: every dial's Host field gains the default port): the upgrade request's `Host` is
-/// the target's host as the URL reader normalises it, with a port only where the target spelled
-/// one.
+/// the target's host as `dial_authority` serialises it, with the port only where the target spelled
+/// one other than the scheme's default.
 #[test]
 fn a_dial_sends_the_targets_host_and_only_a_spelled_port() {
     let request = opening("wss://api.example/v1/realtime?model=m");
@@ -211,6 +211,39 @@ fn a_dial_sends_the_targets_host_and_only_a_spelled_port() {
     assert!(request.contains("\r\nHost: api.example\r\n"), "{request}");
     let request = opening("ws://svc.test:8080/x");
     assert!(request.contains("\r\nHost: svc.test:8080\r\n"), "{request}");
+}
+
+/// RED (the dialled authority is busbar 1.5.5's, from the contract's `dial_authority`): an IDN
+/// target is dialled at its punycode host and its `Host` carries the punycode; a port other than
+/// the scheme's default is dialled and sent; the default port is dialled and never sent. RED before
+/// the change: the host went out as the URL reader decoded it (the Unicode spelling), and a spelled
+/// default port was stapled onto the `Host`.
+#[test]
+fn a_dial_goes_to_the_targets_dial_authority() {
+    let f = WsFramer::new(0);
+    let at = f
+        .locate("wss://b\u{fc}cher.example/x")
+        .expect("an IDN target locates");
+    assert_eq!(at.authority, "xn--bcher-kva.example:443");
+    assert_eq!(at.server_name.as_deref(), Some("xn--bcher-kva.example"));
+    let request = opening("wss://b\u{fc}cher.example/x");
+    assert!(
+        request.contains("\r\nHost: xn--bcher-kva.example\r\n"),
+        "{request}"
+    );
+
+    let at = f.locate("ws://svc.test:8080/x").expect("a ws URL locates");
+    assert_eq!(at.authority, "svc.test:8080");
+    let request = opening("ws://svc.test:8080/x");
+    assert!(request.contains("\r\nHost: svc.test:8080\r\n"), "{request}");
+
+    let at = f.locate("wss://svc.test:443/x").expect("a wss URL locates");
+    assert_eq!(at.authority, "svc.test:443");
+    let request = opening("wss://svc.test:443/x");
+    assert!(
+        request.contains("\r\nHost: svc.test\r\n"),
+        "the default port is never sent: {request}"
+    );
 }
 
 /// RED (audit: an upper-case scheme is refused): a URL's scheme is read without case (RFC 3986

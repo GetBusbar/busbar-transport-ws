@@ -189,27 +189,33 @@ fn transport_meta_matches_the_architecture_row() {
     assert_eq!(<crate::WsFramer as TransportMeta>::STATUS_CLASS, None);
 }
 
-/// `split_ws_url` on the bracketed-IPv6 shapes. A literal address with an explicit port is the one
-/// case the bracket rule exists to serve, and it must come back as the address without its brackets
-/// and the port the URL spelled — not as an authority that gets a default port stapled onto it.
+/// A target read to `(secure, dial host, dial port, path)`.
+fn read(url: &str) -> (bool, String, Option<u16>, String) {
+    let t = crate::transport::ws_target(url).unwrap();
+    (t.secure, t.dial.host, t.dial.dial_port, t.path)
+}
+
+/// The bracketed-IPv6 shapes. A literal address with an explicit port is the one case the bracket
+/// rule exists to serve, and it must come back as the address and the port the URL spelled, not as
+/// an authority that gets a default port stapled onto it.
 #[test]
 fn a_bracketed_ipv6_authority_parses_with_and_without_a_port() {
     assert_eq!(
-        crate::transport::split_ws_url("wss://[::1]:8080/p").unwrap(),
-        (true, "::1".to_string(), 8080, "/p".to_string())
+        read("wss://[::1]:8080/p"),
+        (true, "[::1]".to_string(), Some(8080), "/p".to_string())
     );
     assert_eq!(
-        crate::transport::split_ws_url("ws://[::1]/p").unwrap(),
-        (false, "::1".to_string(), 80, "/p".to_string())
+        read("ws://[::1]/p"),
+        (false, "[::1]".to_string(), Some(80), "/p".to_string())
     );
     // The shapes the existing rule already got right stay right.
     assert_eq!(
-        crate::transport::split_ws_url("ws://host:9000/p").unwrap(),
-        (false, "host".to_string(), 9000, "/p".to_string())
+        read("ws://host:9000/p"),
+        (false, "host".to_string(), Some(9000), "/p".to_string())
     );
     assert_eq!(
-        crate::transport::split_ws_url("wss://host/p").unwrap(),
-        (true, "host".to_string(), 443, "/p".to_string())
+        read("wss://host/p"),
+        (true, "host".to_string(), Some(443), "/p".to_string())
     );
 }
 
@@ -218,18 +224,18 @@ fn a_bracketed_ipv6_authority_parses_with_and_without_a_port() {
 #[test]
 fn a_ws_authority_ends_at_a_query_a_fragment_or_a_backslash() {
     assert_eq!(
-        crate::transport::split_ws_url("ws://host?x=1").unwrap(),
-        (false, "host".to_string(), 80, "/?x=1".to_string())
+        read("ws://host?x=1"),
+        (false, "host".to_string(), Some(80), "/?x=1".to_string())
     );
     assert_eq!(
-        crate::transport::split_ws_url("wss://127.0.0.1\\x/").unwrap(),
-        (true, "127.0.0.1".to_string(), 443, "/x/".to_string())
+        read("wss://127.0.0.1\\x/"),
+        (true, "127.0.0.1".to_string(), Some(443), "/x/".to_string())
     );
     assert_eq!(
-        crate::transport::split_ws_url("wss://host:9443#f").unwrap(),
-        (true, "host".to_string(), 9443, "/#f".to_string())
+        read("wss://host:9443#f"),
+        (true, "host".to_string(), Some(9443), "/#f".to_string())
     );
-    assert!(crate::transport::split_ws_url("wss://u@host/").is_err());
+    assert!(crate::transport::ws_target("wss://u@host/").is_err());
 }
 
 /// HELD, AND BOUNDED: a dial whose far end never answers cannot grow the framing without end. A
