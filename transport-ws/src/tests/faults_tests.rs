@@ -10,8 +10,6 @@
 //!   framing in steady state, one message in and one out per call, adds no allocation beyond the
 //!   door crossing itself and what the protocol library allocates for the message.
 
-use std::alloc::{GlobalAlloc, Layout, System};
-use std::cell::Cell;
 use std::collections::VecDeque;
 use std::ffi::c_void;
 use std::io::{Read, Write};
@@ -28,6 +26,7 @@ use busbar_contract::abi::transport::{
     BeginIn, Claim, EmitIn, FramePiece, FramerOut as DoorOut, FramerSink, IngestIn, TransportTail,
     SIDE_ACCEPT, UNIT0_UPGRADE, YIELD_MORE,
 };
+use busbar_contract::alloc_counter::allocations_of;
 use busbar_contract::transport::{ConnFacts, Framed, Framer, FramerOut, HostTime, Side};
 use busbar_contract::TransportMeta;
 use tungstenite::protocol::Role;
@@ -395,43 +394,6 @@ fn a_panic_in_one_framing_leaves_the_others_working() {
 
 // ── the allocations ──────────────────────────────────────────────────────────────────────────────
 
-/// Counts every allocation (and reallocation) the CURRENT thread makes while its count is on, so
-/// the tests of this binary running side by side never count each other.
-struct Counting;
-
-thread_local! {
-    static COUNT: Cell<Option<usize>> = const { Cell::new(None) };
-}
-
-fn bump() {
-    let _ = COUNT.try_with(|c| {
-        if let Some(n) = c.get() {
-            c.set(Some(n + 1));
-        }
-    });
-}
-
-// SAFETY: every call is `System`'s, unchanged; the counter only bumps a per-thread cell.
-unsafe impl GlobalAlloc for Counting {
-    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        bump();
-        // SAFETY: the caller's layout, passed on.
-        unsafe { System.alloc(layout) }
-    }
-    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        // SAFETY: as allocated above.
-        unsafe { System.dealloc(ptr, layout) }
-    }
-    unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-        bump();
-        // SAFETY: as allocated above.
-        unsafe { System.realloc(ptr, layout, new_size) }
-    }
-}
-
-#[global_allocator]
-static COUNTING: Counting = Counting;
-
 fn z<T>() -> T {
     // SAFETY: plain C data; all-zero is valid.
     unsafe { zeroed() }
@@ -538,11 +500,13 @@ fn per_call<T>(state: &mut T, op: &mut dyn FnMut(&mut T)) -> f64 {
     for _ in 0..64 {
         op(state);
     }
-    COUNT.with(|c| c.set(Some(0)));
-    for _ in 0..ROUNDS {
-        op(state);
-    }
-    let n = COUNT.with(|c| c.replace(None)).unwrap_or(0);
+    // busbar-contract's counting allocator counts per thread, so the other tests of this binary
+    // running side by side never move it.
+    let n = allocations_of(|| {
+        for _ in 0..ROUNDS {
+            op(state);
+        }
+    });
     n as f64 / ROUNDS as f64
 }
 

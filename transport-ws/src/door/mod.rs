@@ -1382,3 +1382,9 @@ busbar_contract::plugin_door! {
 #[cfg(test)]
 #[path = "../tests/door_fill_tests.rs"]
 mod fill_tests;
+
+// THE TRANSPORT'S FAULT EDGES: they read the door's Statement and call its slots over zeroed C
+// shapes, which is raw ABI access, so they live inside the door's one reviewed `unsafe` scope.
+#[cfg(test)]
+#[path = "../tests/faults_tests.rs"]
+mod faults_tests;

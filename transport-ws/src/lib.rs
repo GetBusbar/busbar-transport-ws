@@ -38,10 +38,10 @@ pub use door::door;
 #[path = "tests/framer_tests.rs"]
 mod framer_tests;
 
-// THE FAULT EDGES, with the counting allocator their per-message witness reads (a thread-local
-// count, so the other tests of this binary do not move it). A unit module, so the framer stays
-// the crate's own (its one public entry is its door).
+// The unit tests' one allocator: busbar-contract's test-only counting allocator (a per-thread
+// count, so the other tests of this binary do not move it), read by the door's fault edges'
+// per-message witness (`door::faults_tests`). No `GlobalAlloc` impl lives in this crate.
 #[cfg(test)]
-#[allow(unsafe_code)]
-#[path = "tests/faults_tests.rs"]
-mod faults_tests;
+#[global_allocator]
+static ALLOC: busbar_contract::alloc_counter::Counting =
+    busbar_contract::alloc_counter::Counting::new();

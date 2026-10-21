@@ -36,3 +36,8 @@ zeroize = { workspace = true }
 httpdate = { workspace = true }
 # The door's settings blob is JSON (`door::read_settings`).
 serde_json = { workspace = true }
+
+[dev-dependencies]
+# The unit tests' one allocator (ARCHITECT ruling 2026-10-21): busbar-contract's test-only counting
+# allocator, so no `GlobalAlloc` impl (and no `unsafe` for one) lives in this crate.
+busbar-contract = { workspace = true, features = ["alloc-counter"] }
