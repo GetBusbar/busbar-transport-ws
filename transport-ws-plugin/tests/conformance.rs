@@ -15,6 +15,7 @@
 use std::mem::zeroed;
 use std::sync::Arc;
 
+use busbar_contract::abi::host::service::SCHEME_PLAIN;
 use busbar_contract::abi::mechanism::call::{AbiStr, Blob, Outcome, BLOB_ABSENT};
 use busbar_contract::abi::mechanism::lifecycle::{slot as life, OpenIn, OpenOut};
 use busbar_contract::abi::mechanism::KindCode;
@@ -175,6 +176,7 @@ impl Host {
         let mut i: BeginIn = z();
         i.head = in_head();
         i.side = side;
+        i.scheme = SCHEME_PLAIN;
         i.target = AbiStr {
             ptr: target.as_ptr(),
             len: target.len(),
