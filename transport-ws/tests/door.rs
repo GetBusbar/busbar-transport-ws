@@ -537,7 +537,7 @@ fn an_upgrade_answered_with_no_field_left_is_an_empty_head() {
 }
 
 fn linked() -> &'static Ops {
-    let d = busbar_transport_ws::door::door();
+    let d = busbar_transport_ws::door();
     // SAFETY: the door's `'static` table.
     unsafe { &*(*d).ops.cast::<Ops>() }
 }
@@ -559,9 +559,9 @@ fn a_recalled_exchange_answers_nothing_twice_and_drops_nothing() {
 #[test]
 fn the_ws_claim_opens_at_the_upgrade_and_composes_over_nothing() {
     use busbar_contract::abi::transport::{Claim, TransportTail, UNIT0_UPGRADE};
-    let st = busbar_transport_ws::door::STATEMENT;
-    // SAFETY: the Statement's kind tail is this crate's `'static` `TransportTail`, and its claim
-    // rows are `claim_rows_len` `'static` rows.
+    // SAFETY: the door's Statement is this crate's `'static` one; its kind tail is a `'static`
+    // `TransportTail`, and its claim rows are `claim_rows_len` `'static` rows.
+    let st = unsafe { &*busbar_transport_ws::door().statement };
     let tail = unsafe { &*st.kind_tail.cast::<TransportTail>() };
     let rows: &[Claim] =
         unsafe { std::slice::from_raw_parts(tail.claim_rows, tail.claim_rows_len) };

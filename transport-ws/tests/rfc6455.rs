@@ -83,7 +83,7 @@ const CAP: usize = 64 * 1024;
 
 impl Host {
     fn new() -> Self {
-        let d = busbar_transport_ws::door::door();
+        let d = busbar_transport_ws::door();
         // SAFETY: the door's `'static` table.
         let ops: &'static Ops = unsafe { &*(*d).ops.cast::<Ops>() };
         let mut i: OpenIn = z();

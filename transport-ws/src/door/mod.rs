@@ -226,8 +226,17 @@ const _: () = {
     );
 };
 
+busbar_contract::statement_extensions!(
+    /// The Statement's extensions: this plugin's whole `declares` document (BUSBAR-1.6.0.md l.246).
+    EXTENSIONS: [(
+        busbar_contract::abi::mechanism::extensions::EXT_DECLARES,
+        include_bytes!("../../declares.json"),
+    )]
+);
+
 /// The door's Statement: the `ws` framer.
 pub const STATEMENT: Statement = Statement {
+    extensions: EXTENSIONS,
     kind_tail: (&TAIL as *const TransportTail).cast::<KindTailHead>(),
     claims: CLAIM_NAMES.as_ptr(),
     claims_len: CLAIM_NAMES.len(),

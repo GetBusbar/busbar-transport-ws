@@ -1417,7 +1417,7 @@ impl Default for WsFramer {
 
 impl Plugin for WsFramer {
     fn key(&self) -> &'static str {
-        crate::linked::KEY
+        <Self as busbar_contract::transport::TransportMeta>::KEY
     }
     fn kind(&self) -> Kind {
         Kind::Transport

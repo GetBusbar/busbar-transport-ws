@@ -15,7 +15,7 @@ license = "Apache-2.0"
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-# THE LOGIC, same repo: its `door::door` is the door this image exports. A busbar build that LINKS
+# THE LOGIC, same repo: its `door` is the door this image exports. A busbar build that LINKS
 # the transport names the logic crate, which exports no symbol.
 busbar-transport-ws = { path = "../transport-ws" }
 busbar-contract = { workspace = true }
