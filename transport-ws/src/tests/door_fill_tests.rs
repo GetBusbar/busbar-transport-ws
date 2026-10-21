@@ -26,7 +26,7 @@ fn sink(frame: &mut [u8], pieces: &mut [FramePiece], heads: &mut [HeadSlots]) ->
 #[test]
 fn a_reason_rides_only_beside_its_heads_first_piece() {
     let mut owed = Owed::default();
-    let mut head = Piece::plain(0, b"x-a: 1\r\n".to_vec(), true);
+    let mut head = Piece::plain(0, Bytes::from_static(b"x-a: 1\r\n"), true);
     head.fields = true;
     head.reason = Some(b"Unauthorized".to_vec());
     owed.pieces.push_back(head);
@@ -41,6 +41,7 @@ fn a_reason_rides_only_beside_its_heads_first_piece() {
     fill(
         &mut owed,
         &sink(&mut frame, &mut pieces, &mut heads),
+        0,
         &mut o,
     );
     assert_eq!((o.yielded.heads_len, o.yielded.pieces_len), (0, 0));
@@ -57,6 +58,7 @@ fn a_reason_rides_only_beside_its_heads_first_piece() {
     fill(
         &mut owed,
         &sink(&mut frame, &mut pieces, &mut heads),
+        0,
         &mut o,
     );
     assert_eq!((o.yielded.heads_len, o.yielded.pieces_len), (1, 1));
@@ -85,6 +87,8 @@ fn a_panicked_framing_is_forgotten_by_the_framer_at_its_finish() {
             monotonic_nanos: 0,
             unix_nanos: 0,
         },
+        sink: None,
+        wire_at: 0,
     };
     let state = inst
         .framer
@@ -135,6 +139,8 @@ fn a_cancel_releases_the_dial_parked_on_its_ticket() {
             monotonic_nanos: 0,
             unix_nanos: 0,
         },
+        sink: None,
+        wire_at: 0,
     };
     let mut pending = |_: &crate::transport::UpgradeHead<'_>| Poll::Pending;
     assert!(inst

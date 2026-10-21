@@ -30,7 +30,12 @@
 //!   answered the upgrade and not yet sent a message has answered. It is the only frame this framer
 //!   states a status on: a message never carries one.
 //! * A ping is answered with its pong on the next bytes out; a peer's close is answered with the
-//!   peer's own code and ends the frames.
+//!   peer's own code and ends the frames. A carrier that ends with no closing handshake ends them
+//!   FAILED (RFC 6455 §7.1.5: the close is abnormal, 1006), and a message it cut short is lost.
+//! * An ACCEPTED upgrade request that breaks the handshake rules is answered with its HTTP error
+//!   (RFC 6455 §4.2.1: `400` for a missing or malformed `Sec-WebSocket-Key`, or any other broken
+//!   rule; §4.4: `426` naming version 13 for a version this end does not speak), and the frames end
+//!   failed.
 //! * A close this end starts carries the RFC 6455 code its reason names ([`close_code_for`]).
 //! * Bytes that break the protocol FAIL the connection (RFC 6455 §7.1.7) the way the RFC orders it:
 //!   every message completed before them is handed up first, the frames end, the layer above may
@@ -39,7 +44,14 @@
 //!   The protocol machine judges every frame, text UTF-8 included (as each frame completes); this
 //!   framer parses no WebSocket frame of its own (THE DESIGN §2 "Libraries": ONE protocol = ONE
 //!   library, the `tungstenite` family).
-//! * The message ceiling is the deployment's body cap, for a whole message and for a single frame.
+//! * The message ceiling is the deployment's body cap, for a whole message and for a single frame;
+//!   a refresh's ceiling holds for every connection built and every message written after it.
+//!
+//! ONE COPY OF A MESSAGE (THE DESIGN §11.2): the protocol machine reads the host's ingested bytes
+//! where they lie ([`lent`]) into its own buffer, the one copy into this plugin's memory, and the
+//! message it completes is handed to the door as that buffer, not copied again; on the way out the
+//! machine frames a message into its own buffer and writes it straight into the host's wire buffer.
+//! What the host's buffers cannot hold this call waits in plugin memory for the next.
 //!
 //! The upgrade INTO this framer is [`Framer::adopt`]: another framer gave up the stream with the
 //! bytes it held (the upgrade request itself), and this one answers it. Nothing upgrades out of a
@@ -47,33 +59,165 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::io::{Read, Write};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::task::Poll;
 
 use busbar_contract::abi::transport::fields::{hop_by_hop, LINE_END, SEPARATOR};
 use busbar_contract::ids::StreamId;
 use busbar_contract::transport::wire::{CloseReason, Encode, TransportError, WireStatusClass};
-use busbar_contract::transport::{BytesOut, ConnFacts, Framed, Framer, FramerOut, Located, Side};
+use busbar_contract::transport::{
+    BytesOut, ConnFacts, Framed, Framer, FramerOut, HostTime, Located, Side,
+};
 use busbar_contract::{AbiVersion, Kind, Plugin};
 use tungstenite::client::IntoClientRequest;
 use tungstenite::error::ProtocolError;
 use tungstenite::handshake::client::ClientHandshake;
-use tungstenite::handshake::server::{NoCallback, ServerHandshake};
+use tungstenite::handshake::server::{
+    write_response, ErrorResponse, Request as UpgradeRequest, Response as UpgradeResponse,
+    ServerHandshake,
+};
 use tungstenite::handshake::{HandshakeError, MidHandshake};
-use tungstenite::http::{HeaderMap, HeaderName, HeaderValue};
+use tungstenite::http::{HeaderMap, HeaderName, HeaderValue, StatusCode};
 use tungstenite::protocol::frame::coding::CloseCode;
 use tungstenite::protocol::{CloseFrame, WebSocketConfig};
 use tungstenite::{Bytes, Error as WsError, Message, Utf8Bytes, WebSocket};
 use zeroize::{Zeroize, Zeroizing};
 
-/// The in-memory stream one framing state's protocol machine reads and writes: what core ingested
-/// and the machine has not consumed, whether the carrier's clean end followed it, what the
-/// machine wrote and core has not been handed yet, and what arrived during the handshake.
+/// THE HOST'S BUFFERS, LENT TO THE PROTOCOL MACHINE FOR ONE CALL: the bytes an ingest carries,
+/// read where they lie, and the host's wire buffer, written where it lies, so a message is copied
+/// once into this plugin's memory (the machine's own buffer) and never again on its way through.
+///
+/// A loan is made at the start of one framer call, under that framing's own lock, from buffers
+/// that outlive the call, and is ended before the call returns ([`Pipe::settle`], [`drain`]). A
+/// call that fails or panics drops or poisons its framing, which is never read again; the loan
+/// dies with it, unread.
+#[allow(unsafe_code)]
+mod lent {
+    /// The bytes the host handed one ingest, not yet read by the machine.
+    pub(crate) struct Input {
+        ptr: *const u8,
+        len: usize,
+    }
+
+    impl Default for Input {
+        fn default() -> Self {
+            Self {
+                ptr: std::ptr::null(),
+                len: 0,
+            }
+        }
+    }
+
+    // SAFETY: the pointer is set only for the length of one framer call, on that call's thread and
+    // under the framing's own lock, and is cleared before the call returns (see the module): a
+    // pipe that moves to another thread never carries a live loan.
+    unsafe impl Send for Input {}
+
+    impl Input {
+        /// Lend `bytes` for the call.
+        pub(crate) fn lend(&mut self, bytes: &[u8]) {
+            self.ptr = bytes.as_ptr();
+            self.len = bytes.len();
+        }
+
+        /// What the machine has not read yet.
+        pub(crate) fn rest(&self) -> &[u8] {
+            if self.ptr.is_null() || self.len == 0 {
+                return &[];
+            }
+            // SAFETY: lent by `lend` from a slice that outlives the call, and read only during it;
+            // `ptr..ptr + len` stays inside that slice (`advance`).
+            unsafe { std::slice::from_raw_parts(self.ptr, self.len) }
+        }
+
+        /// The machine read `n` bytes.
+        pub(crate) fn advance(&mut self, n: usize) {
+            let n = n.min(self.len);
+            if n == 0 {
+                return;
+            }
+            // SAFETY: `n <= len`: the pointer stays inside the lent slice, or one past its end.
+            self.ptr = unsafe { self.ptr.add(n) };
+            self.len -= n;
+        }
+
+        /// End the loan.
+        pub(crate) fn clear(&mut self) {
+            *self = Self::default();
+        }
+    }
+
+    /// The host's wire buffer for one call, past what that call already wrote into it.
+    pub(crate) struct Window {
+        ptr: *mut u8,
+        cap: usize,
+        len: usize,
+    }
+
+    impl Default for Window {
+        fn default() -> Self {
+            Self {
+                ptr: std::ptr::null_mut(),
+                cap: 0,
+                len: 0,
+            }
+        }
+    }
+
+    // SAFETY: as `Input`'s: lent for one call under the framing's lock, ended before it returns.
+    unsafe impl Send for Window {}
+
+    impl Window {
+        /// Lend `buf` for the call; `None` lends nothing.
+        pub(crate) fn lend(&mut self, buf: Option<&mut [u8]>) {
+            *self = match buf {
+                Some(buf) => Self {
+                    ptr: buf.as_mut_ptr(),
+                    cap: buf.len(),
+                    len: 0,
+                },
+                None => Self::default(),
+            };
+        }
+
+        /// Write as much of `bytes` as the window still holds; answers how much.
+        pub(crate) fn put(&mut self, bytes: &[u8]) -> usize {
+            if self.ptr.is_null() {
+                return 0;
+            }
+            let n = bytes.len().min(self.cap - self.len);
+            // SAFETY: lent by `lend` from a host buffer of `cap` bytes that outlives the call, and
+            // `len + n <= cap`; `bytes` is the machine's own memory, never the host's buffer.
+            unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), self.ptr.add(self.len), n) };
+            self.len += n;
+            n
+        }
+
+        /// End the loan: how many bytes were written into it.
+        pub(crate) fn release(&mut self) -> usize {
+            let n = self.len;
+            *self = Self::default();
+            n
+        }
+    }
+}
+
+/// The in-memory stream one framing state's protocol machine reads and writes: the host's bytes
+/// lent for this call and what an earlier call left unread, whether the carrier's clean end
+/// followed them, the host's wire buffer lent for this call and what did not fit it (or was
+/// written with no buffer lent), and what arrived during the handshake.
 #[derive(Default)]
 pub(crate) struct Pipe {
+    /// What an earlier call's bytes left that the machine had not read.
     inbound: VecDeque<u8>,
+    /// This call's bytes, read in place.
+    lent: lent::Input,
     ended: bool,
+    /// The host's wire buffer, written in place while the session runs.
+    window: lent::Window,
+    /// What the machine wrote that the lent window could not take (or with none lent), in order:
+    /// once anything waits here, everything after it waits behind it.
     outbound: Vec<u8>,
     /// Every byte ingested while the opening handshake runs: a dialled head's status line (its
     /// reason phrase) is read from here.
@@ -82,36 +226,147 @@ pub(crate) struct Pipe {
     /// harness's seed (`test-seeded`), which unmasks a dialled end's frames.
     #[cfg_attr(not(feature = "test-seeded"), allow(dead_code))]
     client: bool,
+    /// The handshake completed: what the machine writes now is frames. Read only by the test
+    /// harness's seed (`test-seeded`).
+    #[cfg_attr(not(feature = "test-seeded"), allow(dead_code))]
+    framing: bool,
+}
+
+impl Pipe {
+    /// End this call's loan of the host's bytes: what the machine did not read is kept, in order,
+    /// for the next call (the host's bytes are this call's only).
+    fn settle(&mut self) {
+        self.inbound.extend(self.lent.rest());
+        self.lent.clear();
+    }
+
+    /// Nothing ingested is left unread.
+    fn drained(&self) -> bool {
+        self.inbound.is_empty() && self.lent.rest().is_empty()
+    }
+
+    /// Drop everything ingested and not read: past the frames' end it is nobody's.
+    fn discard(&mut self) {
+        self.inbound.clear();
+        self.lent.clear();
+    }
+
+    /// Hand `bytes` on: into the lent window while nothing waits ahead of them, the rest after
+    /// what waits.
+    fn put(&mut self, bytes: &[u8]) {
+        let n = if self.outbound.is_empty() {
+            self.window.put(bytes)
+        } else {
+            0
+        };
+        self.outbound.extend_from_slice(&bytes[n..]);
+    }
 }
 
 impl Read for Pipe {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        if self.inbound.is_empty() {
-            // Nothing more yet: the machine stops here and resumes on the next ingest. Only the
-            // carrier's clean end is the end.
-            return if self.ended {
-                Ok(0)
-            } else {
-                Err(std::io::ErrorKind::WouldBlock.into())
-            };
+        if !self.inbound.is_empty() {
+            let n = buf.len().min(self.inbound.len());
+            let (front, back) = self.inbound.as_slices();
+            let a = n.min(front.len());
+            buf[..a].copy_from_slice(&front[..a]);
+            buf[a..n].copy_from_slice(&back[..n - a]);
+            self.inbound.drain(..n);
+            return Ok(n);
         }
-        let n = buf.len().min(self.inbound.len());
-        let (front, back) = self.inbound.as_slices();
-        let a = n.min(front.len());
-        buf[..a].copy_from_slice(&front[..a]);
-        buf[a..n].copy_from_slice(&back[..n - a]);
-        self.inbound.drain(..n);
-        Ok(n)
+        let lent = self.lent.rest();
+        if !lent.is_empty() {
+            let n = buf.len().min(lent.len());
+            buf[..n].copy_from_slice(&lent[..n]);
+            self.lent.advance(n);
+            return Ok(n);
+        }
+        // Nothing more yet: the machine stops here and resumes on the next ingest. Only the
+        // carrier's clean end is the end.
+        if self.ended {
+            Ok(0)
+        } else {
+            Err(std::io::ErrorKind::WouldBlock.into())
+        }
     }
 }
 
 impl Write for Pipe {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.outbound.extend_from_slice(buf);
+        // The seeded harness unmasks a dialled end's frames before they leave (whole frames: the
+        // machine hands its buffer over whole).
+        #[cfg(feature = "test-seeded")]
+        if self.client && self.framing {
+            let mut frames = buf.to_vec();
+            seeded::unmask(&mut frames);
+            self.put(&frames);
+            return Ok(buf.len());
+        }
+        self.put(buf);
         Ok(buf.len())
     }
     fn flush(&mut self) -> std::io::Result<()> {
         Ok(())
+    }
+}
+
+/// THE ACCEPTED UPGRADE REQUEST'S KEY CHECK, run by the protocol machine before it answers `101`
+/// (its handshake callback): a `Sec-WebSocket-Key` that is not a base64-encoded 16-byte nonce
+/// (RFC 6455 §4.2.1 item 5) is answered `400`.
+type KeyCheck = fn(&UpgradeRequest, UpgradeResponse) -> Result<UpgradeResponse, ErrorResponse>;
+
+// The error type is the protocol library's callback shape, not this crate's choice.
+#[allow(clippy::result_large_err)]
+fn check_key(
+    request: &UpgradeRequest,
+    response: UpgradeResponse,
+) -> Result<UpgradeResponse, ErrorResponse> {
+    match request.headers().get("sec-websocket-key") {
+        Some(key) if key_is_nonce(key.as_bytes()) => Ok(response),
+        _ => Err(handshake_error(StatusCode::BAD_REQUEST)),
+    }
+}
+
+/// A `Sec-WebSocket-Key` that decodes to 16 bytes (RFC 6455 §4.1 item 7): 22 characters of the
+/// base64 alphabet and the `==` padding.
+fn key_is_nonce(key: &[u8]) -> bool {
+    key.len() == 24
+        && key.ends_with(b"==")
+        && key[..22]
+            .iter()
+            .all(|b| b.is_ascii_alphanumeric() || *b == b'+' || *b == b'/')
+}
+
+/// THE HTTP ERROR AN ACCEPTED UPGRADE REQUEST THAT BREAKS THE HANDSHAKE RULES IS ANSWERED WITH
+/// (RFC 6455 §4.2.1, §4.4), the connection closing after it: `426 Upgrade Required` names the one
+/// version this end speaks (`Sec-WebSocket-Version: 13`) and the upgrade it requires (RFC 9110
+/// §15.5.22); any other status carries no field of its own. No body.
+fn handshake_error(status: StatusCode) -> ErrorResponse {
+    let mut answer = ErrorResponse::new(None);
+    *answer.status_mut() = status;
+    let fields = answer.headers_mut();
+    if status == StatusCode::UPGRADE_REQUIRED {
+        fields.insert("sec-websocket-version", HeaderValue::from_static("13"));
+        fields.insert("upgrade", HeaderValue::from_static("websocket"));
+        fields.insert("connection", HeaderValue::from_static("Upgrade, close"));
+    } else {
+        fields.insert("connection", HeaderValue::from_static("close"));
+    }
+    fields.insert("content-length", HeaderValue::from_static("0"));
+    answer
+}
+
+/// The status an accepted handshake's failure is answered with; `None` when there is no one to
+/// answer (the carrier ended before the request did).
+fn handshake_error_status(e: &WsError) -> Option<StatusCode> {
+    match e {
+        WsError::Protocol(ProtocolError::HandshakeIncomplete) | WsError::Io(_) => None,
+        WsError::Protocol(ProtocolError::MissingSecWebSocketVersionHeader) => {
+            Some(StatusCode::UPGRADE_REQUIRED)
+        }
+        // The key check's own answer ([`check_key`]).
+        WsError::Http(answer) => Some(answer.status()),
+        _ => Some(StatusCode::BAD_REQUEST),
     }
 }
 
@@ -121,7 +376,10 @@ type Conn = Arc<Mutex<Option<Phase>>>;
 /// Where one framing state is.
 enum Phase {
     /// An accepted connection waiting for (the rest of) the upgrade request.
-    Accepting(MidHandshake<ServerHandshake<Pipe, NoCallback>>),
+    Accepting(MidHandshake<ServerHandshake<Pipe, KeyCheck>>),
+    /// An accepted connection whose upgrade request broke the handshake rules: its HTTP error
+    /// went out ([`handshake_error`]), its frames ended failed, and nothing more is read.
+    Refused(Pipe),
     /// A dialled connection waiting for (the rest of) the upgrade response, with the messages
     /// written before it completes (each with its text flag) and the pieces of one not yet marked
     /// complete.
@@ -132,11 +390,13 @@ enum Phase {
     },
     /// The session: the protocol machine, the pieces of an outbound message not yet marked
     /// complete, and the failure that ended the inbound frames (its close code), if the far side
-    /// broke the protocol.
+    /// broke the protocol. `lost`: the carrier ended with no closing handshake (RFC 6455 §7.1.5:
+    /// an abnormal close, 1006, which no frame ever carries): the frames ended failed.
     Open {
         ws: Box<WebSocket<Pipe>>,
         message: Vec<u8>,
         failed: Option<CloseCode>,
+        lost: bool,
     },
     /// A dialled connection the far end answered with something other than `101`: its answer's
     /// head was handed up as the stream's head, then its body: `left` bytes of it still to come
@@ -162,6 +422,7 @@ impl Phase {
             ws: Box::new(ws),
             message,
             failed: None,
+            lost: false,
         }
     }
 }
@@ -172,7 +433,7 @@ impl Phase {
             Phase::Accepting(mid) => mid.get_mut().get_mut(),
             Phase::Dialling { mid, .. } => mid.get_mut().get_mut(),
             Phase::Open { ws, .. } => ws.get_mut(),
-            Phase::Answered { pipe, .. } => pipe,
+            Phase::Answered { pipe, .. } | Phase::Refused(pipe) => pipe,
         }
     }
 }
@@ -202,10 +463,12 @@ pub(crate) struct WsFramer {
     /// door takes it ([`WsFramer::take_reason`]).
     reasons: Mutex<HashMap<u64, Vec<u8>>>,
     /// Dials awaiting their auth's answer, by the op's ticket, each with the op's deadline
-    /// ([`WsFramer::open_signed`]).
+    /// ([`WsFramer::open_signed_to`]).
     parked: Mutex<HashMap<(u32, u32), (u64, Phase)>>,
     next: AtomicU64,
-    max_message_bytes: usize,
+    /// The message ceiling (`0` = the protocol library's own default): read when a connection is
+    /// built and when a message is written, and set again by a refresh.
+    max_message_bytes: AtomicUsize,
 }
 
 impl std::fmt::Debug for WsFramer {
@@ -480,11 +743,28 @@ fn content_length(headers: &HeaderMap) -> Option<u64> {
 /// A dialled head's REASON PHRASE (HEAD-FIELDS: the dialled side fills `reason`, HTTP/1 as sent):
 /// the status line's text after its code, once the line is whole (`HTTP/1.1 401 Unauthorized` →
 /// `Unauthorized`); `None` before the line ends, or for a line with no phrase.
+///
+/// A line ends at its LF, a CR before it dropped: a bare LF ends a line as the protocol library's
+/// parser reads it (RFC 9112 §2.2).
 pub(crate) fn reason_phrase(seen: &[u8]) -> Option<Vec<u8>> {
-    let end = seen.windows(2).position(|w| w == b"\r\n")?;
-    let mut parts = seen[..end].splitn(3, |b| *b == b' ');
+    let end = seen.iter().position(|b| *b == b'\n')?;
+    let line = &seen[..end];
+    let line = line.strip_suffix(b"\r").unwrap_or(line);
+    let mut parts = line.splitn(3, |b| *b == b' ');
     let (_version, _code) = (parts.next()?, parts.next()?);
     parts.next().filter(|r| !r.is_empty()).map(<[u8]>::to_vec)
+}
+
+/// Where a response head ends in `seen`: just past the empty line that closes it, its lines ended
+/// by CRLF or by a bare LF, as the protocol library's parser accepts them (RFC 9112 §2.2); every
+/// byte from there is the body. `seen.len()` while no empty line has come.
+fn head_end(seen: &[u8]) -> usize {
+    let crlf = seen.windows(3).position(|w| w == b"\n\r\n").map(|p| p + 3);
+    let lf = seen.windows(2).position(|w| w == b"\n\n").map(|p| p + 2);
+    match (crlf, lf) {
+        (Some(a), Some(b)) => a.min(b),
+        (a, b) => a.or(b).unwrap_or(seen.len()),
+    }
 }
 
 /// A refused upgrade's BODY: frame what the pipe holds, decoded by its transfer coding when it is
@@ -497,7 +777,7 @@ fn answered_body(
     left: Option<u64>,
     chunked: Option<Box<Dechunk>>,
     first: bool,
-    out: &mut dyn FramerOut,
+    out: &mut dyn Output,
 ) -> (Phase, bool) {
     if left == Some(0) {
         pipe.inbound.clear();
@@ -568,19 +848,75 @@ pub(crate) fn close_code_of_status(status: u32) -> CloseCode {
     }
 }
 
-/// Hand whatever the machine wrote to core.
-fn drain(phase: &mut Phase, out: &mut dyn FramerOut) {
-    #[cfg(feature = "test-seeded")]
-    let open = matches!(phase, Phase::Open { .. });
-    let pipe = phase.pipe();
-    if !pipe.outbound.is_empty() {
-        #[cfg(feature = "test-seeded")]
-        if open && pipe.client {
-            seeded::unmask(&mut pipe.outbound);
-        }
-        out.send(&pipe.outbound);
-        pipe.outbound.clear();
+/// WHAT A FRAMER OP HANDS ITS OUTPUT TO, past the contract's [`FramerOut`]: the door's answer
+/// lends the host's own wire buffer for the session's frames to be written into in place, takes
+/// the bytes waiting in a pipe as they stand, and takes a message's payload as the protocol machine
+/// completed it, so nothing of a message is copied again inside this plugin. Off the door
+/// ([`Plain`]) each falls back to the contract's own call.
+pub(crate) trait Output: FramerOut {
+    /// The host's wire buffer past what this answer already wrote into it, for the machine to
+    /// write into in place; `None`: none (off the door, or bytes owed from an earlier call go
+    /// first).
+    fn window(&mut self) -> Option<&mut [u8]> {
+        None
     }
+
+    /// `n` bytes were written into the buffer [`Output::window`] lent.
+    fn wrote(&mut self, _n: usize) {}
+
+    /// Bytes for the far side, in order, taken as they stand: `bytes` is left empty.
+    fn send_owned(&mut self, bytes: &mut Vec<u8>) {
+        self.send(bytes.as_slice());
+        bytes.clear();
+    }
+
+    /// One whole message for the layer above (`text`: a text message), its payload as the
+    /// protocol machine completed it.
+    fn message(&mut self, payload: Bytes, text: bool) {
+        self.frame(Framed::plain(StreamId(0), &payload, true).text(text));
+    }
+}
+
+/// A contract [`FramerOut`] as an [`Output`]: no buffer is lent, and everything goes through the
+/// contract's own calls.
+struct Plain<'a>(&'a mut dyn FramerOut);
+
+impl FramerOut for Plain<'_> {
+    fn send(&mut self, bytes: &[u8]) {
+        self.0.send(bytes);
+    }
+    fn frame(&mut self, piece: Framed<'_>) {
+        self.0.frame(piece);
+    }
+    fn end(&mut self) {
+        self.0.end();
+    }
+    fn now(&self) -> HostTime {
+        self.0.now()
+    }
+    fn wake_at(&mut self, monotonic_nanos: Option<u64>) {
+        self.0.wake_at(monotonic_nanos);
+    }
+}
+
+impl Output for Plain<'_> {}
+
+/// Hand whatever the machine wrote to core: end the loan of the host's wire buffer (what went
+/// into it is told), then hand on what waits in the pipe.
+fn drain(phase: &mut Phase, out: &mut dyn Output) {
+    let pipe = phase.pipe();
+    let wrote = pipe.window.release();
+    if wrote > 0 {
+        out.wrote(wrote);
+    }
+    if !pipe.outbound.is_empty() {
+        out.send_owned(&mut pipe.outbound);
+    }
+}
+
+/// Lend the host's wire buffer (when `out` lends one) to a session's machine for this call.
+fn lend_window(ws: &mut WebSocket<Pipe>, out: &mut dyn Output) {
+    ws.get_mut().window.lend(out.window());
 }
 
 /// THE TEST HARNESS'S SEED (`test-seeded`, a dev-dependency feature the published conformance
@@ -634,7 +970,7 @@ mod seeded {
 impl WsFramer {
     /// Close `state` with `code` (a connection the far side failed closes with the failure's
     /// code instead), handing what the machine wrote to core, and forget it.
-    fn close_with(&self, state: u64, code: CloseCode, out: &mut dyn FramerOut) {
+    fn close_with(&self, state: u64, code: CloseCode, out: &mut dyn Output) {
         let Some(conn) = self.map().remove(&state) else {
             return;
         };
@@ -645,6 +981,7 @@ impl WsFramer {
             return;
         };
         if let Phase::Open { ws, failed, .. } = &mut phase {
+            lend_window(ws, out);
             // The close frame is a courtesy on a connection already finalised: what the machine
             // could write goes out, and a close it cannot write is not an error anyone can act on.
             // A connection the far side failed closes with the failure's code, whatever the reason
@@ -668,14 +1005,35 @@ impl WsFramer {
     pub(crate) fn refusal_with(
         &self,
         state: u64,
-        _stream: Option<StreamId>,
+        stream: Option<StreamId>,
         bytes: &[u8],
         status: u32,
         out: &mut dyn FramerOut,
     ) -> Result<(), TransportError> {
-        let sent = self.emit(state, StreamId(0), bytes, true, false, out);
+        self.refusal_to(state, stream, bytes, status, &mut Plain(out))
+    }
+
+    /// [`Self::refusal_with`] into an [`Output`].
+    ///
+    /// # Errors
+    ///
+    /// As [`Framer::refusal`].
+    pub(crate) fn refusal_to(
+        &self,
+        state: u64,
+        _stream: Option<StreamId>,
+        bytes: &[u8],
+        status: u32,
+        out: &mut dyn Output,
+    ) -> Result<(), TransportError> {
+        let sent = self.emit_to(state, bytes, true, false, out);
         self.close_with(state, close_code_of_status(status), out);
         sent
+    }
+
+    /// [`Framer::close`] into an [`Output`].
+    pub(crate) fn close_to(&self, state: u64, reason: CloseReason, out: &mut dyn Output) {
+        self.close_with(state, close_code_for(reason), out);
     }
 
     /// A framer whose messages (and frames) are capped at `max_message_bytes`; `0` = the protocol
@@ -687,15 +1045,28 @@ impl WsFramer {
             reasons: Mutex::new(HashMap::new()),
             parked: Mutex::new(HashMap::new()),
             next: AtomicU64::new(1),
-            max_message_bytes,
+            max_message_bytes: AtomicUsize::new(max_message_bytes),
         }
     }
 
+    /// THE REFRESHED CEILING: every connection built after this, and every message written after
+    /// it, is held to `max_message_bytes` (`0` = the protocol library's own default).
+    pub(crate) fn set_max_message_bytes(&self, max_message_bytes: usize) {
+        self.max_message_bytes
+            .store(max_message_bytes, Ordering::Relaxed);
+    }
+
+    /// The message ceiling now.
+    fn max_message_bytes(&self) -> usize {
+        self.max_message_bytes.load(Ordering::Relaxed)
+    }
+
     fn config(&self) -> Option<WebSocketConfig> {
-        (self.max_message_bytes > 0).then(|| {
+        let max = self.max_message_bytes();
+        (max > 0).then(|| {
             WebSocketConfig::default()
-                .max_message_size(Some(self.max_message_bytes))
-                .max_frame_size(Some(self.max_message_bytes))
+                .max_message_size(Some(max))
+                .max_frame_size(Some(max))
         })
     }
 
@@ -712,8 +1083,36 @@ impl WsFramer {
         fields: &[(String, Vec<u8>)],
         out: &mut dyn FramerOut,
     ) -> Result<u64, TransportError> {
+        self.open_to(side, target, fields, &mut Plain(out))
+    }
+
+    /// [`Self::open_with`] into an [`Output`].
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::open_with`].
+    pub(crate) fn open_to(
+        &self,
+        side: Side,
+        target: &str,
+        fields: &[(String, Vec<u8>)],
+        out: &mut dyn Output,
+    ) -> Result<u64, TransportError> {
         let phase = self.start(side, target, fields, out)?;
         Ok(self.hold(phase))
+    }
+
+    /// [`Self::open_signed_to`] into a contract [`FramerOut`] (the tests' face).
+    #[cfg(test)]
+    pub(crate) fn open_signed(
+        &self,
+        parking: Parking,
+        target: &str,
+        fields: &[(String, Vec<u8>)],
+        sign: Signer<'_>,
+        out: &mut dyn FramerOut,
+    ) -> Poll<Result<u64, TransportError>> {
+        self.open_signed_to(parking, target, fields, sign, &mut Plain(out))
     }
 
     /// [`Self::open_with`] for a dial whose binding has an auth at the head (`BeginIn::points`):
@@ -726,13 +1125,13 @@ impl WsFramer {
     /// # Errors
     ///
     /// As [`Self::open_with`]; the auth refused, or answered a line the request cannot carry.
-    pub(crate) fn open_signed(
+    pub(crate) fn open_signed_to(
         &self,
         parking: Parking,
         target: &str,
         fields: &[(String, Vec<u8>)],
         sign: Signer<'_>,
-        out: &mut dyn FramerOut,
+        out: &mut dyn Output,
     ) -> Poll<Result<u64, TransportError>> {
         let mut phase = match self.unpark(parking) {
             Some(phase) => phase,
@@ -814,14 +1213,31 @@ impl WsFramer {
         text: bool,
         out: &mut dyn FramerOut,
     ) -> Result<(), TransportError> {
+        self.emit_to(state, bytes, end_of_frame, text, &mut Plain(out))
+    }
+
+    /// [`Self::emit_text`] into an [`Output`]: the session's frames are written straight into
+    /// the host's wire buffer when the door lends it.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::emit_text`].
+    pub(crate) fn emit_to(
+        &self,
+        state: u64,
+        bytes: &[u8],
+        end_of_frame: bool,
+        text: bool,
+        out: &mut dyn Output,
+    ) -> Result<(), TransportError> {
         let conn = self.conn(state)?;
         let mut guard = Self::enter(&conn)?;
+        let max = self.max_message_bytes();
         if let Some(Phase::Dialling { held, message, .. }) = guard.as_mut() {
             // HELD, AND BOUNDED: a message over the ceiling is refused as the open connection
             // would refuse it (a capacity failure), and so is one past the held count, so a dial
             // whose far end never answers cannot grow the framing without end.
-            let over = self.max_message_bytes > 0
-                && message.len().saturating_add(bytes.len()) > self.max_message_bytes;
+            let over = max > 0 && message.len().saturating_add(bytes.len()) > max;
             if over || (end_of_frame && held.len() >= MAX_HELD_MESSAGES) {
                 // The refused message's gathered pieces go with it, as the open path drops them:
                 // none is sent glued to the front of the next message.
@@ -840,7 +1256,6 @@ impl WsFramer {
             }
             return Ok(());
         }
-        let max = self.max_message_bytes;
         Self::with_open(guard.as_mut(), out, |ws, message| {
             // THE CEILING, OUTBOUND TOO: the machine bounds only what it reads, so a message this
             // end writes is held to the same ceiling here, as a held one is above (a capacity
@@ -859,8 +1274,10 @@ impl WsFramer {
                 message.extend_from_slice(bytes);
                 return Ok(());
             }
-            // A message emitted whole is copied once, into the payload the machine sends; one
-            // emitted in pieces is the pieces gathered.
+            // A message emitted whole is copied into the payload the machine sends (the machine
+            // takes its payload owned, and the host's bytes are lent for this call only); one
+            // emitted in pieces is the pieces gathered. The machine frames it into its own buffer
+            // and writes that straight into the host's wire buffer.
             let whole = if message.is_empty() {
                 Bytes::copy_from_slice(bytes)
             } else {
@@ -927,11 +1344,12 @@ impl WsFramer {
         side: Side,
         target: &str,
         fields: &[(String, Vec<u8>)],
-        out: &mut dyn FramerOut,
+        out: &mut dyn Output,
     ) -> Result<Phase, TransportError> {
         let mut phase = match side {
             Side::Accept => {
-                match tungstenite::accept_with_config(Pipe::default(), self.config()) {
+                let check: KeyCheck = check_key;
+                match tungstenite::accept_hdr_with_config(Pipe::default(), check, self.config()) {
                     Err(HandshakeError::Interrupted(mid)) => Phase::Accepting(mid),
                     // Nothing has been read, so nothing can have completed or failed yet.
                     Ok(_) | Err(HandshakeError::Failure(_)) => {
@@ -990,17 +1408,24 @@ impl WsFramer {
     /// dialled head's reason phrase the moment that head is handed up.
     fn drive(
         phase: Phase,
-        out: &mut dyn FramerOut,
+        out: &mut dyn Output,
     ) -> Result<(Phase, bool, Option<Vec<u8>>), TransportError> {
         let mut phase = match phase {
             Phase::Answered {
-                pipe,
+                mut pipe,
                 left,
                 chunked,
                 ..
             } => {
+                // A refused upgrade's body is read off the pipe's own queue.
+                pipe.settle();
                 let (phase, ended) = answered_body(pipe, left, chunked, false, out);
                 return Ok((phase, ended, None));
+            }
+            // The error answer went out and the frames ended: what still arrives is nobody's.
+            Phase::Refused(mut pipe) => {
+                pipe.discard();
+                return Ok((Phase::Refused(pipe), false, None));
             }
             phase => phase,
         };
@@ -1022,15 +1447,32 @@ impl WsFramer {
             Phase::Accepting(mid) => match mid.handshake() {
                 Ok(mut ws) => {
                     ws.get_mut().seen = Vec::new();
+                    ws.get_mut().framing = true;
                     Phase::open(ws, Vec::new())
                 }
                 Err(HandshakeError::Interrupted(mid)) => {
                     return Ok((Phase::Accepting(mid), false, None))
                 }
-                Err(HandshakeError::Failure(_)) => return Err(TransportError::HandshakeFailed),
+                // THE UPGRADE REQUEST BROKE THE HANDSHAKE RULES (RFC 6455 §4.2.1, §4.4): it is
+                // answered with its HTTP error, written by the protocol library's own response
+                // writer and handed out as every other byte is, and the frames end (failed). The
+                // machine that failed took its stream with it, so the answer is written afresh
+                // (the key check's own answer included). A request the carrier cut short has no
+                // one to answer.
+                Err(HandshakeError::Failure(e)) => {
+                    let Some(status) = handshake_error_status(&e) else {
+                        return Err(TransportError::HandshakeFailed);
+                    };
+                    let mut pipe = Pipe::default();
+                    if write_response(&mut pipe, &handshake_error(status)).is_err() {
+                        return Err(TransportError::HandshakeFailed);
+                    }
+                    return Ok((Phase::Refused(pipe), true, None));
+                }
             },
             Phase::Dialling { mid, held, message } => match mid.handshake() {
                 Ok((mut ws, response)) => {
+                    ws.get_mut().framing = true;
                     // THE FAR END ANSWERED (HEAD-FIELDS): its switching response is the stream's
                     // head, handed up before anything else, with its status and its field block.
                     // A far end that answered the upgrade and sends nothing more has answered.
@@ -1072,10 +1514,7 @@ impl WsFramer {
                         ..Framed::plain(StreamId(0), &block, true)
                     });
                     let (seen, carrier_ended) = shaken.unwrap_or_default();
-                    let at = seen
-                        .windows(4)
-                        .position(|w| w == b"\r\n\r\n")
-                        .map_or(seen.len(), |p| p + 4);
+                    let at = head_end(&seen);
                     let pipe = Pipe {
                         inbound: seen[at..].iter().copied().collect(),
                         ended: carrier_ended,
@@ -1100,23 +1539,25 @@ impl WsFramer {
             },
             open => open,
         };
-        let Phase::Open { ws, failed, .. } = &mut phase else {
+        let Phase::Open {
+            ws, failed, lost, ..
+        } = &mut phase
+        else {
             unreachable!("every other phase returned above");
         };
         // The head just handed up carries its reason; an open session's later calls carry none.
         let reason = if shaking { reason } else { None };
-        if failed.is_some() {
+        if failed.is_some() || *lost {
             // The frames ended at the failure: what still arrives is nobody's.
-            ws.get_mut().inbound.clear();
+            ws.get_mut().discard();
             return Ok((phase, false, None));
         }
         let mut ended = false;
         loop {
             match ws.read() {
-                Ok(Message::Binary(b)) => out.frame(Framed::plain(StreamId(0), &b, true)),
-                Ok(Message::Text(t)) => {
-                    out.frame(Framed::plain(StreamId(0), t.as_bytes(), true).text(true));
-                }
+                // Each message goes up as the machine completed it: its own buffer, not a copy.
+                Ok(Message::Binary(b)) => out.message(b, false),
+                Ok(Message::Text(t)) => out.message(Bytes::from(t), true),
                 // A ping's pong is queued by the machine and goes out with the next bytes; a pong and
                 // a raw frame carry nothing for the layer above.
                 Ok(Message::Ping(_) | Message::Pong(_) | Message::Frame(_)) => {}
@@ -1132,9 +1573,12 @@ impl WsFramer {
                     break;
                 }
                 // The carrier ended with no closing handshake (a dropped connection, a closed
-                // tab): every message completed before it was handed up above, and the stream
-                // ends here. That is the connection going away, not a protocol the far side broke.
+                // tab): every message completed before it was handed up above, and the frames end
+                // here FAILED, never whole: RFC 6455 §7.1.5 names this close 1006, abnormal, and a
+                // message it cut short is lost. No close frame can follow (1006 is never sent), and
+                // it is no protocol the far side broke.
                 Err(WsError::Protocol(ProtocolError::ResetWithoutClosingHandshake)) => {
+                    *lost = true;
                     ended = true;
                     break;
                 }
@@ -1150,7 +1594,7 @@ impl WsFramer {
             }
         }
         if failed.is_some() {
-            ws.get_mut().inbound.clear();
+            ws.get_mut().discard();
             ended = true;
         }
         // Whatever the machine owes the far side (a pong, a close answer) goes out now.
@@ -1160,20 +1604,21 @@ impl WsFramer {
             Err(e) => return Err(read_error(&e)),
         }
         let pipe = ws.get_mut();
-        ended |= pipe.ended && pipe.inbound.is_empty();
+        ended |= pipe.ended && pipe.drained();
         Ok((phase, ended, reason))
     }
 
     /// Run `op` on the open state `state`, handing what it wrote to core.
     fn with_open(
         phase: Option<&mut Phase>,
-        out: &mut dyn FramerOut,
+        out: &mut dyn Output,
         op: impl FnOnce(&mut WebSocket<Pipe>, &mut Vec<u8>) -> Result<(), WsError>,
     ) -> Result<(), TransportError> {
         let phase = phase.ok_or(TransportError::Closed)?;
         let Phase::Open { ws, message, .. } = phase else {
             return Err(TransportError::Closed);
         };
+        lend_window(ws, out);
         let done = op(ws, message);
         drain(phase, out);
         done.map_err(|e| match e {
@@ -1184,19 +1629,18 @@ impl WsFramer {
     }
 }
 
-/// One `ws://`/`wss://` URL, read into `(secure, host, port, path)`. Strict over the scheme, with
-/// the authority read by the contract's one URL reader ([`busbar_contract::net::parse_url`], WHATWG
-/// rules): it ends at `/`, `?`, `#` or `\` exactly where the handshake's parser ends it, the host
-/// comes back unbracketed, and a userinfo is refused. The path always opens with `/`.
+/// One `ws://`/`wss://` URL, read into `(secure, host, port, path)` by the contract's one URL
+/// reader ([`busbar_contract::net::parse_url`], WHATWG rules): the scheme is read without case
+/// (RFC 3986 §3.1: `WSS://` is `wss://`), and only `ws` or `wss` is taken; the authority ends at
+/// `/`, `?`, `#` or `\` exactly where the handshake's parser ends it, the host comes back
+/// unbracketed, and a userinfo is refused. The path always opens with `/`.
 pub(crate) fn split_ws_url(url: &str) -> Result<(bool, String, u16, String), TransportError> {
-    let secure = if url.starts_with("wss://") {
-        true
-    } else if url.starts_with("ws://") {
-        false
-    } else {
-        return Err(TransportError::AddressRefused);
-    };
     let parts = busbar_contract::net::parse_url(url).map_err(|_| TransportError::AddressRefused)?;
+    let secure = match parts.scheme.as_str() {
+        "wss" => true,
+        "ws" => false,
+        _ => return Err(TransportError::AddressRefused),
+    };
     if parts.userinfo {
         return Err(TransportError::AddressRefused);
     }
@@ -1370,9 +1814,10 @@ fn authority_host(host: &str) -> String {
     }
 }
 
-/// The upgrade request's URL for a dial to `url`: its scheme, host (an IPv6 literal bracketed),
-/// port only where the target spelled one, and path, so the request's `Host` is the target's
-/// authority as written.
+/// The upgrade request's URL for a dial to `url`: its scheme (lower-case), its host as the URL
+/// reader normalises it (percent-decoded, a trailing dot dropped; an IPv6 literal bracketed), the
+/// port only where the target spelled one, and its path. The request's `Host` is that host and
+/// port: the target's normalised host, not its authority as written.
 fn request_url(url: &str) -> Result<String, TransportError> {
     let (secure, host, _, path) = split_ws_url(url)?;
     let port = busbar_contract::net::parse_url(url)
@@ -1387,9 +1832,10 @@ fn request_url(url: &str) -> Result<String, TransportError> {
 }
 
 impl WsFramer {
-    /// Whether the far side FAILED the connection in `state` (a protocol violation, text that is
-    /// not UTF-8, a message over the ceiling), or a refused upgrade's body was cut short by the
-    /// carrier's end: its frames ended failed, not cleanly.
+    /// Whether the frames of the connection in `state` ended FAILED, not cleanly: the far side
+    /// failed it (a protocol violation, text that is not UTF-8, a message over the ceiling), the
+    /// carrier ended with no closing handshake, its upgrade request broke the handshake rules, or
+    /// a refused upgrade's body was cut short by the carrier's end.
     pub(crate) fn failed(&self, state: u64) -> bool {
         let Ok(conn) = self.conn(state) else {
             return false;
@@ -1403,9 +1849,84 @@ impl WsFramer {
                 Phase::Open {
                     failed: Some(_),
                     ..
-                } | Phase::Answered { short: true, .. }
+                } | Phase::Open { lost: true, .. }
+                    | Phase::Answered { short: true, .. }
+                    | Phase::Refused(_)
             )
         )
+    }
+
+    /// [`Framer::ingest`] into an [`Output`]. The machine reads `bytes` where they lie (the host
+    /// lends them for this call only) and, on a running session, writes straight into the host's
+    /// wire buffer when the door lends it; what it does not read this call is kept for the next.
+    ///
+    /// # Errors
+    ///
+    /// As [`Framer::ingest`].
+    pub(crate) fn ingest_to(
+        &self,
+        state: u64,
+        bytes: &[u8],
+        end: bool,
+        out: &mut dyn Output,
+    ) -> Result<(), TransportError> {
+        let conn = self.conn(state)?;
+        let mut held = Self::enter(&conn)?;
+        let mut phase = held.take().ok_or(TransportError::Closed)?;
+        let dialling = matches!(phase, Phase::Dialling { .. });
+        let open = matches!(phase, Phase::Open { .. });
+        let pipe = phase.pipe();
+        pipe.lent.lend(bytes);
+        pipe.ended |= end;
+        if open {
+            pipe.window.lend(out.window());
+        }
+        // Only a dialled head is read back off what the handshake saw (its reason phrase, a
+        // refusal's body); an accepting handshake keeps no copy.
+        if dialling {
+            pipe.seen.extend_from_slice(bytes);
+        }
+        match Self::drive(phase, out) {
+            Ok((mut phase, ended, reason)) => {
+                if let Some(reason) = reason {
+                    self.reasons
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .insert(state, reason);
+                }
+                drain(&mut phase, out);
+                phase.pipe().settle();
+                if ended {
+                    out.end();
+                }
+                *held = Some(phase);
+                Ok(())
+            }
+            // A failed state is gone: its connection has nothing more to say.
+            Err(e) => {
+                drop(held);
+                self.map().remove(&state);
+                self.take_reason(state);
+                Err(e)
+            }
+        }
+    }
+
+    /// [`Framer::adopt`] into an [`Output`].
+    ///
+    /// # Errors
+    ///
+    /// As [`Framer::adopt`].
+    pub(crate) fn adopt_to(
+        &self,
+        side: Side,
+        _facts: &ConnFacts,
+        leftover: &[u8],
+        out: &mut dyn Output,
+    ) -> Result<u64, TransportError> {
+        let state = self.open_to(side, "", &[], out)?;
+        self.ingest_to(state, leftover, false, out)?;
+        Ok(state)
     }
 }
 
@@ -1456,41 +1977,7 @@ impl Framer for WsFramer {
         end: bool,
         out: &mut dyn FramerOut,
     ) -> Result<(), TransportError> {
-        let conn = self.conn(state)?;
-        let mut held = Self::enter(&conn)?;
-        let mut phase = held.take().ok_or(TransportError::Closed)?;
-        let dialling = matches!(phase, Phase::Dialling { .. });
-        let pipe = phase.pipe();
-        pipe.inbound.extend(bytes);
-        pipe.ended |= end;
-        // Only a dialled head is read back off what the handshake saw (its reason phrase, a
-        // refusal's body); an accepting handshake keeps no copy.
-        if dialling {
-            pipe.seen.extend_from_slice(bytes);
-        }
-        match Self::drive(phase, out) {
-            Ok((mut phase, ended, reason)) => {
-                if let Some(reason) = reason {
-                    self.reasons
-                        .lock()
-                        .unwrap_or_else(PoisonError::into_inner)
-                        .insert(state, reason);
-                }
-                drain(&mut phase, out);
-                if ended {
-                    out.end();
-                }
-                *held = Some(phase);
-                Ok(())
-            }
-            // A failed state is gone: its connection has nothing more to say.
-            Err(e) => {
-                drop(held);
-                self.map().remove(&state);
-                self.take_reason(state);
-                Err(e)
-            }
-        }
+        self.ingest_to(state, bytes, end, &mut Plain(out))
     }
 
     fn emit(
@@ -1530,7 +2017,7 @@ impl Framer for WsFramer {
     }
 
     fn close(&self, state: u64, reason: CloseReason, out: &mut dyn FramerOut) {
-        self.close_with(state, close_code_for(reason), out);
+        self.close_to(state, reason, &mut Plain(out));
     }
 
     /// A WebSocket state keeps no deadline of its own (it never states one), so a tick finds nothing
@@ -1558,8 +2045,6 @@ impl Framer for WsFramer {
         leftover: &[u8],
         out: &mut dyn FramerOut,
     ) -> Result<u64, TransportError> {
-        let state = self.open(side, "", facts, out)?;
-        self.ingest(state, leftover, false, out)?;
-        Ok(state)
+        self.adopt_to(side, facts, leftover, &mut Plain(out))
     }
 }

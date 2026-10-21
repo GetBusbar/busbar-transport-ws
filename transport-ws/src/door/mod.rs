@@ -8,8 +8,14 @@
 //! Each framer op is the framer's own method, answered into the host's sink. What does not fit the
 //! sink waits in the framing's queue and goes out on the `YIELD_MORE` re-call, which carries no new
 //! bytes. A WebSocket connection carries one message stream (stream `0`): each message is a frame,
-//! and when the connection's frames end the stream ends with its `PIECE_END` piece and the answer carries
-//! `YIELD_ENDED`.
+//! and when the connection's frames end the stream ends with its `PIECE_END` piece (or, when they
+//! ended failed, `PIECE_STREAM_FAILED`) and the answer carries `YIELD_ENDED`.
+//!
+//! A MESSAGE IS COPIED ONCE INSIDE THIS PLUGIN (THE DESIGN §11.2): a session's frames are written
+//! by the protocol machine straight into the host's wire buffer, which the answer lends it, and an
+//! inbound message waits in the framing's queue as the machine's own buffer until it is written
+//! into the host's frame buffer. The transport ABI's answers are written into HOST buffers
+//! (`FramerSink`): that write is the ABI's, not a copy this plugin makes for itself.
 //!
 //! A DIALLED framing's stream opens with its HEAD (HEAD-FIELDS): the far end's switching-protocols
 //! response, the moment it completes the handshake, as ONE `PIECE_FIELDS` frame carrying its status
@@ -63,7 +69,9 @@ use busbar_contract::transport::{
 };
 use busbar_contract::TransportMeta;
 
-use crate::transport::{AuthLine, Parking, UpgradeHead, WsFramer};
+use tungstenite::Bytes;
+
+use crate::transport::{AuthLine, Output, Parking, UpgradeHead, WsFramer};
 
 // This crate's own seal over what the binding's auth answers (`Services::auth_call`): the auth
 // fields joining a dialled head are credential material, held as this crate's own secret.
@@ -248,7 +256,9 @@ pub const STATEMENT: Statement = Statement {
 /// One frame piece waiting for the host.
 struct Piece {
     stream: u64,
-    bytes: Vec<u8>,
+    /// The piece's bytes: a message's as the protocol machine completed it (never copied), or a
+    /// head's or a refused upgrade's body.
+    bytes: Bytes,
     end_of_frame: bool,
     /// The bytes belong to a text message (`PIECE_TEXT`).
     text: bool,
@@ -275,7 +285,7 @@ struct Piece {
 
 impl Piece {
     /// A piece that is no head and states no status.
-    fn plain(stream: u64, bytes: Vec<u8>, end_of_frame: bool) -> Self {
+    fn plain(stream: u64, bytes: Bytes, end_of_frame: bool) -> Self {
         Self {
             stream,
             bytes,
@@ -331,13 +341,13 @@ fn field_cut(bytes: &[u8], room: usize, in_value: bool) -> usize {
 /// What one framing owes the host and has not been able to hand it.
 #[derive(Default)]
 struct Owed {
-    /// Bytes owed to the far side: a dialled upgrade request carries its auth's credential lines,
-    /// so every byte leaves this buffer wiped ([`push_wiped`], [`consume_wiped`], and on drop).
+    /// Bytes owed to the far side, from `wire_from` on: a dialled upgrade request carries its
+    /// auth's credential lines, so every byte leaves this buffer wiped ([`Owed::owe`],
+    /// [`Owed::consume`], and on drop).
     wire: Vec<u8>,
+    /// How much of `wire` is already handed over (and wiped): what is handed over is never moved.
+    wire_from: usize,
     pieces: VecDeque<Piece>,
-    /// The byte buffers of pieces already handed over, kept for the next pieces: a framing in
-    /// steady state queues its messages without allocating.
-    spare: Vec<Vec<u8>>,
     ended: bool,
     deadline: Option<u64>,
     error: String,
@@ -349,43 +359,54 @@ impl Drop for Owed {
     }
 }
 
-/// Append `bytes` to `wire`, never leaving a copy behind in a buffer it outgrows.
-fn push_wiped(wire: &mut Vec<u8>, bytes: &[u8]) {
-    if wire.capacity() - wire.len() < bytes.len() {
-        let mut grown = Vec::with_capacity((wire.len() + bytes.len()).max(wire.capacity() * 2));
-        grown.extend_from_slice(wire);
-        wire.zeroize();
-        *wire = grown;
-    }
-    wire.extend_from_slice(bytes);
-}
-
-/// Drop the first `n` bytes of `wire` (handed to the host), wiping every byte the remainder no
-/// longer covers.
-fn consume_wiped(wire: &mut Vec<u8>, n: usize) {
-    let rest = wire.len() - n;
-    wire.copy_within(n.., 0);
-    wire[rest..].zeroize();
-    wire.truncate(rest);
-}
-
-/// The most handed-over piece buffers a framing keeps for reuse.
-const SPARE_MAX: usize = 8;
-
 impl Owed {
-    /// A buffer holding `bytes`, a kept one where there is one.
-    fn buffer(&mut self, bytes: &[u8]) -> Vec<u8> {
-        let mut b = self.spare.pop().unwrap_or_default();
-        b.clear();
-        b.extend_from_slice(bytes);
-        b
+    /// Wire bytes wait for the host.
+    fn wire_owed(&self) -> bool {
+        self.wire_from < self.wire.len()
     }
 
-    /// Keep a handed-over piece's buffer for the next piece.
-    fn recycle(&mut self, b: Vec<u8>) {
-        if self.spare.len() < SPARE_MAX {
-            self.spare.push(b);
+    /// Owe `bytes` after what is owed, never leaving a copy behind in a buffer it outgrows.
+    fn owe(&mut self, bytes: &[u8]) {
+        if self.wire.capacity() - self.wire.len() < bytes.len() {
+            let live = self.wire.len() - self.wire_from;
+            let mut grown = Vec::with_capacity((live + bytes.len()).max(self.wire.capacity() * 2));
+            grown.extend_from_slice(&self.wire[self.wire_from..]);
+            self.wire.zeroize();
+            self.wire = grown;
+            self.wire_from = 0;
         }
+        self.wire.extend_from_slice(bytes);
+    }
+
+    /// `n` owed bytes were handed to the host: wiped where they lie, and the buffer emptied once
+    /// all of it is.
+    fn consume(&mut self, n: usize) {
+        let to = self.wire_from + n;
+        self.wire[self.wire_from..to].zeroize();
+        self.wire_from = to;
+        if self.wire_from == self.wire.len() {
+            self.wire.clear();
+            self.wire_from = 0;
+        }
+    }
+
+    /// Hand the host as much of the owed wire as its buffer holds past `at`; answers how much.
+    fn pour_wire(&mut self, sink: &FramerSink, at: usize) -> usize {
+        let n = (self.wire.len() - self.wire_from).min(sink.wire_cap.saturating_sub(at));
+        if n == 0 {
+            return 0;
+        }
+        // SAFETY: `at + n <= wire_cap`: the run lands inside the host's wire buffer, which no queue
+        // byte overlaps.
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                self.wire.as_ptr().add(self.wire_from),
+                sink.wire.add(at),
+                n,
+            );
+        }
+        self.consume(n);
+        n
     }
 }
 
@@ -410,21 +431,62 @@ impl Instance {
     }
 }
 
-/// The framer's output for one op, collected before it goes to the sink.
+/// The framer's output for one op: its wire bytes written into the host's wire buffer as they
+/// come (what does not fit is owed), its pieces collected before they go to the sink.
 struct Collect<'a> {
     owed: &'a mut Owed,
     now: HostTime,
+    /// The host's buffers for this answer; `None` off an answer, where every byte is owed.
+    sink: Option<&'a FramerSink>,
+    /// How much of the host's wire buffer this answer has written.
+    wire_at: usize,
+}
+
+impl<'a> Collect<'a> {
+    /// The output of one op answered into `sink`: what an earlier answer could not hand over goes
+    /// into the host's wire buffer first.
+    fn new(owed: &'a mut Owed, sink: &'a FramerSink) -> Self {
+        let wire_at = owed.pour_wire(sink, 0);
+        Self {
+            owed,
+            now: time(sink),
+            sink: Some(sink),
+            wire_at,
+        }
+    }
+
+    /// Write as much of `bytes` into the host's wire buffer as it holds, when nothing owed waits
+    /// ahead of them; answers how much.
+    fn place(&mut self, bytes: &[u8]) -> usize {
+        let Some(sink) = self.sink else {
+            return 0;
+        };
+        if self.owed.wire_owed() {
+            return 0;
+        }
+        let n = bytes.len().min(sink.wire_cap.saturating_sub(self.wire_at));
+        if n == 0 {
+            return 0;
+        }
+        // SAFETY: `wire_at + n <= wire_cap`: the run lands inside the host's wire buffer, which
+        // `bytes` (plugin memory) never overlaps.
+        unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), sink.wire.add(self.wire_at), n) };
+        self.wire_at += n;
+        n
+    }
 }
 
 impl Out for Collect<'_> {
     fn send(&mut self, bytes: &[u8]) {
-        push_wiped(&mut self.owed.wire, bytes);
+        let n = self.place(bytes);
+        self.owed.owe(&bytes[n..]);
     }
     fn frame(&mut self, piece: Framed<'_>) {
         // The framer states a status on ONE frame only, the dialled stream's head: a message
-        // never carries one (`crate::transport`).
+        // never carries one (`crate::transport`). A message comes as the machine's own buffer
+        // ([`Output::message`]); what comes here is a head or a refused upgrade's body.
         let head = piece.status_code.is_some();
-        let bytes = self.owed.buffer(piece.bytes);
+        let bytes = Bytes::copy_from_slice(piece.bytes);
         self.owed.pieces.push_back(Piece {
             text: piece.text && !head,
             fields: head,
@@ -440,7 +502,7 @@ impl Out for Collect<'_> {
             // The one stream's frames are over: its empty last piece, then the connection's end.
             self.owed.pieces.push_back(Piece {
                 end: true,
-                ..Piece::plain(0, Vec::new(), true)
+                ..Piece::plain(0, Bytes::new(), true)
             });
         }
         self.owed.ended = true;
@@ -453,9 +515,49 @@ impl Out for Collect<'_> {
     }
 }
 
+impl Output for Collect<'_> {
+    fn window(&mut self) -> Option<&mut [u8]> {
+        let sink = self.sink?;
+        let room = sink.wire_cap.saturating_sub(self.wire_at);
+        if self.owed.wire_owed() || room == 0 || sink.wire.is_null() {
+            return None;
+        }
+        // SAFETY: the host's wire buffer of `wire_cap` bytes, valid for the call; `wire_at + room
+        // == wire_cap`, and nothing else writes past `wire_at` until the loan ends (`wrote`).
+        Some(unsafe { std::slice::from_raw_parts_mut(sink.wire.add(self.wire_at), room) })
+    }
+
+    fn wrote(&mut self, n: usize) {
+        self.wire_at += n;
+    }
+
+    fn send_owned(&mut self, bytes: &mut Vec<u8>) {
+        let n = self.place(bytes.as_slice());
+        if n < bytes.len() {
+            if self.owed.wire_owed() {
+                self.owed.owe(&bytes[n..]);
+            } else {
+                // Nothing is owed: the pipe's buffer becomes the owed wire as it stands, its
+                // handed-over front wiped, and no byte of it is copied.
+                bytes[..n].zeroize();
+                std::mem::swap(&mut self.owed.wire, bytes);
+                self.owed.wire_from = n;
+            }
+        }
+        bytes.clear();
+    }
+
+    fn message(&mut self, payload: Bytes, text: bool) {
+        self.owed.pieces.push_back(Piece {
+            text,
+            ..Piece::plain(0, payload, true)
+        });
+    }
+}
+
 impl BytesOut for Collect<'_> {
     fn put(&mut self, bytes: &[u8]) {
-        push_wiped(&mut self.owed.wire, bytes);
+        Out::send(self, bytes);
     }
 }
 
@@ -652,7 +754,29 @@ macro_rules! answer {
     };
 }
 
-answer!(Refresh, RefreshIn, OutHead, Outcome::Ready);
+/// `refresh`: the new settings are read as `open` reads them, and applied (the message ceiling
+/// holds for every connection built and every message written after it), or refused: a blob
+/// `open` would refuse is answered FAILED, and the settings in force stay.
+pub struct Refresh;
+impl Slot for Refresh {
+    type In = RefreshIn;
+    type Out = OutHead;
+    fn call(p: *mut c_void, i: &RefreshIn, o: &mut OutHead) -> Outcome {
+        match read_settings(&i.settings) {
+            Ok(max) => {
+                if !p.is_null() {
+                    instance(p).framer.set_max_message_bytes(max);
+                }
+                Outcome::Ready
+            }
+            Err(e) => {
+                o.error = abi_str(e);
+                Outcome::Failed
+            }
+        }
+    }
+}
+
 answer!(Retire, GenIn, OutHead, Outcome::Ready);
 answer!(Tick, TickIn, TickOut, Outcome::Ready);
 answer!(Drive, DriveIn, OutHead, Outcome::Ready);
@@ -732,14 +856,18 @@ fn opening(
 ) -> Outcome {
     let inst = instance(p);
     let mut owed = Owed::default();
-    let mut c = Collect {
-        owed: &mut owed,
-        now: time(sink),
-    };
-    match open(&inst.framer, &mut c) {
+    let mut c = Collect::new(&mut owed, sink);
+    let opened = open(&inst.framer, &mut c);
+    let wire_at = c.wire_at;
+    match opened {
         Ok(token) => {
             o.framing = token;
-            fill(&mut owed, sink, o);
+            // An adopted upgrade request that broke the handshake rules was answered and its
+            // frames ended at once: failed, never whole.
+            if owed.ended && inst.framer.failed(token) {
+                end_failed(&mut owed);
+            }
+            fill(&mut owed, sink, wire_at, o);
             inst.queues().insert(token, Arc::new(Mutex::new(owed)));
             Outcome::Ready
         }
@@ -768,14 +896,12 @@ fn framing(
         o.head.error = abi_str("the framing failed");
         return Outcome::Failed;
     };
-    let mut c = Collect {
-        owed: &mut held,
-        now: time(sink),
-    };
+    let mut c = Collect::new(&mut held, sink);
     let done = op(&inst.framer, &mut c);
+    let wire_at = c.wire_at;
     let owed = &mut *held;
     if let Err(e) = done {
-        if owed.wire.is_empty() && owed.pieces.is_empty() {
+        if wire_at == 0 && !owed.wire_owed() && owed.pieces.is_empty() {
             owed.error = e;
             o.head.error = AbiStr {
                 ptr: owed.error.as_ptr(),
@@ -786,8 +912,18 @@ fn framing(
         // What the failing op produced still goes out; the connection's end follows it.
         owed.ended = true;
     }
-    fill(owed, sink, o);
+    fill(owed, sink, wire_at, o);
     Outcome::Ready
+}
+
+/// The stream's end just queued is a FAILURE (`PIECE_STREAM_FAILED`), never whole as well.
+fn end_failed(owed: &mut Owed) {
+    if let Some(last) = owed.pieces.back_mut() {
+        if last.end {
+            last.failed = true;
+            last.end = false;
+        }
+    }
 }
 
 /// `begin`.
@@ -806,7 +942,7 @@ impl Slot for Begin {
             return dial_with_auth(p, i, o, &target, &fields);
         }
         opening(p, &i.sink, o, |f, c| {
-            f.open_with(side, &target, &fields, c)
+            f.open_to(side, &target, &fields, c)
                 .map_err(|e| format!("{e:?}"))
         })
     }
@@ -821,7 +957,7 @@ const SEQ_HEAD: u32 = 2;
 /// `BeginIn::points`/`BeginIn::auth`): at [`POINT_PEER`] the auth is called once, before any head,
 /// and only a continue goes on; at [`POINT_HEAD`] or [`POINT_HEAD_BODY`] (the upgrade carries no
 /// body: an empty one) it is called over the upgrade request exactly as it goes on the wire, and
-/// what it answers joins that request last (`WsFramer::open_signed`). A call that is not ready
+/// what it answers joins that request last (`WsFramer::open_signed_to`). A call that is not ready
 /// answers PENDING and the dial is parked on the op's ticket; the resumed op re-issues the same
 /// handles and reads the stored answers. A point this framer does not serve, a host that serves no
 /// auth call, a stop, or an answer the request cannot carry refuses the dial: an unsigned
@@ -881,7 +1017,7 @@ fn dial_with_auth(
     } else {
         // Only the peer point: the head goes out as the plane's.
         return opening(p, &i.sink, o, |f, c| {
-            f.open_with(Side::Dial, target, fields, c)
+            f.open_to(Side::Dial, target, fields, c)
                 .map_err(|e| format!("{e:?}"))
         });
     };
@@ -922,15 +1058,16 @@ fn dial_with_auth(
         now: i.sink.now_monotonic_ns,
     };
     let mut owed = Owed::default();
-    let mut c = Collect {
-        owed: &mut owed,
-        now: time(&i.sink),
-    };
-    match inst.framer.open_signed(parking, target, fields, &mut sign, &mut c) {
+    let mut c = Collect::new(&mut owed, &i.sink);
+    let signed = inst
+        .framer
+        .open_signed_to(parking, target, fields, &mut sign, &mut c);
+    let wire_at = c.wire_at;
+    match signed {
         Poll::Pending => Outcome::Pending,
         Poll::Ready(Ok(token)) => {
             o.framing = token;
-            fill(&mut owed, &i.sink, o);
+            fill(&mut owed, &i.sink, wire_at, o);
             inst.queues().insert(token, Arc::new(Mutex::new(owed)));
             Outcome::Ready
         }
@@ -954,7 +1091,7 @@ impl Slot for Adopt {
         let facts = facts_of(i.facts);
         let leftover = raw(i.leftover, i.leftover_len);
         opening(p, &i.sink, o, |f, c| {
-            f.adopt(side, &facts, leftover, c)
+            f.adopt_to(side, &facts, leftover, c)
                 .map_err(|e| format!("{e:?}"))
         })
     }
@@ -974,7 +1111,7 @@ impl Slot for Ingest {
                 return Ok(());
             }
             let ended_before = c.owed.ended;
-            f.ingest(i.framing, bytes, end, c)
+            f.ingest_to(i.framing, bytes, end, c)
                 .map_err(|e| format!("{e:?}"))?;
             // THE DIALLED HEAD'S REASON PHRASE rides the head piece this call queued.
             if let Some(reason) = f.take_reason(i.framing) {
@@ -982,16 +1119,12 @@ impl Slot for Ingest {
                     head.reason = Some(reason);
                 }
             }
-            // A connection the far side FAILED ends its stream failed, not cleanly: the reader is
-            // told (`PIECE_STREAM_FAILED` on the empty end piece), and the close carries the code.
+            // A connection whose frames ended FAILED (the far side failed it, the carrier ended
+            // with no closing handshake, its upgrade request broke the rules) ends its stream
+            // failed, not cleanly: the reader is told (`PIECE_STREAM_FAILED` on the empty end
+            // piece), and a close carries the failure's code.
             if !ended_before && c.owed.ended && f.failed(i.framing) {
-                if let Some(last) = c.owed.pieces.back_mut() {
-                    if last.end {
-                        last.failed = true;
-                        // A failed stream ends failed, never whole as well.
-                        last.end = false;
-                    }
-                }
+                end_failed(c.owed);
             }
             Ok(())
         })
@@ -1010,7 +1143,7 @@ impl Slot for Emit {
             if bytes.is_empty() && !eof {
                 return Ok(());
             }
-            f.emit_text(i.framing, bytes, eof, i.flags & EMIT_TEXT != 0, c)
+            f.emit_to(i.framing, bytes, eof, i.flags & EMIT_TEXT != 0, c)
                 .map_err(|e| format!("{e:?}"))
         })
     }
@@ -1025,7 +1158,7 @@ impl Slot for Refuse {
         let bytes = raw(i.bytes, i.len);
         let stream = (i.has_stream != 0).then_some(StreamId(i.stream));
         framing(p, i.framing, &i.sink, o, |f, c| {
-            f.refusal_with(i.framing, stream, bytes, i.status, c)
+            f.refusal_to(i.framing, stream, bytes, i.status, c)
                 .map_err(|e| format!("{e:?}"))
         })
     }
@@ -1051,7 +1184,7 @@ impl Slot for Finish {
     fn call(p: *mut c_void, i: &FinishIn, o: &mut FramerOut) -> Outcome {
         let reason = reason_of(i.reason);
         let out = framing(p, i.framing, &i.sink, o, |f, c| {
-            f.close(i.framing, reason, c);
+            f.close_to(i.framing, reason, c);
             c.owed.ended = true;
             Ok(())
         });
@@ -1086,13 +1219,10 @@ impl Slot for Encode {
     }
 }
 
-/// Hand the host what the framing owes it, as far as the sink holds.
-fn fill(owed: &mut Owed, sink: &FramerSink, o: &mut FramerOut) {
-    let w = owed.wire.len().min(sink.wire_cap);
-    // SAFETY: `w <= wire_cap`: the run lands inside the host's wire buffer, which no queue byte
-    // overlaps.
-    unsafe { std::ptr::copy_nonoverlapping(owed.wire.as_ptr(), sink.wire, w) };
-    consume_wiped(&mut owed.wire, w);
+/// Hand the host what the framing owes it, as far as the sink holds; this answer already wrote
+/// `wire_at` bytes of the host's wire buffer.
+fn fill(owed: &mut Owed, sink: &FramerSink, wire_at: usize, o: &mut FramerOut) {
+    let w = wire_at + owed.pour_wire(sink, wire_at);
     let y = &mut o.yielded;
     y.wire_len = w as u64;
     let mut frame_len = 0_usize;
@@ -1202,21 +1332,19 @@ fn fill(owed: &mut Owed, sink: &FramerSink, o: &mut FramerOut) {
         frame_len += take;
         n += 1;
         if whole {
-            if let Some(done) = owed.pieces.pop_front() {
-                owed.recycle(done.bytes);
-            }
+            owed.pieces.pop_front();
         } else {
             // The rest of a field block opens mid-line unless what was taken ended one.
             if piece.fields {
                 piece.continued = !piece.bytes[..take].ends_with(b"\n");
             }
-            piece.bytes.drain(..take);
+            piece.bytes = piece.bytes.slice(take..);
         }
     }
     y.frame_len = frame_len as u64;
     y.pieces_len = n as u32;
     y.heads_len = heads as u32;
-    let more = !owed.wire.is_empty() || !owed.pieces.is_empty();
+    let more = owed.wire_owed() || !owed.pieces.is_empty();
     let mut flags = 0;
     if more {
         flags |= YIELD_MORE;
