@@ -47,11 +47,11 @@
 //! * The message ceiling is the deployment's body cap, for a whole message and for a single frame;
 //!   a refresh's ceiling holds for every connection built and every message written after it.
 //!
-//! ONE COPY OF A MESSAGE (THE DESIGN §11.2): the protocol machine reads the host's ingested bytes
-//! where they lie ([`lent`]) into its own buffer, the one copy into this plugin's memory, and the
-//! message it completes is handed to the door as that buffer, not copied again; on the way out the
-//! machine frames a message into its own buffer and writes it straight into the host's wire buffer.
-//! What the host's buffers cannot hold this call waits in plugin memory for the next.
+//! THE COPIES OF A MESSAGE (THE DESIGN §11.2): the host's ingested bytes are borrowed for the call
+//! only (the transport ABI's `IngestIn::bytes`), so they are copied once into this plugin's memory
+//! (the pipe) for the protocol machine to read; the message it completes is handed to the door as
+//! the machine's own buffer, not copied again. On the way out the machine's frames are handed to
+//! the door as the pipe's buffer stands, never copied into a second queue.
 //!
 //! The upgrade INTO this framer is [`Framer::adopt`]: another framer gave up the stream with the
 //! bytes it held (the upgrade request itself), and this one answers it. Nothing upgrades out of a
@@ -84,140 +84,15 @@ use tungstenite::protocol::{CloseFrame, WebSocketConfig};
 use tungstenite::{Bytes, Error as WsError, Message, Utf8Bytes, WebSocket};
 use zeroize::{Zeroize, Zeroizing};
 
-/// THE HOST'S BUFFERS, LENT TO THE PROTOCOL MACHINE FOR ONE CALL: the bytes an ingest carries,
-/// read where they lie, and the host's wire buffer, written where it lies, so a message is copied
-/// once into this plugin's memory (the machine's own buffer) and never again on its way through.
-///
-/// A loan is made at the start of one framer call, under that framing's own lock, from buffers
-/// that outlive the call, and is ended before the call returns ([`Pipe::settle`], [`drain`]). A
-/// call that fails or panics drops or poisons its framing, which is never read again; the loan
-/// dies with it, unread.
-#[allow(unsafe_code)]
-mod lent {
-    /// The bytes the host handed one ingest, not yet read by the machine.
-    pub(crate) struct Input {
-        ptr: *const u8,
-        len: usize,
-    }
-
-    impl Default for Input {
-        fn default() -> Self {
-            Self {
-                ptr: std::ptr::null(),
-                len: 0,
-            }
-        }
-    }
-
-    // SAFETY: the pointer is set only for the length of one framer call, on that call's thread and
-    // under the framing's own lock, and is cleared before the call returns (see the module): a
-    // pipe that moves to another thread never carries a live loan.
-    unsafe impl Send for Input {}
-
-    impl Input {
-        /// Lend `bytes` for the call.
-        pub(crate) fn lend(&mut self, bytes: &[u8]) {
-            self.ptr = bytes.as_ptr();
-            self.len = bytes.len();
-        }
-
-        /// What the machine has not read yet.
-        pub(crate) fn rest(&self) -> &[u8] {
-            if self.ptr.is_null() || self.len == 0 {
-                return &[];
-            }
-            // SAFETY: lent by `lend` from a slice that outlives the call, and read only during it;
-            // `ptr..ptr + len` stays inside that slice (`advance`).
-            unsafe { std::slice::from_raw_parts(self.ptr, self.len) }
-        }
-
-        /// The machine read `n` bytes.
-        pub(crate) fn advance(&mut self, n: usize) {
-            let n = n.min(self.len);
-            if n == 0 {
-                return;
-            }
-            // SAFETY: `n <= len`: the pointer stays inside the lent slice, or one past its end.
-            self.ptr = unsafe { self.ptr.add(n) };
-            self.len -= n;
-        }
-
-        /// End the loan.
-        pub(crate) fn clear(&mut self) {
-            *self = Self::default();
-        }
-    }
-
-    /// The host's wire buffer for one call, past what that call already wrote into it.
-    pub(crate) struct Window {
-        ptr: *mut u8,
-        cap: usize,
-        len: usize,
-    }
-
-    impl Default for Window {
-        fn default() -> Self {
-            Self {
-                ptr: std::ptr::null_mut(),
-                cap: 0,
-                len: 0,
-            }
-        }
-    }
-
-    // SAFETY: as `Input`'s: lent for one call under the framing's lock, ended before it returns.
-    unsafe impl Send for Window {}
-
-    impl Window {
-        /// Lend `buf` for the call; `None` lends nothing.
-        pub(crate) fn lend(&mut self, buf: Option<&mut [u8]>) {
-            *self = match buf {
-                Some(buf) => Self {
-                    ptr: buf.as_mut_ptr(),
-                    cap: buf.len(),
-                    len: 0,
-                },
-                None => Self::default(),
-            };
-        }
-
-        /// Write as much of `bytes` as the window still holds; answers how much.
-        pub(crate) fn put(&mut self, bytes: &[u8]) -> usize {
-            if self.ptr.is_null() {
-                return 0;
-            }
-            let n = bytes.len().min(self.cap - self.len);
-            // SAFETY: lent by `lend` from a host buffer of `cap` bytes that outlives the call, and
-            // `len + n <= cap`; `bytes` is the machine's own memory, never the host's buffer.
-            unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), self.ptr.add(self.len), n) };
-            self.len += n;
-            n
-        }
-
-        /// End the loan: how many bytes were written into it.
-        pub(crate) fn release(&mut self) -> usize {
-            let n = self.len;
-            *self = Self::default();
-            n
-        }
-    }
-}
-
-/// The in-memory stream one framing state's protocol machine reads and writes: the host's bytes
-/// lent for this call and what an earlier call left unread, whether the carrier's clean end
-/// followed them, the host's wire buffer lent for this call and what did not fit it (or was
-/// written with no buffer lent), and what arrived during the handshake.
+/// The in-memory stream one framing state's protocol machine reads and writes: what core ingested
+/// and the machine has not consumed, whether the carrier's clean end followed it, what the
+/// machine wrote and core has not been handed yet, and what arrived during the handshake.
 #[derive(Default)]
 pub(crate) struct Pipe {
-    /// What an earlier call's bytes left that the machine had not read.
+    /// The host's ingested bytes the machine has not read: the one copy of them in this plugin
+    /// (the ABI lends them for the call only).
     inbound: VecDeque<u8>,
-    /// This call's bytes, read in place.
-    lent: lent::Input,
     ended: bool,
-    /// The host's wire buffer, written in place while the session runs.
-    window: lent::Window,
-    /// What the machine wrote that the lent window could not take (or with none lent), in order:
-    /// once anything waits here, everything after it waits behind it.
     outbound: Vec<u8>,
     /// Every byte ingested while the opening handshake runs: a dialled head's status line (its
     /// reason phrase) is read from here.
@@ -233,61 +108,30 @@ pub(crate) struct Pipe {
 }
 
 impl Pipe {
-    /// End this call's loan of the host's bytes: what the machine did not read is kept, in order,
-    /// for the next call (the host's bytes are this call's only).
-    fn settle(&mut self) {
-        self.inbound.extend(self.lent.rest());
-        self.lent.clear();
-    }
-
-    /// Nothing ingested is left unread.
-    fn drained(&self) -> bool {
-        self.inbound.is_empty() && self.lent.rest().is_empty()
-    }
-
     /// Drop everything ingested and not read: past the frames' end it is nobody's.
     fn discard(&mut self) {
         self.inbound.clear();
-        self.lent.clear();
-    }
-
-    /// Hand `bytes` on: into the lent window while nothing waits ahead of them, the rest after
-    /// what waits.
-    fn put(&mut self, bytes: &[u8]) {
-        let n = if self.outbound.is_empty() {
-            self.window.put(bytes)
-        } else {
-            0
-        };
-        self.outbound.extend_from_slice(&bytes[n..]);
     }
 }
 
 impl Read for Pipe {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        if !self.inbound.is_empty() {
-            let n = buf.len().min(self.inbound.len());
-            let (front, back) = self.inbound.as_slices();
-            let a = n.min(front.len());
-            buf[..a].copy_from_slice(&front[..a]);
-            buf[a..n].copy_from_slice(&back[..n - a]);
-            self.inbound.drain(..n);
-            return Ok(n);
+        if self.inbound.is_empty() {
+            // Nothing more yet: the machine stops here and resumes on the next ingest. Only the
+            // carrier's clean end is the end.
+            return if self.ended {
+                Ok(0)
+            } else {
+                Err(std::io::ErrorKind::WouldBlock.into())
+            };
         }
-        let lent = self.lent.rest();
-        if !lent.is_empty() {
-            let n = buf.len().min(lent.len());
-            buf[..n].copy_from_slice(&lent[..n]);
-            self.lent.advance(n);
-            return Ok(n);
-        }
-        // Nothing more yet: the machine stops here and resumes on the next ingest. Only the
-        // carrier's clean end is the end.
-        if self.ended {
-            Ok(0)
-        } else {
-            Err(std::io::ErrorKind::WouldBlock.into())
-        }
+        let n = buf.len().min(self.inbound.len());
+        let (front, back) = self.inbound.as_slices();
+        let a = n.min(front.len());
+        buf[..a].copy_from_slice(&front[..a]);
+        buf[a..n].copy_from_slice(&back[..n - a]);
+        self.inbound.drain(..n);
+        Ok(n)
     }
 }
 
@@ -299,10 +143,10 @@ impl Write for Pipe {
         if self.client && self.framing {
             let mut frames = buf.to_vec();
             seeded::unmask(&mut frames);
-            self.put(&frames);
+            self.outbound.extend_from_slice(&frames);
             return Ok(buf.len());
         }
-        self.put(buf);
+        self.outbound.extend_from_slice(buf);
         Ok(buf.len())
     }
     fn flush(&mut self) -> std::io::Result<()> {
@@ -849,21 +693,10 @@ pub(crate) fn close_code_of_status(status: u32) -> CloseCode {
 }
 
 /// WHAT A FRAMER OP HANDS ITS OUTPUT TO, past the contract's [`FramerOut`]: the door's answer
-/// lends the host's own wire buffer for the session's frames to be written into in place, takes
-/// the bytes waiting in a pipe as they stand, and takes a message's payload as the protocol machine
-/// completed it, so nothing of a message is copied again inside this plugin. Off the door
+/// takes the bytes waiting in a pipe as they stand, and a message's payload as the protocol
+/// machine completed it, so nothing of a message is copied again inside this plugin. Off the door
 /// ([`Plain`]) each falls back to the contract's own call.
 pub(crate) trait Output: FramerOut {
-    /// The host's wire buffer past what this answer already wrote into it, for the machine to
-    /// write into in place; `None`: none (off the door, or bytes owed from an earlier call go
-    /// first).
-    fn window(&mut self) -> Option<&mut [u8]> {
-        None
-    }
-
-    /// `n` bytes were written into the buffer [`Output::window`] lent.
-    fn wrote(&mut self, _n: usize) {}
-
     /// Bytes for the far side, in order, taken as they stand: `bytes` is left empty.
     fn send_owned(&mut self, bytes: &mut Vec<u8>) {
         self.send(bytes.as_slice());
@@ -877,8 +710,7 @@ pub(crate) trait Output: FramerOut {
     }
 }
 
-/// A contract [`FramerOut`] as an [`Output`]: no buffer is lent, and everything goes through the
-/// contract's own calls.
+/// A contract [`FramerOut`] as an [`Output`]: everything goes through the contract's own calls.
 struct Plain<'a>(&'a mut dyn FramerOut);
 
 impl FramerOut for Plain<'_> {
@@ -901,22 +733,12 @@ impl FramerOut for Plain<'_> {
 
 impl Output for Plain<'_> {}
 
-/// Hand whatever the machine wrote to core: end the loan of the host's wire buffer (what went
-/// into it is told), then hand on what waits in the pipe.
+/// Hand whatever the machine wrote to core, as the pipe's buffer stands.
 fn drain(phase: &mut Phase, out: &mut dyn Output) {
     let pipe = phase.pipe();
-    let wrote = pipe.window.release();
-    if wrote > 0 {
-        out.wrote(wrote);
-    }
     if !pipe.outbound.is_empty() {
         out.send_owned(&mut pipe.outbound);
     }
-}
-
-/// Lend the host's wire buffer (when `out` lends one) to a session's machine for this call.
-fn lend_window(ws: &mut WebSocket<Pipe>, out: &mut dyn Output) {
-    ws.get_mut().window.lend(out.window());
 }
 
 /// THE TEST HARNESS'S SEED (`test-seeded`, a dev-dependency feature the published conformance
@@ -981,7 +803,6 @@ impl WsFramer {
             return;
         };
         if let Phase::Open { ws, failed, .. } = &mut phase {
-            lend_window(ws, out);
             // The close frame is a courtesy on a connection already finalised: what the machine
             // could write goes out, and a close it cannot write is not an error anyone can act on.
             // A connection the far side failed closes with the failure's code, whatever the reason
@@ -1216,8 +1037,7 @@ impl WsFramer {
         self.emit_to(state, bytes, end_of_frame, text, &mut Plain(out))
     }
 
-    /// [`Self::emit_text`] into an [`Output`]: the session's frames are written straight into
-    /// the host's wire buffer when the door lends it.
+    /// [`Self::emit_text`] into an [`Output`].
     ///
     /// # Errors
     ///
@@ -1276,8 +1096,7 @@ impl WsFramer {
             }
             // A message emitted whole is copied into the payload the machine sends (the machine
             // takes its payload owned, and the host's bytes are lent for this call only); one
-            // emitted in pieces is the pieces gathered. The machine frames it into its own buffer
-            // and writes that straight into the host's wire buffer.
+            // emitted in pieces is the pieces gathered.
             let whole = if message.is_empty() {
                 Bytes::copy_from_slice(bytes)
             } else {
@@ -1412,13 +1231,11 @@ impl WsFramer {
     ) -> Result<(Phase, bool, Option<Vec<u8>>), TransportError> {
         let mut phase = match phase {
             Phase::Answered {
-                mut pipe,
+                pipe,
                 left,
                 chunked,
                 ..
             } => {
-                // A refused upgrade's body is read off the pipe's own queue.
-                pipe.settle();
                 let (phase, ended) = answered_body(pipe, left, chunked, false, out);
                 return Ok((phase, ended, None));
             }
@@ -1604,7 +1421,7 @@ impl WsFramer {
             Err(e) => return Err(read_error(&e)),
         }
         let pipe = ws.get_mut();
-        ended |= pipe.ended && pipe.drained();
+        ended |= pipe.ended && pipe.inbound.is_empty();
         Ok((phase, ended, reason))
     }
 
@@ -1618,7 +1435,6 @@ impl WsFramer {
         let Phase::Open { ws, message, .. } = phase else {
             return Err(TransportError::Closed);
         };
-        lend_window(ws, out);
         let done = op(ws, message);
         drain(phase, out);
         done.map_err(|e| match e {
@@ -1856,9 +1672,8 @@ impl WsFramer {
         )
     }
 
-    /// [`Framer::ingest`] into an [`Output`]. The machine reads `bytes` where they lie (the host
-    /// lends them for this call only) and, on a running session, writes straight into the host's
-    /// wire buffer when the door lends it; what it does not read this call is kept for the next.
+    /// [`Framer::ingest`] into an [`Output`]. The host lends `bytes` for this call only (the
+    /// transport ABI's `IngestIn::bytes`), so they are copied once into the pipe for the machine.
     ///
     /// # Errors
     ///
@@ -1874,13 +1689,9 @@ impl WsFramer {
         let mut held = Self::enter(&conn)?;
         let mut phase = held.take().ok_or(TransportError::Closed)?;
         let dialling = matches!(phase, Phase::Dialling { .. });
-        let open = matches!(phase, Phase::Open { .. });
         let pipe = phase.pipe();
-        pipe.lent.lend(bytes);
+        pipe.inbound.extend(bytes);
         pipe.ended |= end;
-        if open {
-            pipe.window.lend(out.window());
-        }
         // Only a dialled head is read back off what the handshake saw (its reason phrase, a
         // refusal's body); an accepting handshake keeps no copy.
         if dialling {
@@ -1895,7 +1706,6 @@ impl WsFramer {
                         .insert(state, reason);
                 }
                 drain(&mut phase, out);
-                phase.pipe().settle();
                 if ended {
                     out.end();
                 }

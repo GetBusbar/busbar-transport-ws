@@ -11,10 +11,10 @@
 //! and when the connection's frames end the stream ends with its `PIECE_END` piece (or, when they
 //! ended failed, `PIECE_STREAM_FAILED`) and the answer carries `YIELD_ENDED`.
 //!
-//! A MESSAGE IS COPIED ONCE INSIDE THIS PLUGIN (THE DESIGN §11.2): a session's frames are written
-//! by the protocol machine straight into the host's wire buffer, which the answer lends it, and an
-//! inbound message waits in the framing's queue as the machine's own buffer until it is written
-//! into the host's frame buffer. The transport ABI's answers are written into HOST buffers
+//! NO SECOND QUEUE (THE DESIGN §11.2): a session's frames are handed over as the framer's pipe
+//! buffer stands (written into the host's wire buffer, the rest owed without a copy), and an
+//! inbound message waits in the framing's queue as the protocol machine's own buffer until it is
+//! written into the host's frame buffer. The transport ABI's answers are written into HOST buffers
 //! (`FramerSink`): that write is the ABI's, not a copy this plugin makes for itself.
 //!
 //! A DIALLED framing's stream opens with its HEAD (HEAD-FIELDS): the far end's switching-protocols
@@ -516,21 +516,6 @@ impl Out for Collect<'_> {
 }
 
 impl Output for Collect<'_> {
-    fn window(&mut self) -> Option<&mut [u8]> {
-        let sink = self.sink?;
-        let room = sink.wire_cap.saturating_sub(self.wire_at);
-        if self.owed.wire_owed() || room == 0 || sink.wire.is_null() {
-            return None;
-        }
-        // SAFETY: the host's wire buffer of `wire_cap` bytes, valid for the call; `wire_at + room
-        // == wire_cap`, and nothing else writes past `wire_at` until the loan ends (`wrote`).
-        Some(unsafe { std::slice::from_raw_parts_mut(sink.wire.add(self.wire_at), room) })
-    }
-
-    fn wrote(&mut self, n: usize) {
-        self.wire_at += n;
-    }
-
     fn send_owned(&mut self, bytes: &mut Vec<u8>) {
         let n = self.place(bytes.as_slice());
         if n < bytes.len() {
