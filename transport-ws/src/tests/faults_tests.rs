@@ -20,6 +20,7 @@ use std::panic::{catch_unwind, AssertUnwindSafe};
 
 use crate::door::{Begin, Emit, Ingest, Open};
 use crate::WsFramer;
+use busbar_contract::abi::host::service::SCHEME_PLAIN;
 use busbar_contract::abi::mechanism::call::{AbiStr, Outcome};
 use busbar_contract::abi::mechanism::lifecycle::{OpenIn, OpenOut};
 use busbar_contract::abi::sdk::door::Slot;
@@ -348,6 +349,7 @@ impl Host {
         };
         let mut b: BeginIn = z();
         b.side = SIDE_ACCEPT;
+        b.scheme = SCHEME_PLAIN;
         b.target = AbiStr {
             ptr: std::ptr::null(),
             len: 0,
