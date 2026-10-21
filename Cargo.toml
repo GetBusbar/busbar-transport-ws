@@ -74,8 +74,8 @@ metrics-util = { version = "0.20.4", default-features = false }
 oauth-as = { version = "1.0.0", features = ["http", "jwt", "consent", "resource-metadata", "par", "dpop", "client-assertion"] }
 opentelemetry-proto = { version = "0.32", default-features = false, features = ["gen-tonic-messages", "trace"] }
 proc-macro2 = { version = "1", features = ["span-locations"] }
-proptest = "1"
 prost = { version = "0.14", default-features = false, features = ["std"] }
+psl = "2.1"
 rcgen = { version = "0.14", default-features = false, features = ["crypto", "ring"] }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"] }
 ring = "0.17"
@@ -110,6 +110,7 @@ webpki-roots = "1"
 zeroize = "1"
 # busbar .github/fleet/deps.toml [plugin-deps], at 31d43cf9605fdf83becba3de5f38b51903432c1e
 fallible-iterator = "0.2"
+httparse = { version = "1", default-features = false }
 ldap3 = { version = "0.12", default-features = false, features = ["sync"] }
 mysql = { version = "28", default-features = false, features = ["minimal-rust"] }
 mysql_common = { version = "0.35", default-features = false }
