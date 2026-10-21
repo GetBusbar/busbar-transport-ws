@@ -19,6 +19,7 @@
 use std::ffi::c_void;
 use std::mem::{size_of, zeroed};
 
+use busbar_contract::abi::host::service::SCHEME_PLAIN;
 use busbar_contract::abi::mechanism::call::{AbiStr, InHead, Op, OutHead, Outcome};
 use busbar_contract::abi::mechanism::lifecycle::{slot as life, OpenIn, OpenOut};
 use busbar_contract::abi::transport::check::check_framer;
@@ -164,6 +165,7 @@ impl Host {
     fn accept(&mut self) -> u64 {
         let mut i: BeginIn = z();
         i.side = SIDE_ACCEPT;
+        i.scheme = SCHEME_PLAIN;
         i.target = AbiStr {
             ptr: [].as_ptr(),
             len: 0,
