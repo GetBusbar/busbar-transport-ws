@@ -32,14 +32,14 @@ use zeroize::Zeroize;
 use busbar_contract::abi::auth::{FIELD_QUERY, POINT_HEAD, POINT_HEAD_BODY, POINT_PEER};
 use busbar_contract::abi::host::service::{AuthRef, UnitRef, FLOW_CONTINUE};
 use busbar_contract::abi::mechanism::call::{AbiStr, Blob, InHead, OutHead, Outcome};
-use busbar_contract::abi::mechanism::door::{KindTailHead, Statement};
+use busbar_contract::abi::mechanism::door::Statement;
 use busbar_contract::abi::mechanism::lifecycle::{
     CancelIn, CancelOut, DriveIn, GenIn, OpenIn, OpenOut, RefreshIn, ReleaseIn, TickIn, TickOut,
     ValidateIn,
 };
 use busbar_contract::abi::mechanism::ticket::{CompletionHandle, Ticket};
 use busbar_contract::abi::sdk::door::{abi_str, statement, Slot};
-use busbar_contract::abi::sdk::services::{HeadViewArgs, Services};
+use busbar_contract::abi::sdk::services::{HeadViewArgs, Services, StaticServices};
 use busbar_contract::abi::sdk::transport::form_codes;
 use busbar_contract::abi::transport::{
     AcceptIn, AcceptOut, AdoptIn, ArrivalIn, ArrivalOut, BeginIn, Claim, ConnIn, ConnOut, DialIn,
@@ -74,10 +74,7 @@ busbar_contract::own_seal!(Own);
 /// The setting this transport reads, at its 1.5.5 path: the message ceiling.
 pub const BODY_MAX_BYTES: &str = "limits.request_body_max_bytes";
 
-const NONE: AbiStr = AbiStr {
-    ptr: std::ptr::null(),
-    len: 0,
-};
+const NONE: AbiStr = AbiStr::ABSENT;
 
 /// The transport's own key (`meta.rs`).
 const KEY: &str = <WsFramer as TransportMeta>::KEY;
@@ -90,10 +87,7 @@ pub const SECURE_KEY: &str = "wss";
 const CLAIM_NAMES: &[AbiStr] = &[abi_str(KEY), abi_str(SECURE_KEY)];
 
 const fn bytes_str(b: &'static [u8]) -> AbiStr {
-    AbiStr {
-        ptr: b.as_ptr(),
-        len: b.len(),
-    }
+    AbiStr::of_bytes(b)
 }
 
 /// `names` as host strings, in declared order.
@@ -125,19 +119,18 @@ const UNIT0: u8 = match <WsFramer as TransportMeta>::UNIT0_TRIGGER {
 /// The claim row, RENDERED from the transport's one declaration (`meta.rs`, `claims.rs`; THE
 /// DESIGN §2 "Each fact is declared once; anything derivable is derived"). `ws` and `wss` are one
 /// wire, so both claims carry it.
-const ROW: Claim = Claim {
-    selector_forms: bytes_str(&SELECTOR_CODES),
-    egress_selector_forms: bytes_str(&EGRESS_SELECTOR_CODES),
-    facts: FACTS.as_ptr(),
-    facts_len: FACTS.len(),
+const ROW: Claim = {
+    let mut c = Claim::EMPTY.with_facts(FACTS);
+    c.selector_forms = bytes_str(&SELECTOR_CODES);
+    c.egress_selector_forms = bytes_str(&EGRESS_SELECTOR_CODES);
     // The declaration states no status numbering and no status leg (`STATUS_NAMESPACE`,
     // `STATUS_CLASS`): frames after the upgrade carry none.
-    status_namespace: NONE,
-    session: <WsFramer as TransportMeta>::SESSION as u8,
-    session_bound: <WsFramer as TransportMeta>::SESSION_BOUND as u8,
-    unit0_trigger: UNIT0,
-    status_at: 0,
-    _reserved: 0,
+    c.status_namespace = NONE;
+    c.session = <WsFramer as TransportMeta>::SESSION as u8;
+    c.session_bound = <WsFramer as TransportMeta>::SESSION_BOUND as u8;
+    c.unit0_trigger = UNIT0;
+    c.status_at = 0;
+    c
 };
 
 /// Each claimed scheme's row, by index into [`CLAIM_NAMES`].
@@ -174,37 +167,20 @@ const SETTINGS: &[SettingDecl] = &[SettingDecl {
     default: abi_str(DEFAULT_BODY_MAX),
 }];
 
-const TAIL: TransportTail = TransportTail {
-    head: KindTailHead {
-        size: std::mem::size_of::<TransportTail>() as u32,
-        _reserved: 0,
-    },
-    role: ROLE_FRAMER,
-    framing: FRAMING_STREAM,
+const TAIL: TransportTail = {
+    let mut t = TransportTail::EMPTY
+        .with_claim_rows(CLAIMS)
+        .with_settings(SETTINGS);
+    t.role = ROLE_FRAMER;
+    t.framing = FRAMING_STREAM;
     // No fact: a dialled head is signed by the binding's auth over exactly the bytes sent, with
     // nothing added after it (ruling 23, `dial_with_auth`), as every framer's is.
-    facts: 0,
-    handshake_max_steps: 0,
-    frame_piece_size: FRAME_PIECE_SIZE,
-    _reserved: 0,
+    t.facts = 0;
+    t.handshake_max_steps = 0;
+    t.frame_piece_size = FRAME_PIECE_SIZE;
     // No transport names another: the carrier is the connector's choice, and an upgrade reaches
     // this framer by `adopt`, never by composition.
-    composes_over: std::ptr::null(),
-    composes_over_len: 0,
-    claim_rows: CLAIMS.as_ptr(),
-    claim_rows_len: CLAIMS.len(),
-    upgrades_to: std::ptr::null(),
-    upgrades_to_len: 0,
-    handoff_from: NONE,
-    handoff_to: NONE,
-    handoff_binding_fact: NONE,
-    handshake_frame_kind: NONE,
-    status_rows: std::ptr::null(),
-    status_rows_len: 0,
-    settings: SETTINGS.as_ptr(),
-    settings_len: SETTINGS.len(),
-    fault_rows: std::ptr::null(),
-    fault_rows_len: 0,
+    t
 };
 
 // THE TAIL IS THE DECLARATION'S (THE DESIGN §2: each fact declared once): every literal above is
@@ -216,23 +192,20 @@ const _: () = {
     ));
     assert!(TAIL.framing == FRAMING_STREAM);
     assert!(!<WsFramer as TransportMeta>::DECODES_PAYLOAD && TAIL.facts == 0);
-    assert!(<WsFramer as TransportMeta>::COMPOSES_OVER.is_empty() && TAIL.composes_over_len == 0);
-    assert!(<WsFramer as TransportMeta>::UPGRADES_TO.is_empty() && TAIL.upgrades_to_len == 0);
+    assert!(<WsFramer as TransportMeta>::COMPOSES_OVER.is_empty() && TAIL.composes_over_len() == 0);
+    assert!(<WsFramer as TransportMeta>::UPGRADES_TO.is_empty() && TAIL.upgrades_to_len() == 0);
     assert!(
         <WsFramer as TransportMeta>::HANDOFF.is_none()
-            && TAIL.handoff_from.len == 0
-            && TAIL.handoff_to.len == 0
-            && TAIL.handoff_binding_fact.len == 0
+            && TAIL.handoff_from.len() == 0
+            && TAIL.handoff_to.len() == 0
+            && TAIL.handoff_binding_fact.len() == 0
     );
 };
 
 /// The door's Statement: the `ws` framer.
-pub const STATEMENT: Statement = Statement {
-    kind_tail: (&TAIL as *const TransportTail).cast::<KindTailHead>(),
-    claims: CLAIM_NAMES.as_ptr(),
-    claims_len: CLAIM_NAMES.len(),
-    ..statement(KEY, env!("CARGO_PKG_VERSION"), 64)
-};
+pub const STATEMENT: Statement = statement(KEY, env!("CARGO_PKG_VERSION"), 64)
+    .with_kind_tail(&TAIL)
+    .with_claims(CLAIM_NAMES);
 
 // ── the instance ─────────────────────────────────────────────────────────────────────────────────
 
@@ -391,7 +364,7 @@ pub struct Instance {
     owed: Mutex<HashMap<u64, OwedSlot>>,
     /// The host services `open` was handed (`OpenIn::host`): the binding's auth a dial calls.
     /// `None`: the host offers none, and a dial whose binding has an auth is refused.
-    services: Option<Services>,
+    services: Option<StaticServices>,
 }
 
 impl Instance {
@@ -451,11 +424,14 @@ impl BytesOut for Collect<'_> {
 }
 
 fn read_settings(b: &Blob) -> Result<usize, &'static str> {
-    let text: &[u8] = if b.ptr.is_null() || b.len == 0 {
+    let text: &[u8] = if b.ptr().is_null() || b.is_empty() {
         b"{}"
     } else {
         // SAFETY: the host's blob, valid for the call.
-        unsafe { std::slice::from_raw_parts(b.ptr, b.len) }
+        #[allow(unused_unsafe)]
+        unsafe {
+            b.bytes()
+        }
     };
     let v: serde_json::Value = serde_json::from_slice(text).map_err(|_| "settings: not JSON")?;
     match v.get(BODY_MAX_BYTES) {
@@ -473,11 +449,14 @@ fn instance<'a>(p: *mut c_void) -> &'a Instance {
 }
 
 fn text(s: &AbiStr) -> &[u8] {
-    if s.ptr.is_null() {
+    if s.is_absent() {
         return &[];
     }
     // SAFETY: host-borrowed input, valid for the call.
-    unsafe { std::slice::from_raw_parts(s.ptr, s.len) }
+    #[allow(unused_unsafe)]
+    unsafe {
+        s.bytes()
+    }
 }
 
 /// A dial's opening head fields (`BeginIn::fields`), owned.
@@ -545,7 +524,7 @@ fn facts_of(p: *const busbar_contract::abi::transport::ConnFacts) -> ConnFacts {
     }
     // SAFETY: host-borrowed for the call.
     let f = unsafe { &*p };
-    let s = |a: &AbiStr| (!a.ptr.is_null()).then(|| String::from_utf8_lossy(text(a)).into_owned());
+    let s = |a: &AbiStr| (!a.is_absent()).then(|| String::from_utf8_lossy(text(a)).into_owned());
     ConnFacts {
         sni: s(&f.offered_name),
         alpn: s(&f.agreed_protocol),
@@ -580,8 +559,11 @@ impl Slot for Open {
     fn call(_: *mut c_void, i: &OpenIn, o: &mut OpenOut) -> Outcome {
         match read_settings(&i.settings) {
             Ok(max) => {
-                // SAFETY: host-borrowed for the call; NULL when the host hands no tables.
-                let services = unsafe { i.host.as_ref() }.and_then(Services::of);
+                // SAFETY: host-borrowed for the call; NULL when the host hands no tables, and the
+                // tables a real host lent `open` are the instance's own for its life.
+                #[allow(unused_unsafe)]
+                let services: Option<StaticServices> =
+                    unsafe { i.host.as_ref() }.and_then(|t| unsafe { Services::from_raw(t) });
                 o.instance = Box::into_raw(Box::new(Instance {
                     framer: WsFramer::new(max),
                     owed: Mutex::new(HashMap::new()),
@@ -768,10 +750,8 @@ fn framing(
     if let Err(e) = done {
         if owed.wire.is_empty() && owed.pieces.is_empty() {
             owed.error = e;
-            o.head.error = AbiStr {
-                ptr: owed.error.as_ptr(),
-                len: owed.error.len(),
-            };
+            // SAFETY: the framing-owned text outlives the host's read of the failure.
+            o.head.error = unsafe { AbiStr::from_raw_parts(owed.error.as_ptr(), owed.error.len()) };
             return Outcome::Failed;
         }
         // What the failing op produced still goes out; the connection's end follows it.

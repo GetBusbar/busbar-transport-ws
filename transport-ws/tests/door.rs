@@ -37,11 +37,15 @@ fn call<I, O>(op: Option<Op>, inst: *mut c_void, i: &mut I, o: &mut O, index: u3
         (*ih).op = index;
         (*std::ptr::from_mut(o).cast::<OutHead>()).size = size_of::<O>() as u32;
     }
-    let r = (op.expect("every slot is filled"))(
-        inst,
-        std::ptr::from_ref(i).cast(),
-        std::ptr::from_mut(o).cast(),
-    );
+    // SAFETY: the slot is the door's own, called with the `in` and `out` built above.
+    #[allow(unused_unsafe)]
+    let r = unsafe {
+        (op.expect("every slot is filled"))(
+            inst,
+            std::ptr::from_ref(i).cast(),
+            std::ptr::from_mut(o).cast(),
+        )
+    };
     r.outcome()
 }
 
@@ -199,10 +203,7 @@ impl Host {
         let mut end = End::default();
         let mut i: BeginIn = z();
         i.side = side;
-        i.target = AbiStr {
-            ptr: target.as_ptr(),
-            len: target.len(),
-        };
+        i.target = AbiStr::of(target);
         i.sink = self.sink();
         let mut o: FramerOut = z();
         let r = call(self.ops.begin, self.inst, &mut i, &mut o, slot::BEGIN);
@@ -537,7 +538,9 @@ fn an_upgrade_answered_with_no_field_left_is_an_empty_head() {
 }
 
 fn linked() -> &'static Ops {
-    let d = busbar_transport_ws::door::door();
+    // SAFETY: `door()` answers the `'static` door of this crate.
+    #[allow(unused_unsafe)]
+    let d = unsafe { busbar_transport_ws::door::door() };
     // SAFETY: the door's `'static` table.
     unsafe { &*(*d).ops.cast::<Ops>() }
 }
@@ -562,12 +565,12 @@ fn the_ws_claim_opens_at_the_upgrade_and_composes_over_nothing() {
     let st = busbar_transport_ws::door::STATEMENT;
     // SAFETY: the Statement's kind tail is this crate's `'static` `TransportTail`, and its claim
     // rows are `claim_rows_len` `'static` rows.
-    let tail = unsafe { &*st.kind_tail.cast::<TransportTail>() };
+    let tail = unsafe { &*st.kind_tail().cast::<TransportTail>() };
     let rows: &[Claim] =
-        unsafe { std::slice::from_raw_parts(tail.claim_rows, tail.claim_rows_len) };
+        unsafe { std::slice::from_raw_parts(tail.claim_rows_ptr(), tail.claim_rows_len()) };
     assert_eq!(rows.len(), 2, "one entry, two claims: `ws` and `wss`");
     assert!(rows.iter().all(|r| r.unit0_trigger == UNIT0_UPGRADE));
-    assert_eq!(tail.composes_over_len, 0);
+    assert_eq!(tail.composes_over_len(), 0);
 }
 
 /// A REFUSED UPGRADE'S WAIT CROSSES THE ABI (THE DESIGN §1: the breaker applies to every plane

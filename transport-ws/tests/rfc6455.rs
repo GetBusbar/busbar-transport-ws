@@ -48,11 +48,15 @@ fn call<I, O>(op: Option<Op>, inst: *mut c_void, i: &mut I, o: &mut O, index: u3
         (*ih).op = index;
         (*std::ptr::from_mut(o).cast::<OutHead>()).size = size_of::<O>() as u32;
     }
-    (op.expect("every slot is filled"))(
-        inst,
-        std::ptr::from_ref(i).cast(),
-        std::ptr::from_mut(o).cast(),
-    )
+    // SAFETY: the slot is the door's own, called with the `in` and `out` built above.
+    #[allow(unused_unsafe)]
+    unsafe {
+        (op.expect("every slot is filled"))(
+            inst,
+            std::ptr::from_ref(i).cast(),
+            std::ptr::from_mut(o).cast(),
+        )
+    }
     .outcome()
 }
 
@@ -83,7 +87,9 @@ const CAP: usize = 64 * 1024;
 
 impl Host {
     fn new() -> Self {
-        let d = busbar_transport_ws::door::door();
+        // SAFETY: `door()` answers the `'static` door of this crate.
+        #[allow(unused_unsafe)]
+        let d = unsafe { busbar_transport_ws::door::door() };
         // SAFETY: the door's `'static` table.
         let ops: &'static Ops = unsafe { &*(*d).ops.cast::<Ops>() };
         let mut i: OpenIn = z();
@@ -164,10 +170,7 @@ impl Host {
     fn accept(&mut self) -> u64 {
         let mut i: BeginIn = z();
         i.side = SIDE_ACCEPT;
-        i.target = AbiStr {
-            ptr: [].as_ptr(),
-            len: 0,
-        };
+        i.target = AbiStr::ABSENT;
         i.sink = self.sink();
         let mut o: FramerOut = z();
         let r = call(self.ops.begin, self.inst, &mut i, &mut o, slot::BEGIN);

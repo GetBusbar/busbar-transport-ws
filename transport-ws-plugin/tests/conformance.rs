@@ -15,7 +15,7 @@
 use std::mem::zeroed;
 use std::sync::Arc;
 
-use busbar_contract::abi::mechanism::call::{AbiStr, Blob, Outcome, BLOB_ABSENT};
+use busbar_contract::abi::mechanism::call::{AbiStr, Blob, Outcome};
 use busbar_contract::abi::mechanism::lifecycle::{slot as life, OpenIn, OpenOut};
 use busbar_contract::abi::mechanism::KindCode;
 use busbar_contract::abi::transport::{
@@ -54,7 +54,8 @@ fn cdylib() -> std::path::PathBuf {
 
 /// The row a compiled-in build holds for this door.
 fn row() -> LinkedRow {
-    LinkedRow::of(linked::door).expect("the door states itself")
+    LinkedRow::of_macro(busbar_transport_ws_plugin::door::MACRO_DOOR)
+        .expect("the door states itself")
 }
 
 fn bind(d: &Dispatcher) -> Bind {
@@ -70,12 +71,7 @@ fn bind(d: &Dispatcher) -> Bind {
 fn open(p: &Plugin<Transport>) {
     let mut i: OpenIn = z();
     i.head = in_head();
-    i.settings = Blob {
-        ptr: std::ptr::null(),
-        len: 0,
-        fmt: BLOB_ABSENT,
-        flags: 0,
-    };
+    i.settings = Blob::ABSENT;
     let mut o: OpenOut = z();
     o.head = out_head();
     let mut f = Frame::new(i, o);
@@ -175,10 +171,7 @@ impl Host {
         let mut i: BeginIn = z();
         i.head = in_head();
         i.side = side;
-        i.target = AbiStr {
-            ptr: target.as_ptr(),
-            len: target.len(),
-        };
+        i.target = AbiStr::of(target);
         i.sink = self.sink();
         let mut o: FramerOut = z();
         o.head = out_head();
@@ -312,7 +305,7 @@ fn the_door_asked_for_as_another_kind_is_refused_both_ways() {
 // THE PUBLISHED SUITE (busbar-plugin-loader's `conformance_suite!`): both legs through the one
 // loader, every step at its pinned crossing count, over `conformance.json`.
 busbar_plugin_loader::conformance_suite! {
-    door: busbar_transport_ws_plugin::linked::door,
+    door: busbar_transport_ws_plugin::door::MACRO_DOOR,
     cdylib: "busbar_transport_ws_plugin",
     inputs: include_str!("conformance.json"),
 }
