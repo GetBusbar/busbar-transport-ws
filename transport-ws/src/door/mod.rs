@@ -883,6 +883,7 @@ fn dial_with_auth(
             authority: head.authority,
             query: head.query,
             fields: head.fields,
+            scheme: i.scheme,
         };
         match services.auth_call::<Own>(
             handle(SEQ_HEAD),
