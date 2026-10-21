@@ -37,7 +37,7 @@ pub(crate) use transport::WsFramer;
 pub mod linked {
     use busbar_contract::transport::TransportMeta;
 
-    pub use crate::door::door;
+    pub use crate::door::{door, MACRO_DOOR};
 
     /// The row's registry key.
     pub const KEY: &str = <crate::WsFramer as TransportMeta>::KEY;
