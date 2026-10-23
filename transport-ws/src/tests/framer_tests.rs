@@ -11,7 +11,12 @@ use busbar_contract::transport::wire::WireStatusClass;
 use busbar_contract::transport::{Framed, Framer, FramerOut, HostTime, Side};
 use tungstenite::handshake::derive_accept_key;
 
+use std::task::Poll;
+
+use crate::transport::{reason_phrase, retry_after, AuthLine, Parking, UpgradeHead};
 use crate::WsFramer;
+use tungstenite::http::{HeaderMap, HeaderValue};
+use zeroize::Zeroizing;
 
 /// What one framer call produced.
 #[derive(Default)]
@@ -20,6 +25,8 @@ struct Out {
     frames: Vec<Vec<u8>>,
     /// Per frame in `frames`: the status it stated, and its class.
     statuses: Vec<Option<(u32, Option<WireStatusClass>)>>,
+    /// The frames ended (`end`).
+    ended: bool,
 }
 
 impl FramerOut for Out {
@@ -31,7 +38,9 @@ impl FramerOut for Out {
         self.statuses
             .push(piece.status_code.map(|code| (code, piece.status)));
     }
-    fn end(&mut self) {}
+    fn end(&mut self) {
+        self.ended = true;
+    }
     fn now(&self) -> HostTime {
         HostTime::default()
     }
@@ -293,6 +302,390 @@ fn a_far_end_that_refuses_the_upgrade_hands_up_its_answer() {
     }
 }
 
+/// A REFUSED UPGRADE'S BODY REACHES THE PLANE (Q128 transport-ws LOW): after its head, the far end's
+/// error document is handed up as the stream's body, what came with the head and what arrives
+/// after it, up to its declared `Content-Length`; then the frames end. The head's reason phrase is
+/// taken for the head's slots. RED before the fix: only the head went up, and no reason was kept.
+#[test]
+fn a_refused_upgrade_hands_up_its_body_and_its_reason() {
+    let framer = WsFramer::new(0);
+    let mut out = Out::default();
+    let state = framer
+        .open_with(Side::Dial, "ws://127.0.0.1:9/x", &[], &mut out)
+        .expect("the dial opens");
+    let body = br#"{"error":"bad key"}"#;
+    let answer = format!(
+        "HTTP/1.1 401 Unauthorized\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+        body.len()
+    );
+    let mut first = answer.into_bytes();
+    first.extend_from_slice(&body[..5]);
+    let mut heard = Out::default();
+    framer
+        .ingest(state, &first, false, &mut heard)
+        .expect("the far end answered");
+    assert_eq!(
+        heard.statuses[0],
+        Some((401, Some(WireStatusClass::CallerFault)))
+    );
+    assert_eq!(
+        framer.take_reason(state).as_deref(),
+        Some(&b"Unauthorized"[..])
+    );
+    assert_eq!(framer.take_reason(state), None, "taken once");
+    let mut rest = Out::default();
+    framer
+        .ingest(state, &body[5..], false, &mut rest)
+        .expect("the rest of the body");
+    let mut got: Vec<u8> = heard.frames[1..].concat();
+    got.extend(rest.frames.concat());
+    assert_eq!(got, body.to_vec(), "the whole error document, once");
+}
+
+/// A REFUSED UPGRADE'S WHOLE BODY, PAST THE MACHINE'S ONE READ (Q128 transport-ws MEDIUM): head and
+/// a body larger than the protocol machine's handshake read arrive in ONE chunk, and every byte of
+/// it is handed up, then the frames end; with no declared length, the body runs to the carrier's
+/// end, and that end is forwarded. RED before the fix: the bytes past the machine's read were
+/// dropped, and a carrier that had already ended never ended the frames.
+#[test]
+fn a_refused_upgrade_hands_up_a_large_body_and_the_carrier_end() {
+    let body = vec![b'x'; 9000];
+    // Declared length, head and body in one chunk.
+    let framer = WsFramer::new(0);
+    let mut out = Out::default();
+    let state = framer
+        .open_with(Side::Dial, "ws://127.0.0.1:9/x", &[], &mut out)
+        .expect("the dial opens");
+    let mut chunk = format!(
+        "HTTP/1.1 503 Busy\r\nContent-Length: {}\r\n\r\n",
+        body.len()
+    )
+    .into_bytes();
+    chunk.extend_from_slice(&body);
+    let mut heard = Out::default();
+    framer
+        .ingest(state, &chunk, false, &mut heard)
+        .expect("the far end answered");
+    assert_eq!(heard.frames[1..].concat(), body, "the whole body, once");
+    assert!(heard.ended, "the declared length is met: the frames end");
+    // No declared length; the carrier ended with the chunk.
+    let framer = WsFramer::new(0);
+    let mut out = Out::default();
+    let state = framer
+        .open_with(Side::Dial, "ws://127.0.0.1:9/x", &[], &mut out)
+        .expect("the dial opens");
+    let mut chunk = b"HTTP/1.1 502 Bad Gateway\r\n\r\n".to_vec();
+    chunk.extend_from_slice(&body);
+    let mut heard = Out::default();
+    framer
+        .ingest(state, &chunk, true, &mut heard)
+        .expect("the far end answered");
+    assert_eq!(heard.frames[1..].concat(), body, "the whole body, once");
+    assert!(heard.ended, "the carrier ended: the frames end");
+}
+
+/// A REFUSED UPGRADE'S CHUNKED BODY IS DECODED BY ITS TRANSFER CODING (Q128 transport-ws LOW, both
+/// readers on a5c9118; RFC 9112 §6.3 and §7.1: `Transfer-Encoding: chunked` overrides any
+/// `Content-Length`, and the body ends at its last chunk): on a kept-alive connection the plane gets
+/// the error document without chunk markers, across pieces split mid-size-line and mid-chunk, and
+/// the frames end at the zero-length chunk and its trailers, not at the carrier's end. RED before
+/// the fix: the chunk-size lines reached the plane, and the frames never ended.
+#[test]
+fn a_refused_upgrades_chunked_body_is_decoded_and_ends_at_its_last_chunk() {
+    let framer = WsFramer::new(0);
+    let mut out = Out::default();
+    let state = framer
+        .open_with(Side::Dial, "ws://127.0.0.1:9/x", &[], &mut out)
+        .expect("the dial opens");
+    let wire: &[u8] = b"HTTP/1.1 401 Unauthorized\r\nTransfer-Encoding: chunked\r\n\
+        Content-Length: 3\r\n\r\n7;ext=1\r\n{\"error\r\nC\r\n\":\"bad key\"}\r\n0\r\nx-trace: 1\r\n\r\n";
+    let split = wire
+        .windows(2)
+        .position(|w| w == b"C\r")
+        .expect("the second size line")
+        + 1;
+    let mut heard = Out::default();
+    framer
+        .ingest(state, &wire[..split], false, &mut heard)
+        .expect("the far end answered");
+    assert_eq!(
+        heard.statuses[0],
+        Some((401, Some(WireStatusClass::CallerFault)))
+    );
+    assert!(!heard.ended, "the last chunk has not come");
+    let mut rest = Out::default();
+    framer
+        .ingest(state, &wire[split..], false, &mut rest)
+        .expect("the rest of the body");
+    let mut got: Vec<u8> = heard.frames[1..].concat();
+    got.extend(rest.frames.concat());
+    assert_eq!(got, br#"{"error":"bad key"}"#.to_vec(), "decoded, once");
+    assert!(
+        rest.ended,
+        "the last chunk ends the frames on a kept-alive carrier"
+    );
+}
+
+/// THE CEILING HOLDS FOR WHAT AN OPEN CONNECTION WRITES TOO (Q128 transport-ws LOW): a message over
+/// the ceiling, whole or gathered from pieces, is refused as a held one is, and one within it goes
+/// out. RED before the fix: the open path sent any size (the machine bounds only what it reads).
+#[test]
+fn an_open_connection_refuses_an_outbound_message_over_the_ceiling() {
+    let framer = WsFramer::new(8);
+    let mut out = Out::default();
+    let state = framer
+        .open_with(Side::Dial, "ws://127.0.0.1:9/x", &[], &mut out)
+        .expect("the dial opens");
+    let request = String::from_utf8(out.sent.clone()).expect("an upgrade request");
+    let mut opened = Out::default();
+    framer
+        .ingest(state, &switching(&request), false, &mut opened)
+        .expect("the handshake completes");
+    let mut w = Out::default();
+    assert!(
+        framer
+            .emit_text(state, b"123456789", true, false, &mut w)
+            .is_err(),
+        "whole"
+    );
+    framer
+        .emit_text(state, b"12345", false, false, &mut w)
+        .expect("a piece within the ceiling");
+    assert!(
+        framer
+            .emit_text(state, b"6789", true, false, &mut w)
+            .is_err(),
+        "gathered"
+    );
+    let mut ok = Out::default();
+    framer
+        .emit_text(state, b"12345678", true, false, &mut ok)
+        .expect("within the ceiling");
+    assert!(!ok.sent.is_empty(), "the message went out");
+}
+
+/// A REFUSED PIECE TAKES ITS MESSAGE'S GATHERED PIECES WITH IT ON A DIAL STILL HANDSHAKING (Q128
+/// transport-ws LOW, reader r52 on 3286006), as the open path drops them: the next message is held
+/// alone, not glued to the refused one's front. RED before the fix: the refused message's first
+/// pieces stayed gathered, so a next message within the ceiling read as over it.
+#[test]
+fn a_refused_piece_on_a_dial_drops_its_gathered_pieces() {
+    let framer = WsFramer::new(8);
+    let mut out = Out::default();
+    let state = framer
+        .open_with(Side::Dial, "ws://127.0.0.1:9/x", &[], &mut out)
+        .expect("the dial opens");
+    let mut w = Out::default();
+    framer
+        .emit_text(state, b"12345", false, false, &mut w)
+        .expect("a piece within the ceiling");
+    assert!(
+        framer
+            .emit_text(state, b"6789", true, false, &mut w)
+            .is_err(),
+        "the gathered message is over the ceiling"
+    );
+    framer
+        .emit_text(state, b"1234", true, false, &mut w)
+        .expect("a next message within the ceiling is held alone");
+}
+
+/// THE DIALLED HEAD'S ORDER IS PINNED (Q128 transport-ws LOW, reader r51 on 3286006): the request
+/// line, the machine's handshake lines in their fixed order, then the opening fields (in the
+/// request map's own order, a repeated name's lines together and in their order); an opening field
+/// of a handshake name is not copied. The doc at `HANDSHAKE_FIELDS` states this order.
+#[test]
+fn the_dialled_heads_order_is_pinned() {
+    let framer = WsFramer::new(0);
+    let mut out = Out::default();
+    let fields = [
+        ("authorization".to_string(), b"Bearer k".to_vec()),
+        ("x-plane".to_string(), b"1".to_vec()),
+        ("host".to_string(), b"elsewhere.test".to_vec()),
+        ("authorization".to_string(), b"Second k".to_vec()),
+    ];
+    framer
+        .open_with(Side::Dial, "ws://svc.test:9/x", &fields, &mut out)
+        .expect("the dial opens");
+    let request = String::from_utf8(out.sent.clone()).expect("an upgrade request");
+    let names: Vec<&str> = request
+        .split("\r\n")
+        .skip(1)
+        .take_while(|l| !l.is_empty())
+        .map(|l| l.split(':').next().unwrap_or_default())
+        .collect();
+    assert!(request.starts_with("GET /x HTTP/1.1\r\n"), "{request}");
+    assert_eq!(
+        names[..5],
+        [
+            "Host",
+            "Connection",
+            "Upgrade",
+            "Sec-WebSocket-Version",
+            "Sec-WebSocket-Key",
+        ],
+        "the handshake's lines lead: {request}"
+    );
+    // Then the opening fields, each line once, a repeated name's lines together.
+    let mut rest = names[5..].to_vec();
+    let auth_at = rest
+        .iter()
+        .position(|n| *n == "authorization")
+        .expect("authorization");
+    assert_eq!(rest.get(auth_at + 1), Some(&"authorization"), "{request}");
+    rest.sort_unstable();
+    assert_eq!(
+        rest,
+        ["authorization", "authorization", "x-plane"],
+        "{request}"
+    );
+    assert!(
+        request.contains("Host: svc.test:9\r\n"),
+        "the opening host is not copied"
+    );
+    assert!(
+        request.find("Bearer k") < request.find("Second k"),
+        "a repeated name's lines keep their order"
+    );
+}
+
+/// A REFUSED UPGRADE'S BODY CUT SHORT BY THE CARRIER ENDS FAILED (Q128 transport-ws LOW, reader r51
+/// on 3286006): a carrier that ends before the declared `Content-Length` (or before the last chunk)
+/// ends the frames failed, not whole. RED before the fix: a short body read as a whole one.
+#[test]
+fn a_refused_upgrades_short_body_ends_failed() {
+    for (head, body) in [
+        (
+            "HTTP/1.1 401 Unauthorized\r\nContent-Length: 10\r\n\r\n",
+            &b"short"[..],
+        ),
+        (
+            "HTTP/1.1 401 Unauthorized\r\nTransfer-Encoding: chunked\r\n\r\n",
+            &b"a\r\nshort"[..],
+        ),
+    ] {
+        let framer = WsFramer::new(0);
+        let mut out = Out::default();
+        let state = framer
+            .open_with(Side::Dial, "ws://127.0.0.1:9/x", &[], &mut out)
+            .expect("the dial opens");
+        let mut wire = head.as_bytes().to_vec();
+        wire.extend_from_slice(body);
+        let mut heard = Out::default();
+        framer
+            .ingest(state, &wire, true, &mut heard)
+            .expect("the far end answered");
+        assert!(heard.ended, "{head}: the frames end");
+        assert!(framer.failed(state), "{head}: a short body ends failed");
+    }
+    // A body the carrier's end does not cut is whole.
+    let framer = WsFramer::new(0);
+    let mut out = Out::default();
+    let state = framer
+        .open_with(Side::Dial, "ws://127.0.0.1:9/x", &[], &mut out)
+        .expect("the dial opens");
+    let mut heard = Out::default();
+    framer
+        .ingest(
+            state,
+            b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 2\r\n\r\nok",
+            true,
+            &mut heard,
+        )
+        .expect("the far end answered");
+    assert!(heard.ended && !framer.failed(state));
+}
+
+/// A MALFORMED CHUNKED CODING ENDS FAILED (Q128 transport-ws MEDIUM, reader r162 on 0769fe6): a
+/// refused upgrade's chunked body whose chunk-size is not hex, or whose chunk data is not followed
+/// by its line end, is not a whole body: the frames end, failed. RED before the fix: the decoder
+/// stopped there and the body read as whole and cleanly ended.
+#[test]
+fn a_malformed_chunked_body_ends_failed() {
+    for body in [
+        &b"zz\r\nhello\r\n0\r\n\r\n"[..],
+        &b"5\r\nhelloXX\r\n0\r\n\r\n"[..],
+    ] {
+        let framer = WsFramer::new(0);
+        let mut out = Out::default();
+        let state = framer
+            .open_with(Side::Dial, "ws://127.0.0.1:9/x", &[], &mut out)
+            .expect("the dial opens");
+        let mut wire = b"HTTP/1.1 401 Unauthorized\r\nTransfer-Encoding: chunked\r\n\r\n".to_vec();
+        wire.extend_from_slice(body);
+        let mut heard = Out::default();
+        framer
+            .ingest(state, &wire, false, &mut heard)
+            .expect("the far end answered");
+        assert!(heard.ended, "{body:?}: the frames end");
+        assert!(
+            framer.failed(state),
+            "{body:?}: a malformed coding ends failed"
+        );
+    }
+}
+
+/// A REFUSED UPGRADE'S `Retry-After` IS READ IN BOTH OF RFC 9110's FORMS (Q128 transport-ws LOW,
+/// reader r72 on f876543), as the http framer reads it: delay-seconds, and an IMF-fixdate as the
+/// seconds left until it (`0` once past). RED before the fix: the HTTP-date form was dropped.
+#[test]
+fn a_retry_after_is_read_in_both_forms() {
+    let mut h = HeaderMap::new();
+    h.insert("retry-after", HeaderValue::from_static("7"));
+    assert_eq!(retry_after(&h, 0), Some(7));
+    // 1445412480 = Wed, 21 Oct 2015 07:28:00 GMT.
+    h.insert(
+        "retry-after",
+        HeaderValue::from_static("Wed, 21 Oct 2015 07:28:00 GMT"),
+    );
+    assert_eq!(retry_after(&h, 1_445_412_470), Some(10));
+    assert_eq!(retry_after(&h, 1_445_412_490), Some(0), "past: no wait");
+    h.insert("retry-after", HeaderValue::from_static("soon"));
+    assert_eq!(retry_after(&h, 0), None);
+}
+
+/// A REFUSED UPGRADE WITH A STATUS THAT CARRIES NO BODY ENDS AT ITS HEAD (Q128 transport-ws LOW,
+/// reader r72 on f876543; RFC 9112 §6.3: 1xx, 204 and 304 carry none), on a kept-alive carrier.
+/// RED before the fix: the frames waited for the carrier to close.
+#[test]
+fn a_bodiless_refusal_ends_at_its_head() {
+    for answer in [
+        &b"HTTP/1.1 304 Not Modified\r\n\r\n"[..],
+        &b"HTTP/1.1 204 No Content\r\nContent-Length: 9\r\n\r\n"[..],
+    ] {
+        let framer = WsFramer::new(0);
+        let mut out = Out::default();
+        let state = framer
+            .open_with(Side::Dial, "ws://127.0.0.1:9/x", &[], &mut out)
+            .expect("the dial opens");
+        let mut heard = Out::default();
+        framer
+            .ingest(state, answer, false, &mut heard)
+            .expect("the far end answered");
+        assert!(
+            heard.ended,
+            "{}: ended at its head",
+            String::from_utf8_lossy(answer)
+        );
+        assert!(!framer.failed(state));
+    }
+}
+
+/// A dialled head's reason phrase is the status line's text after its code, once the line is whole.
+#[test]
+fn a_reason_phrase_is_read_off_a_whole_status_line() {
+    assert_eq!(
+        reason_phrase(b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n"),
+        Some(b"Switching Protocols".to_vec())
+    );
+    assert_eq!(
+        reason_phrase(b"HTTP/1.1 401 Unauthorized"),
+        None,
+        "not whole yet"
+    );
+    assert_eq!(reason_phrase(b"HTTP/1.1 204 \r\n"), None, "no phrase");
+}
+
 /// The close code of the first close frame in a client's (masked) `wire`.
 fn close_code(wire: &[u8]) -> Option<u16> {
     let mut at = 0;
@@ -372,4 +765,181 @@ fn a_held_text_message_that_is_not_utf8_fails_at_the_call() {
         .ingest(state, &switching(&request), false, &mut done)
         .expect("the handshake completes");
     assert_eq!(opcodes(&done.sent), [0x1]);
+}
+
+/// An auth line of the head.
+fn field_line(name: &str, value: &[u8]) -> AuthLine {
+    AuthLine {
+        name: name.into(),
+        value: Zeroizing::new(value.to_vec()),
+        query: false,
+    }
+}
+
+/// The upgrade request `head` stands for, as the wire would carry it.
+fn as_sent(head: &UpgradeHead<'_>) -> String {
+    let mut wire = format!("GET {}", head.target);
+    if let Some(query) = head.query {
+        wire.push('?');
+        wire.push_str(query);
+    }
+    wire.push_str(" HTTP/1.1\r\n");
+    for (name, value) in head.fields {
+        wire.push_str(&format!("{name}: {}\r\n", String::from_utf8_lossy(value)));
+    }
+    wire
+}
+
+/// RULING 23 (nothing is added to a head after its auth runs; Q128 transport-ws r72 item 1): a
+/// dial's binding auth is called ONCE over the upgrade request exactly as it goes on the wire,
+/// the handshake's own lines among it; its answer joins last, a field line replacing any line of
+/// its name, a query key joining the target's query; nothing follows it. RED before the fix: the
+/// auth's answer never reached the wire.
+#[test]
+fn an_auth_that_signs_the_whole_head_sees_every_byte_on_the_wire() {
+    let framer = WsFramer::new(0);
+    let fields = [
+        ("x-plane".to_string(), b"1".to_vec()),
+        ("x-sig".to_string(), b"stale".to_vec()),
+        ("x-plane".to_string(), b"2".to_vec()),
+    ];
+    let mut seen = Vec::new();
+    let mut sign = |head: &UpgradeHead<'_>| {
+        seen.push((as_sent(head), head.authority.to_owned()));
+        Poll::Ready(Ok(vec![
+            field_line("X-Sig", b"signed"),
+            AuthLine {
+                name: "sig".into(),
+                value: Zeroizing::new(b"q1".to_vec()),
+                query: true,
+            },
+        ]))
+    };
+    let mut out = Out::default();
+    let Poll::Ready(Ok(state)) = framer.open_signed(
+        PARKING,
+        "ws://svc.test:9/x?a=1&sig=old",
+        &fields,
+        &mut sign,
+        &mut out,
+    ) else {
+        panic!("the dial opens");
+    };
+    let request = String::from_utf8(out.sent.clone()).expect("an upgrade request");
+    assert_eq!(seen.len(), 1, "the auth is called once");
+    let (signed_over, authority) = &seen[0];
+    assert_eq!(authority, "svc.test:9");
+    for line in [
+        "Host: svc.test:9\r\n",
+        "Sec-WebSocket-Key: ",
+        "x-plane: 1\r\n",
+        "x-sig: stale\r\n",
+    ] {
+        assert!(
+            signed_over.contains(line),
+            "the auth saw {line:?}: {signed_over}"
+        );
+    }
+    let expected = signed_over
+        .replace("GET /x?a=1&sig=old HTTP/1.1", "GET /x?a=1&sig=q1 HTTP/1.1")
+        .replace("x-sig: stale\r\n", "")
+        + "X-Sig: signed\r\n\r\n";
+    assert_eq!(
+        request, expected,
+        "every byte sent is a byte the auth signed, or its own answer, last"
+    );
+
+    // The far end's answer still completes the handshake over the signed request's key.
+    let mut done = Out::default();
+    framer
+        .ingest(state, &switching(&request), false, &mut done)
+        .expect("the handshake completes");
+    assert_eq!(done.statuses, [Some((101, Some(WireStatusClass::Success)))]);
+}
+
+/// An auth answer the upgrade request cannot carry refuses the dial: a value that would split a
+/// line, a handshake line of the framer's own, or a query value that would end the target.
+#[test]
+fn an_auth_answer_the_request_cannot_carry_refuses_the_dial() {
+    let answers = [
+        field_line("x-sig", b"a\r\nx-evil: 1"),
+        field_line("sec-websocket-key", b"forged"),
+        field_line("Host", b"elsewhere.test"),
+        AuthLine {
+            name: "sig".into(),
+            value: Zeroizing::new(b"a#b".to_vec()),
+            query: true,
+        },
+    ];
+    for answer in answers {
+        let framer = WsFramer::new(0);
+        let mut once = Some(answer);
+        let mut sign = |_: &UpgradeHead<'_>| Poll::Ready(Ok(once.take().into_iter().collect()));
+        let mut out = Out::default();
+        assert!(
+            matches!(
+                framer.open_signed(PARKING, "ws://svc.test/x", &[], &mut sign, &mut out),
+                Poll::Ready(Err(_))
+            ),
+            "refused"
+        );
+        assert!(out.sent.is_empty(), "nothing leaves on a refused dial");
+    }
+}
+
+/// The op's parking: one ticket, a deadline ahead of now.
+const PARKING: Parking = Parking {
+    ticket: (7, 1),
+    deadline: 1_000,
+    now: 10,
+};
+
+/// A SIGN THAT IS NOT READY PARKS THE DIAL, AND THE RESUME SIGNS THE SAME BYTES (ruling 23; the
+/// framer pends only on a ticketed auth call): nothing goes out while the auth's answer is
+/// pending; the resumed op on the same ticket offers the auth the SAME head (its key among it), so
+/// the answer the host stored signs exactly what is sent; a parked dial whose op's deadline
+/// passed is dropped, never resumed.
+#[test]
+fn a_pending_sign_parks_the_dial_and_its_resume_signs_the_same_head() {
+    let framer = WsFramer::new(0);
+    let mut heads = Vec::new();
+    let mut out = Out::default();
+    let mut pending = |head: &UpgradeHead<'_>| {
+        heads.push(as_sent(head));
+        Poll::Pending
+    };
+    assert!(framer
+        .open_signed(PARKING, "ws://svc.test/x", &[], &mut pending, &mut out)
+        .is_pending());
+    assert!(out.sent.is_empty(), "nothing leaves while the auth pends");
+    assert_eq!(framer.parked(), 1);
+
+    let mut ready = |head: &UpgradeHead<'_>| {
+        heads.push(as_sent(head));
+        Poll::Ready(Ok(vec![field_line("x-sig", b"s")]))
+    };
+    let Poll::Ready(Ok(_)) =
+        framer.open_signed(PARKING, "ws://svc.test/x", &[], &mut ready, &mut out)
+    else {
+        panic!("the resumed dial opens");
+    };
+    assert_eq!(heads.len(), 2);
+    assert_eq!(
+        heads[0], heads[1],
+        "the resume signs the same head, its key among it"
+    );
+    let request = String::from_utf8(out.sent.clone()).expect("an upgrade request");
+    assert_eq!(request, format!("{}x-sig: s\r\n\r\n", heads[0]));
+    assert_eq!(framer.parked(), 0, "a resumed dial is no longer parked");
+
+    // A dial parked past its op's deadline is dropped by the next park.
+    let mut pending = |_: &UpgradeHead<'_>| Poll::Pending;
+    let _ = framer.open_signed(PARKING, "ws://svc.test/x", &[], &mut pending, &mut out);
+    let later = Parking {
+        ticket: (8, 1),
+        deadline: 2_000,
+        now: 1_500,
+    };
+    let _ = framer.open_signed(later, "ws://svc.test/x", &[], &mut pending, &mut out);
+    assert_eq!(framer.parked(), 1, "only the live dial stays parked");
 }

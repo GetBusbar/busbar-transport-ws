@@ -18,6 +18,9 @@ use std::io::{Read, Write};
 use std::mem::zeroed;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 
+use crate::door::{Begin, Emit, Ingest, Open};
+use crate::WsFramer;
+use busbar_contract::abi::host::service::SCHEME_PLAIN;
 use busbar_contract::abi::mechanism::call::{AbiStr, Outcome};
 use busbar_contract::abi::mechanism::lifecycle::{OpenIn, OpenOut};
 use busbar_contract::abi::sdk::door::Slot;
@@ -28,8 +31,6 @@ use busbar_contract::abi::transport::{
 };
 use busbar_contract::transport::{ConnFacts, Framed, Framer, FramerOut, HostTime, Side};
 use busbar_contract::TransportMeta;
-use busbar_transport_ws::door::{Begin, Emit, Ingest, Open};
-use busbar_transport_ws::WsFramer;
 use tungstenite::protocol::Role;
 use tungstenite::{Bytes, Message, WebSocket};
 
@@ -46,7 +47,7 @@ fn text(s: &AbiStr) -> &'static [u8] {
 }
 
 fn claims() -> (Vec<String>, &'static [Claim]) {
-    let st = busbar_transport_ws::door::STATEMENT;
+    let st = crate::door::STATEMENT;
     // SAFETY: the Statement's claim list and kind tail are this crate's `'static` data.
     let names: &[AbiStr] = unsafe { std::slice::from_raw_parts(st.claims, st.claims_len) };
     let tail = unsafe { &*st.kind_tail.cast::<TransportTail>() };
@@ -348,6 +349,7 @@ impl Host {
         };
         let mut b: BeginIn = z();
         b.side = SIDE_ACCEPT;
+        b.scheme = SCHEME_PLAIN;
         b.target = AbiStr {
             ptr: std::ptr::null(),
             len: 0,

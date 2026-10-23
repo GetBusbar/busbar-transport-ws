@@ -29,7 +29,7 @@ mod transport;
 pub mod door;
 mod meta;
 
-pub use transport::WsFramer;
+pub(crate) use transport::WsFramer;
 
 /// THE TRANSPORT AXIS ENTRY (#3, #30): what the composition root folds for this wire — its key, the
 /// layers it declares, and its door, which the root builds the wire from (the `transport-door`
@@ -37,7 +37,7 @@ pub use transport::WsFramer;
 pub mod linked {
     use busbar_contract::transport::TransportMeta;
 
-    pub use crate::door::door;
+    pub use crate::door::{door, MACRO_DOOR};
 
     /// The row's registry key.
     pub const KEY: &str = <crate::WsFramer as TransportMeta>::KEY;
@@ -50,3 +50,11 @@ pub mod linked {
 #[cfg(test)]
 #[path = "tests/framer_tests.rs"]
 mod framer_tests;
+
+// THE FAULT EDGES, with the counting allocator their per-message witness reads (a thread-local
+// count, so the other tests of this binary do not move it). A unit module, so the framer stays
+// the crate's own (its one public entry is its door).
+#[cfg(test)]
+#[allow(unsafe_code)]
+#[path = "tests/faults_tests.rs"]
+mod faults_tests;
