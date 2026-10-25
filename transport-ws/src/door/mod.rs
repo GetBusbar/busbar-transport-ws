@@ -684,6 +684,20 @@ impl Slot for Locate {
     type In = LocateIn;
     type Out = LocateOut;
     fn call(p: *mut c_void, i: &LocateIn, o: &mut LocateOut) -> Outcome {
+        // A LISTENER names no far end (`LocateIn::accept`): the answer is the offer it makes, the
+        // version-1.1 upgrade the dial side offers too, with no authority and no name.
+        if i.accept != 0 {
+            let offer: &[u8] = b"\x08http/1.1";
+            if offer.len() > i.alpn_cap {
+                o.alpn_needed = offer.len() as u64;
+                o.head.error = abi_str("locate: a host buffer is too small");
+                return Outcome::Failed;
+            }
+            // SAFETY: the host's ALPN buffer, of the capacity checked above.
+            unsafe { std::ptr::copy_nonoverlapping(offer.as_ptr(), i.alpn_buf, offer.len()) };
+            o.alpn_written = offer.len() as u64;
+            return Outcome::Ready;
+        }
         let Ok(target) = std::str::from_utf8(text(&i.target)) else {
             o.head.error = abi_str("locate: the target is not text");
             return Outcome::Failed;
