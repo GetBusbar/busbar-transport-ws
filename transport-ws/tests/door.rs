@@ -590,3 +590,27 @@ fn a_refused_upgrade_s_retry_after_reaches_the_host() {
     assert_eq!(dial.heads[0].retry_after, Some(7), "the wait crosses");
     host.close();
 }
+
+/// BEGIN REFUSES A TARGET THAT IS NOT TEXT, as `locate` does (codeaudit g2 LOW): it never dials a
+/// U+FFFD-repaired address the host did not name. RED before the fix: the dial opened on the
+/// repaired target.
+#[test]
+fn begin_refuses_a_target_that_is_not_text() {
+    let mut host = Host::open(linked(), (64 * 1024, 64 * 1024, 64));
+    let target: &'static [u8] = b"ws://svc.test/\xff\xfe";
+    let mut i: BeginIn = z();
+    i.side = SIDE_DIAL;
+    i.scheme = SCHEME_PLAIN;
+    i.target = AbiStr {
+        ptr: target.as_ptr(),
+        len: target.len(),
+    };
+    i.sink = host.sink();
+    let mut o: FramerOut = z();
+    let r = call(host.ops.begin, host.inst, &mut i, &mut o, slot::BEGIN);
+    assert_eq!(r, Outcome::Failed, "a target that is not text is refused");
+    // SAFETY: the door's error text, valid until the next call.
+    let why = unsafe { std::slice::from_raw_parts(o.head.error.ptr, o.head.error.len) };
+    assert_eq!(why, b"begin: the target is not text");
+    host.close();
+}
