@@ -89,6 +89,7 @@ fn a_panicked_framing_is_forgotten_by_the_framer_at_its_finish() {
         framer: WsFramer::new(0),
         owed: Mutex::new(HashMap::new()),
         services: None,
+        refused: Mutex::new(String::new()),
     };
     let mut sink_out = Owed::default();
     let mut c = Collect {
@@ -134,6 +135,7 @@ fn a_cancel_releases_the_dial_parked_on_its_ticket() {
         framer: WsFramer::new(0),
         owed: Mutex::new(HashMap::new()),
         services: None,
+        refused: Mutex::new(String::new()),
     };
     let parking = crate::transport::Parking {
         ticket: (3, 9),

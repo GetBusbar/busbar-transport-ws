@@ -424,6 +424,9 @@ pub struct Instance {
     /// The host services `open` was handed (`OpenIn::host`): the binding's auth a dial calls.
     /// `None`: the host offers none, and a dial whose binding has an auth is refused.
     services: Option<Services>,
+    /// The last refused refresh's text, held so the answer's error names live memory until the
+    /// next refused refresh (a refresh runs alone on its instance).
+    refused: Mutex<String>,
 }
 
 impl Instance {
@@ -482,29 +485,83 @@ impl BytesOut for Collect<'_> {
     }
 }
 
-fn read_settings(b: &Blob) -> Result<usize, &'static str> {
-    let text: &[u8] = if b.ptr.is_null() || b.len == 0 {
-        b"{}"
+/// Why a settings blob is refused: a fixed text, or the one naming the key the transport does not
+/// read.
+#[derive(Debug, PartialEq, Eq)]
+enum Unread {
+    Text(&'static str),
+    Key(String),
+}
+
+impl Unread {
+    /// The text, owned (the key's is formatted here, off the hot path: settings are read at
+    /// validate, open and refresh only).
+    fn text(&self) -> std::borrow::Cow<'static, str> {
+        match self {
+            Self::Text(t) => (*t).into(),
+            Self::Key(k) => format!("settings: {k} is not a setting this transport reads").into(),
+        }
+    }
+}
+
+/// The ceiling's one bad-value text: zero, a negative, a fraction or another kind alike.
+const BAD_BODY_MAX: &str =
+    "settings: limits.request_body_max_bytes must be a count of bytes above 0";
+
+/// The settings blob read: a JSON object (empty bytes = `{}`) whose every key is one this transport
+/// declares, its ceiling a count above 0.
+fn read_settings(b: &Blob) -> Result<usize, Unread> {
+    let bytes: &[u8] = if b.ptr.is_null() || b.len == 0 {
+        &[]
     } else {
         // SAFETY: the host's blob, valid for the call.
         unsafe { std::slice::from_raw_parts(b.ptr, b.len) }
     };
-    let v: serde_json::Value = serde_json::from_slice(text).map_err(|_| "settings: not JSON")?;
-    match v.get(BODY_MAX_BYTES) {
-        None => Ok(DEFAULT_REQUEST_BODY_MAX_BYTES),
-        Some(x) => {
-            let n = x
-                .as_u64()
-                .and_then(|n| usize::try_from(n).ok())
-                .ok_or("settings: a value is not of its declared kind")?;
-            // `WsFramer::new(0)` means the library's inbound default and NO outbound ceiling: refuse
-            // rather than open without one.
-            if n == 0 {
-                return Err("settings: limits.request_body_max_bytes must be above 0");
-            }
-            Ok(n)
-        }
+    let object = busbar_contract::abi::sdk::life::settings_object(bytes)
+        .map_err(|_| Unread::Text("settings: must be a JSON object"))?;
+    if let Some(key) = object.keys().find(|k| k.as_str() != BODY_MAX_BYTES) {
+        return Err(Unread::Key(key.clone()));
     }
+    match object.get(BODY_MAX_BYTES) {
+        None => Ok(DEFAULT_REQUEST_BODY_MAX_BYTES),
+        // `WsFramer::new(0)` means the library's inbound default and NO outbound ceiling: refuse
+        // rather than open without one.
+        Some(x) => x
+            .as_u64()
+            .and_then(|n| usize::try_from(n).ok())
+            .filter(|&n| n > 0)
+            .ok_or(Unread::Text(BAD_BODY_MAX)),
+    }
+}
+
+/// The text a call with no instance yet (`validate`, `open`) names: a fixed one where it lives, an
+/// owned one written into the host's lent reason buffer (`err_buf`, cut on a char boundary to
+/// `err_cap`), and, when the host lent none, the generic text. Answers the text and its length in
+/// the buffer (`0` for a fixed text).
+fn lent_text(why: &Unread, buf: *mut u8, cap: usize) -> (AbiStr, usize) {
+    if let Unread::Text(t) = why {
+        return (abi_str(t), 0);
+    }
+    if buf.is_null() || cap == 0 {
+        return (
+            abi_str("settings: a key is not a setting this transport reads"),
+            0,
+        );
+    }
+    let text = why.text();
+    let mut end = text.len().min(cap);
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    // SAFETY: the host's reason buffer of `cap >= end` writable bytes, lent for this call.
+    unsafe { std::ptr::copy_nonoverlapping(text.as_ptr(), buf, end) };
+    (
+        AbiStr {
+            ptr: buf.cast_const(),
+            len: end,
+        },
+        end,
+    )
 }
 
 fn instance<'a>(p: *mut c_void) -> &'a Instance {
@@ -605,7 +662,7 @@ impl Slot for Validate {
         match read_settings(&i.settings) {
             Ok(_) => Outcome::Ready,
             Err(e) => {
-                o.error = abi_str(e);
+                o.error = lent_text(&e, i.err_buf, i.err_cap).0;
                 Outcome::Failed
             }
         }
@@ -626,12 +683,48 @@ impl Slot for Open {
                     framer: WsFramer::new(max),
                     owed: Mutex::new(HashMap::new()),
                     services,
+                    refused: Mutex::new(String::new()),
                 }))
                 .cast();
                 Outcome::Ready
             }
             Err(e) => {
-                o.head.error = abi_str(e);
+                (o.head.error, o.err_len) = lent_text(&e, i.err_buf, i.err_cap);
+                Outcome::Failed
+            }
+        }
+    }
+}
+
+/// `refresh`: the new settings re-read with exactly the validate texts. A refused blob keeps the old
+/// settings; an accepted one applies to framings begun after it (each framing keeps the ceiling it
+/// began under).
+pub struct Refresh;
+impl Slot for Refresh {
+    type In = RefreshIn;
+    type Out = OutHead;
+    fn call(p: *mut c_void, i: &RefreshIn, o: &mut OutHead) -> Outcome {
+        // SAFETY: the host passes back the pointer `open` answered, until `close`; NULL is none.
+        let Some(inst) = (unsafe { p.cast::<Instance>().as_ref() }) else {
+            o.error = abi_str("refresh: no open instance");
+            return Outcome::Failed;
+        };
+        match read_settings(&i.settings) {
+            Ok(max) => {
+                inst.framer.set_max(max);
+                Outcome::Ready
+            }
+            Err(Unread::Text(t)) => {
+                o.error = abi_str(t);
+                Outcome::Failed
+            }
+            Err(e) => {
+                let mut held = inst.refused.lock().unwrap_or_else(PoisonError::into_inner);
+                *held = e.text().into_owned();
+                o.error = AbiStr {
+                    ptr: held.as_ptr(),
+                    len: held.len(),
+                };
                 Outcome::Failed
             }
         }
@@ -683,7 +776,6 @@ macro_rules! answer {
     };
 }
 
-answer!(Refresh, RefreshIn, OutHead, Outcome::Ready);
 answer!(Retire, GenIn, OutHead, Outcome::Ready);
 answer!(Tick, TickIn, TickOut, Outcome::Ready);
 answer!(Drive, DriveIn, OutHead, Outcome::Ready);
