@@ -390,6 +390,11 @@ fn consume_wiped(wire: &mut Vec<u8>, at: &mut usize, n: usize) {
 /// The most handed-over piece buffers a framing keeps for reuse.
 const SPARE_MAX: usize = 8;
 
+/// The capacity a kept piece buffer holds at most: what one large message grew it past this is
+/// given back, so a framing keeps working-size spares, not its high-water mark (as stdio's
+/// `KEEP_BYTES`). A buffer within it is kept whole, so steady state allocates nothing.
+const KEEP_BYTES: usize = 256 * 1024;
+
 impl Owed {
     /// The bytes owed to the far side and not handed over yet.
     fn wire_owed(&self) -> &[u8] {
@@ -407,6 +412,11 @@ impl Owed {
     /// Keep a handed-over piece's buffer for the next piece.
     fn recycle(&mut self, b: Vec<u8>) {
         if self.spare.len() < SPARE_MAX {
+            let mut b = b;
+            if b.capacity() > KEEP_BYTES {
+                b.clear();
+                b.shrink_to(KEEP_BYTES);
+            }
             self.spare.push(b);
         }
     }
