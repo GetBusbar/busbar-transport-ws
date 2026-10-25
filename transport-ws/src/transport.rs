@@ -962,6 +962,15 @@ impl WsFramer {
         self.map().contains_key(&state)
     }
 
+    /// How many ingested bytes framing `state` holds unread (a test reads that bytes nobody will
+    /// read are not kept).
+    #[cfg(test)]
+    pub(crate) fn inbound_len(&self, state: u64) -> Option<usize> {
+        let conn = self.conn(state).ok()?;
+        let mut guard = Self::enter(&conn).ok()?;
+        guard.as_mut().map(|phase| phase.pipe().inbound.len())
+    }
+
     /// Framing `state`'s own lock, found under the map's.
     fn conn(&self, state: u64) -> Result<Conn, TransportError> {
         self.map()
@@ -1218,8 +1227,12 @@ impl WsFramer {
             }
         }
         if failed.is_some() {
-            ws.get_mut().inbound.clear();
             ended = true;
+        }
+        if ended {
+            // The frames ended (the peer's close, the connection gone, or a failure): the machine
+            // reads no more, so what is still in `inbound`, and what arrives later, is nobody's.
+            ws.get_mut().inbound.clear();
         }
         // Whatever the machine owes the far side (a pong, a close answer) goes out now.
         match ws.flush() {
