@@ -700,7 +700,7 @@ fn a_zero_message_ceiling_is_refused_by_validate_and_open() {
     let why = unsafe { std::slice::from_raw_parts(o.error.ptr, o.error.len) };
     assert_eq!(
         why,
-        b"settings: limits.request_body_max_bytes must be above 0"
+        b"settings: limits.request_body_max_bytes must be a count of bytes above 0"
     );
     let mut oi: OpenIn = z();
     oi.settings = Blob {
@@ -885,7 +885,7 @@ fn a_refused_open_says_why() {
     let mut host = auth_host::open(0);
     assert_eq!(
         refused_begin(&mut host, "ws://u:p@host/", 0),
-        "the target is not a ws:// or wss:// URL"
+        "begin: the target carries userinfo; credentials never ride a URL"
     );
     host.close();
 }
@@ -1086,7 +1086,7 @@ fn an_op_after_a_refuse_fails_and_does_not_end_the_stream_again() {
     assert_eq!(r, Outcome::Failed, "the op fails");
     // SAFETY: the door's error text, valid until the next call.
     let why = unsafe { std::slice::from_raw_parts(o.head.error.ptr, o.head.error.len) };
-    assert_eq!(why, b"the connection is closed");
+    assert_eq!(why, b"ingest: the connection is closed");
     assert_eq!(accept.failures.len(), before);
     host.close();
 }
@@ -1155,7 +1155,7 @@ fn an_emit_after_a_refuse_with_a_backlog_fails_and_the_backlog_still_drains() {
     assert_eq!(r, Outcome::Failed, "new data on a closed framing fails");
     // SAFETY: the door's error text, valid until the next call.
     let why = unsafe { std::slice::from_raw_parts(o.head.error.ptr, o.head.error.len) };
-    assert_eq!(why, b"the connection is closed");
+    assert_eq!(why, b"emit: the connection is closed");
     let mut calls = 0;
     while more {
         calls += 1;
@@ -1166,5 +1166,419 @@ fn an_emit_after_a_refuse_with_a_backlog_fails_and_the_backlog_still_drains() {
     expect.extend_from_slice(&body);
     expect.extend_from_slice(&[0x88, 2, 0x03, 0xE8]);
     assert_eq!(accept.wire, expect, "the backlog drains in full");
+    host.close();
+}
+
+// ── settings: the canonical texts (sibling alignment A, E) ───────────────────────────────────────
+
+/// The text an answer's head names.
+fn said(error: &AbiStr) -> String {
+    if error.ptr.is_null() {
+        return String::new();
+    }
+    // SAFETY: the door's error text, valid until the next call.
+    String::from_utf8(unsafe { std::slice::from_raw_parts(error.ptr, error.len) }.to_vec())
+        .expect("the reason is text")
+}
+
+/// `validate` over `settings`, a reason buffer lent: its outcome and its text.
+fn validate(settings: &[u8]) -> (Outcome, String) {
+    use busbar_contract::abi::mechanism::call::Blob;
+    use busbar_contract::abi::mechanism::lifecycle::ValidateIn;
+    let mut buf = [0_u8; 256];
+    let mut i: ValidateIn = z();
+    i.settings = Blob {
+        ptr: settings.as_ptr(),
+        len: settings.len(),
+        ..z()
+    };
+    i.err_buf = buf.as_mut_ptr();
+    i.err_cap = buf.len();
+    let mut o: OutHead = z();
+    let r = call(
+        linked().head.validate,
+        std::ptr::null_mut(),
+        &mut i,
+        &mut o,
+        life::VALIDATE,
+    );
+    (r, said(&o.error))
+}
+
+/// `open` over `settings`, a reason buffer lent: its outcome and its text (the instance, if one
+/// opened, is closed).
+fn open_with(settings: &[u8]) -> (Outcome, String) {
+    use busbar_contract::abi::mechanism::call::Blob;
+    let mut buf = [0_u8; 256];
+    let mut i: OpenIn = z();
+    i.settings = Blob {
+        ptr: settings.as_ptr(),
+        len: settings.len(),
+        ..z()
+    };
+    i.err_buf = buf.as_mut_ptr();
+    i.err_cap = buf.len();
+    let mut o: OpenOut = z();
+    let r = call(
+        linked().head.open,
+        std::ptr::null_mut(),
+        &mut i,
+        &mut o,
+        life::OPEN,
+    );
+    let text = said(&o.head.error);
+    if r == Outcome::Ready {
+        let mut ci: InHead = z();
+        let mut co: OutHead = z();
+        call(
+            linked().head.close,
+            o.instance,
+            &mut ci,
+            &mut co,
+            life::CLOSE,
+        );
+    } else if !text.is_empty() && o.head.error.ptr == buf.as_ptr() {
+        assert_eq!(o.err_len, text.len(), "an open states its reason's length");
+    }
+    (r, text)
+}
+
+/// SETTINGS ARE A JSON OBJECT: a number, an array or a string is refused, by `validate` and `open`.
+/// RED before the fix: `5` and `[]` opened with the defaults.
+#[test]
+fn settings_that_are_not_a_json_object_are_refused() {
+    for settings in [&b"5"[..], b"[]", b"\"x\"", b"not json"] {
+        for (r, text) in [validate(settings), open_with(settings)] {
+            assert_eq!(
+                r,
+                Outcome::Failed,
+                "{:?}",
+                String::from_utf8_lossy(settings)
+            );
+            assert_eq!(text, "settings: must be a JSON object");
+        }
+    }
+    assert_eq!(validate(b"").0, Outcome::Ready, "empty settings are `{{}}`");
+    assert_eq!(validate(b"{}").0, Outcome::Ready);
+}
+
+/// A KEY THE TRANSPORT DOES NOT DECLARE IS REFUSED BY NAME. RED before the fix: it was ignored.
+#[test]
+fn an_undeclared_setting_is_refused() {
+    let settings = br#"{"limits.request_body_max_bytes": 5, "nope": 1}"#;
+    for (r, text) in [validate(settings), open_with(settings)] {
+        assert_eq!(r, Outcome::Failed);
+        assert_eq!(text, "settings: nope is not a setting this transport reads");
+    }
+}
+
+/// A CEILING THAT IS NOT A COUNT ABOVE 0 SAYS THE CANONICAL TEXT. RED before the fix: a value of
+/// another kind said "a value is not of its declared kind".
+#[test]
+fn a_bad_message_ceiling_says_the_canonical_text() {
+    for value in ["0", "-1", "\"8\"", "1.5", "null", "true"] {
+        let settings = format!(r#"{{"limits.request_body_max_bytes": {value}}}"#);
+        for (r, text) in [
+            validate(settings.as_bytes()),
+            open_with(settings.as_bytes()),
+        ] {
+            assert_eq!(r, Outcome::Failed, "{value}");
+            assert_eq!(
+                text,
+                "settings: limits.request_body_max_bytes must be a count of bytes above 0"
+            );
+        }
+    }
+}
+
+/// `refresh` on `inst` with `settings`: its outcome and its text.
+fn refresh(inst: *mut c_void, settings: &[u8]) -> (Outcome, String) {
+    use busbar_contract::abi::mechanism::call::Blob;
+    use busbar_contract::abi::mechanism::lifecycle::RefreshIn;
+    let mut i: RefreshIn = z();
+    i.settings = Blob {
+        ptr: settings.as_ptr(),
+        len: settings.len(),
+        ..z()
+    };
+    let mut o: OutHead = z();
+    let r = call(linked().head.refresh, inst, &mut i, &mut o, life::REFRESH);
+    (r, said(&o.error))
+}
+
+/// A connected pair on `host`: the dialled end and the accepted one, past the upgrade.
+fn pair(host: &mut Host) -> (End, End) {
+    let mut dial = host.begin(SIDE_DIAL, "ws://svc.test/stream");
+    let mut accept = host.begin(SIDE_ACCEPT, "");
+    host.carry(&mut dial, &mut accept);
+    host.carry(&mut accept, &mut dial);
+    (dial, accept)
+}
+
+/// REFRESH RE-READS THE SETTINGS: a bad blob is refused with the validate texts and the old ceiling
+/// stays; a good one applies to framings begun after it, and one begun before keeps its own. RED
+/// before the fix: refresh answered READY to anything and the new ceiling never applied.
+#[test]
+fn refresh_rereads_the_settings_for_framings_begun_after_it() {
+    let mut host = Host::open(linked(), (64 * 1024, 64 * 1024, 64));
+    let (_, before) = pair(&mut host);
+    for (settings, text) in [
+        (&b"[]"[..], "settings: must be a JSON object"),
+        (
+            br#"{"x": 1}"#,
+            "settings: x is not a setting this transport reads",
+        ),
+        (
+            br#"{"limits.request_body_max_bytes": 0}"#,
+            "settings: limits.request_body_max_bytes must be a count of bytes above 0",
+        ),
+    ] {
+        assert_eq!(
+            refresh(host.inst, settings),
+            (Outcome::Failed, text.to_owned())
+        );
+    }
+    // The old (default) ceiling stands: a new framing still sends five bytes.
+    let (_, kept) = pair(&mut host);
+    assert_eq!(host.emit(&kept, b"hello", 0).0, Outcome::Ready);
+    assert_eq!(
+        refresh(host.inst, br#"{"limits.request_body_max_bytes": 4}"#),
+        (Outcome::Ready, String::new())
+    );
+    let (_, after) = pair(&mut host);
+    assert_eq!(
+        host.emit(&after, b"hello", 0).0,
+        Outcome::Failed,
+        "a framing begun after the refresh holds the new ceiling"
+    );
+    assert_eq!(
+        host.emit(&before, b"hello", 0).0,
+        Outcome::Ready,
+        "a framing begun before keeps its own"
+    );
+    host.close();
+}
+
+// ── role stubs, a missing instance, op-prefixed texts (sibling alignment B, C, D) ────────────────
+
+/// A CARRIER OP IS REFUSED BY NAME: the ws framer serves none of them, and says which op it was
+/// asked for. RED before the fix: each answered REFUSED with no text.
+#[test]
+fn a_carrier_op_is_refused_by_name() {
+    use busbar_contract::abi::transport::{
+        AcceptIn, AcceptOut, ArrivalIn, ArrivalOut, ConnIn, ConnOut, DialIn, FramingIn, IoOut,
+        ListenIn, ListenOut, ReadIn, ShutIn, WriteIn,
+    };
+    let host = Host::open(linked(), (1024, 1024, 4));
+    let ops = host.ops;
+    macro_rules! refused {
+        ($field:ident, $slot:ident, $in:ty, $out:ty, $text:literal) => {{
+            let mut i: $in = z();
+            let mut o: $out = z();
+            let r = call(ops.$field, host.inst, &mut i, &mut o, slot::$slot);
+            // SAFETY: every `out` leads with its head.
+            let head = unsafe { &*std::ptr::from_ref(&o).cast::<OutHead>() };
+            assert_eq!((r, said(&head.error)), (Outcome::Refused, $text.to_owned()));
+        }};
+    }
+    refused!(
+        listen,
+        LISTEN,
+        ListenIn,
+        ListenOut,
+        "listen: the ws framer does not serve this op"
+    );
+    refused!(
+        accept,
+        ACCEPT,
+        AcceptIn,
+        AcceptOut,
+        "accept: the ws framer does not serve this op"
+    );
+    refused!(
+        dial,
+        DIAL,
+        DialIn,
+        ConnOut,
+        "dial: the ws framer does not serve this op"
+    );
+    refused!(
+        read,
+        READ,
+        ReadIn,
+        IoOut,
+        "read: the ws framer does not serve this op"
+    );
+    refused!(
+        write,
+        WRITE,
+        WriteIn,
+        IoOut,
+        "write: the ws framer does not serve this op"
+    );
+    refused!(
+        flush,
+        FLUSH,
+        ConnIn,
+        OutHead,
+        "flush: the ws framer does not serve this op"
+    );
+    refused!(
+        shut,
+        SHUT,
+        ShutIn,
+        OutHead,
+        "shut: the ws framer does not serve this op"
+    );
+    refused!(
+        arrival,
+        ARRIVAL,
+        ArrivalIn,
+        ArrivalOut,
+        "arrival: the ws framer does not serve this op"
+    );
+    refused!(
+        detach,
+        DETACH,
+        FramingIn,
+        FramerOut,
+        "detach: the ws framer does not serve this op"
+    );
+    host.close();
+}
+
+/// AN OP ON NO INSTANCE FAILS BY NAME, never reading through a NULL instance. RED before the fix:
+/// the door dereferenced the NULL pointer.
+#[test]
+fn an_op_with_no_instance_fails_by_name() {
+    use busbar_contract::abi::mechanism::lifecycle::RefreshIn;
+    use busbar_contract::abi::transport::{FramingIn, LocateIn, LocateOut};
+    let ops = linked();
+    let none = std::ptr::null_mut();
+    macro_rules! failed {
+        ($field:ident, $slot:expr, $in:ty, $out:ty, $text:literal) => {{
+            let mut i: $in = z();
+            let mut o: $out = z();
+            let r = call($field, none, &mut i, &mut o, $slot);
+            // SAFETY: every `out` leads with its head.
+            let head = unsafe { &*std::ptr::from_ref(&o).cast::<OutHead>() };
+            assert_eq!((r, said(&head.error)), (Outcome::Failed, $text.to_owned()));
+        }};
+    }
+    let (locate, begin, adopt, ingest) = (ops.locate, ops.begin, ops.adopt, ops.ingest);
+    let (emit, refuse, finish, timer) = (ops.emit, ops.refuse, ops.finish, ops.timer);
+    let refresh = ops.head.refresh;
+    let target = "ws://svc.test/";
+    let mut i: LocateIn = z();
+    i.target = AbiStr {
+        ptr: target.as_ptr(),
+        len: target.len(),
+    };
+    let mut o: LocateOut = z();
+    let r = call(locate, none, &mut i, &mut o, slot::LOCATE);
+    assert_eq!(
+        (r, said(&o.head.error)),
+        (Outcome::Failed, "locate: no open instance".to_owned())
+    );
+    failed!(
+        begin,
+        slot::BEGIN,
+        BeginIn,
+        FramerOut,
+        "begin: no open instance"
+    );
+    failed!(
+        adopt,
+        slot::ADOPT,
+        AdoptIn,
+        FramerOut,
+        "adopt: no open instance"
+    );
+    failed!(
+        ingest,
+        slot::INGEST,
+        IngestIn,
+        FramerOut,
+        "ingest: no open instance"
+    );
+    failed!(
+        emit,
+        slot::EMIT,
+        EmitIn,
+        FramerOut,
+        "emit: no open instance"
+    );
+    failed!(
+        refuse,
+        slot::REFUSE,
+        RefuseIn,
+        FramerOut,
+        "refuse: no open instance"
+    );
+    failed!(
+        finish,
+        slot::FINISH,
+        FinishIn,
+        FramerOut,
+        "finish: no open instance"
+    );
+    failed!(
+        timer,
+        slot::TIMER,
+        FramingIn,
+        FramerOut,
+        "timer: no open instance"
+    );
+    failed!(
+        refresh,
+        life::REFRESH,
+        RefreshIn,
+        OutHead,
+        "refresh: no open instance"
+    );
+}
+
+/// A FRAMING THE DOOR DOES NOT HOLD IS NAMED BY ITS OP. RED before the fix: "no such framing".
+#[test]
+fn an_unknown_framing_fails_by_op() {
+    let mut host = Host::open(linked(), (1024, 1024, 4));
+    let mut i: IngestIn = z();
+    i.framing = 77;
+    i.sink = host.sink();
+    let mut o: FramerOut = z();
+    let r = call(host.ops.ingest, host.inst, &mut i, &mut o, slot::INGEST);
+    assert_eq!(
+        (r, said(&o.head.error)),
+        (Outcome::Failed, "ingest: no such framing".to_owned())
+    );
+    host.close();
+}
+
+/// A TARGET CARRYING USERINFO IS REFUSED SAYING SO, and the text repeats no byte of it. RED before
+/// the fix: `locate` said "locate: the target is not a ws or wss URL".
+#[test]
+fn locate_refuses_a_target_carrying_userinfo() {
+    use busbar_contract::abi::transport::{LocateIn, LocateOut};
+    let host = Host::open(linked(), (1024, 1024, 4));
+    let target = "wss://user:hunter2@svc.test/";
+    let (mut auth, mut name) = ([0_u8; 64], [0_u8; 64]);
+    let mut i: LocateIn = z();
+    i.target = AbiStr {
+        ptr: target.as_ptr(),
+        len: target.len(),
+    };
+    i.authority_buf = auth.as_mut_ptr();
+    i.authority_cap = auth.len();
+    i.name_buf = name.as_mut_ptr();
+    i.name_cap = name.len();
+    let mut o: LocateOut = z();
+    let r = call(host.ops.locate, host.inst, &mut i, &mut o, slot::LOCATE);
+    assert_eq!(
+        (r, said(&o.head.error)),
+        (
+            Outcome::Failed,
+            "locate: the target carries userinfo; credentials never ride a URL".to_owned()
+        )
+    );
     host.close();
 }

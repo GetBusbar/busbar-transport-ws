@@ -89,6 +89,7 @@ fn a_panicked_framing_is_forgotten_by_the_framer_at_its_finish() {
         framer: WsFramer::new(0),
         owed: Mutex::new(HashMap::new()),
         services: None,
+        refused: Mutex::new(String::new()),
     };
     let mut sink_out = Owed::default();
     let mut c = Collect {
@@ -134,6 +135,7 @@ fn a_cancel_releases_the_dial_parked_on_its_ticket() {
         framer: WsFramer::new(0),
         owed: Mutex::new(HashMap::new()),
         services: None,
+        refused: Mutex::new(String::new()),
     };
     let parking = crate::transport::Parking {
         ticket: (3, 9),
@@ -285,4 +287,22 @@ fn the_wire_s_capacity_follows_its_backlog_not_its_throughput() {
             owed.wire.capacity()
         );
     }
+}
+
+/// A KEPT PIECE BUFFER GIVES BACK WHAT ONE LARGE MESSAGE GREW IT PAST [`KEEP_BYTES`]: a framing in
+/// steady state holds working-size spares, not its high-water mark eight times over. RED before
+/// the fix: a 4 MiB buffer was kept whole.
+#[test]
+fn a_kept_piece_buffer_is_bounded() {
+    let mut owed = Owed::default();
+    owed.recycle(vec![7; 4 * 1024 * 1024]);
+    owed.recycle(Vec::with_capacity(1024));
+    assert_eq!(owed.spare.len(), 2, "both are kept");
+    for b in &owed.spare {
+        assert!(b.capacity() <= KEEP_BYTES, "kept at {} bytes", b.capacity());
+    }
+    assert!(
+        owed.spare[1].capacity() >= 1024,
+        "a working-size buffer is kept whole"
+    );
 }
