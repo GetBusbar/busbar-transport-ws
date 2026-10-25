@@ -143,10 +143,13 @@ enum Phase {
     /// (its declared `Content-Length`), or with none declared, every byte until the carrier ends.
     /// At `Some(0)` its frames have ended and nothing more is read. `chunked`: the body's transfer
     /// coding is `chunked` (RFC 9112 §7.1), decoded here and ended at its last chunk; `left` is then
-    /// `None` until it ends.
+    /// `None` until it ends. With a transfer coding whose final coding is not `chunked`,
+    /// `Content-Length` is ignored and the body runs to the carrier's end (RFC 9112 §6.3).
     ///
     /// `short`: the carrier ended before the body did (short of its declared `Content-Length`, or
-    /// of its last chunk): the frames end FAILED, not whole ([`WsFramer::failed`]).
+    /// of its last chunk), or the declared `Content-Length` is not a length or disagrees with
+    /// itself (RFC 9110 §8.6), which fails the body at once: the frames end FAILED, not whole
+    /// ([`WsFramer::failed`]).
     Answered {
         pipe: Pipe,
         left: Option<u64>,
@@ -1121,7 +1124,10 @@ impl WsFramer {
                 // byte past the head (what came with it, then what still arrives) up to its declared
                 // `Content-Length`, or with none declared until the carrier ends, unless its
                 // transfer coding is `chunked`, which frames it instead (decoded, to its last
-                // chunk; RFC 9112 §6.3); then the frames end.
+                // chunk; RFC 9112 §6.3). With a transfer coding whose final coding is not `chunked`,
+                // `Content-Length` is ignored and the body runs to the carrier's end (§6.3); a
+                // `Content-Length` that is not a length or disagrees fails the body at once (RFC 9110
+                // §8.6); then the frames end.
                 Err(HandshakeError::Failure(WsError::Http(response))) => {
                     let code = response.status().as_u16();
                     let block = head_block(response.headers());
@@ -1470,7 +1476,8 @@ fn request_url(url: &str) -> Result<String, TransportError> {
 impl WsFramer {
     /// Whether the far side FAILED the connection in `state` (a protocol violation, text that is
     /// not UTF-8, a message over the ceiling), or a refused upgrade's body was cut short by the
-    /// carrier's end: its frames ended failed, not cleanly.
+    /// carrier's end, or declared a `Content-Length` that is not a length or disagrees (RFC 9110
+    /// §8.6): its frames ended failed, not cleanly.
     pub(crate) fn failed(&self, state: u64) -> bool {
         let Ok(conn) = self.conn(state) else {
             return false;
