@@ -989,3 +989,31 @@ fn a_refusal_is_not_glued_onto_a_gathered_partial_message() {
     let (_, payload) = first_data_payload(&refused.sent).expect("a data frame");
     assert_eq!(payload, b"refused".to_vec());
 }
+
+/// A BARE-LF RESPONSE HEAD IS READ AS THE PROTOCOL LIBRARY READS IT (codeaudit r1 g1): the status
+/// line ends at the first line feed, and the head at the first empty line, so the reason phrase is
+/// just the phrase and the body that arrived with the head is handed up. RED before the fix: the
+/// reason phrase spanned header lines and the body was dropped.
+#[test]
+fn a_bare_lf_response_head_is_read_whole() {
+    assert_eq!(
+        reason_phrase(b"HTTP/1.1 401 Unauthorized\nX-A: b\n\n"),
+        Some(b"Unauthorized".to_vec())
+    );
+    let framer = WsFramer::new(0);
+    let mut out = Out::default();
+    let state = framer
+        .open_with(Side::Dial, "ws://127.0.0.1:9/x", &[], &mut out)
+        .expect("the dial opens");
+    let mut heard = Out::default();
+    framer
+        .ingest(
+            state,
+            b"HTTP/1.1 401 Unauthorized\nX-A: b\nContent-Length: 5\n\nhello",
+            false,
+            &mut heard,
+        )
+        .expect("the far end answered");
+    assert_eq!(heard.frames[1..].concat(), b"hello".to_vec());
+    assert!(heard.ended && !framer.failed(state));
+}
