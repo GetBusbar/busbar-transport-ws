@@ -673,6 +673,17 @@ impl WsFramer {
         status: u32,
         out: &mut dyn FramerOut,
     ) -> Result<(), TransportError> {
+        // The refusal is its own message: the pieces of an unfinished outbound message are dropped,
+        // not sent glued to its front.
+        if let Ok(conn) = self.conn(state) {
+            if let Ok(mut guard) = Self::enter(&conn) {
+                if let Some(Phase::Open { message, .. } | Phase::Dialling { message, .. }) =
+                    guard.as_mut()
+                {
+                    message.clear();
+                }
+            }
+        }
         let sent = self.emit(state, StreamId(0), bytes, true, false, out);
         self.close_with(state, close_code_of_status(status), out);
         sent
