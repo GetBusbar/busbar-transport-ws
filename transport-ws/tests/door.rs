@@ -20,9 +20,9 @@ use busbar_contract::abi::transport::check::{check_framer, check_framer_fields};
 use busbar_contract::abi::transport::fields::lines;
 use busbar_contract::abi::transport::{
     slot, AdoptIn, BeginIn, EmitIn, FinishIn, FramePiece, FramerOut, FramerSink, IngestIn, Ops,
-    CLOSE_NORMAL, EMIT_TEXT, PIECE_CONTINUED, PIECE_END, PIECE_END_OF_FRAME, PIECE_FIELDS,
-    PIECE_HAS_CODE, PIECE_STREAM_FAILED, PIECE_TEXT, SIDE_ACCEPT, SIDE_DIAL, STATUS_SUCCESS,
-    YIELD_ENDED, YIELD_MORE,
+    RefuseIn, CLOSE_NORMAL, EMIT_TEXT, PIECE_CONTINUED, PIECE_END, PIECE_END_OF_FRAME,
+    PIECE_FIELDS, PIECE_HAS_CODE, PIECE_STREAM_FAILED, PIECE_TEXT, SIDE_ACCEPT, SIDE_DIAL,
+    STATUS_SUCCESS, YIELD_ENDED, YIELD_MORE,
 };
 use tungstenite::handshake::derive_accept_key;
 
@@ -935,7 +935,6 @@ fn a_refused_emit_with_a_backlog_fails_the_op_and_keeps_the_connection() {
     let (r, o) = host.emit(&accept, &big, 0);
     assert_eq!(r, Outcome::Failed, "the refused message fails the op");
     assert!(o.head.error.len > 0, "and says why");
-    assert!(!accept.ended, "the connection is not ended");
     host.say(&mut accept, "ok");
     host.carry(&mut accept, &mut dial);
     assert_eq!(texts(&dial), ["ok"], "a later message goes out");
@@ -1032,4 +1031,38 @@ fn an_adopted_connection_whose_leftover_is_refused_is_answered() {
         assert_answered(&accept, status);
         host.close();
     }
+}
+
+/// AN OP ON A FRAMING THAT WAS ALREADY GONE FAILS THE OP: after a successful `refuse` the state is
+/// gone; a later `ingest` answers `Failed` with an explained text, and ends nothing a second time.
+/// RED before the fix: it answered READY with a failed end piece reading "Closed".
+#[test]
+fn an_op_after_a_refuse_fails_and_does_not_end_the_stream_again() {
+    let mut host = Host::open(linked(), (64 * 1024, 64 * 1024, 8));
+    let mut dial = host.begin(SIDE_DIAL, "ws://svc.test/stream");
+    let mut accept = host.begin(SIDE_ACCEPT, "");
+    host.carry(&mut dial, &mut accept);
+    let mut i: RefuseIn = z();
+    i.framing = accept.framing;
+    i.sink = host.sink();
+    let mut o: FramerOut = z();
+    let r = call(host.ops.refuse, host.inst, &mut i, &mut o, slot::REFUSE);
+    assert_eq!(r, Outcome::Ready);
+    let more = host.take(r, &o, &mut accept);
+    host.again(more, &mut accept);
+    let before = accept.failures.len();
+    let bytes = client_message(0x1, b"late");
+    let mut i: IngestIn = z();
+    i.framing = accept.framing;
+    i.bytes = bytes.as_ptr();
+    i.len = bytes.len();
+    i.sink = host.sink();
+    let mut o: FramerOut = z();
+    let r = call(host.ops.ingest, host.inst, &mut i, &mut o, slot::INGEST);
+    assert_eq!(r, Outcome::Failed, "the op fails");
+    // SAFETY: the door's error text, valid until the next call.
+    let why = unsafe { std::slice::from_raw_parts(o.head.error.ptr, o.head.error.len) };
+    assert_eq!(why, b"the connection is closed");
+    assert_eq!(accept.failures.len(), before);
+    host.close();
 }

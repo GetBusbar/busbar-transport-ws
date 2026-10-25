@@ -247,8 +247,9 @@ struct Piece {
     /// The bytes belong to a text message (`PIECE_TEXT`).
     text: bool,
     /// The stream's end is a FAILURE (`PIECE_STREAM_FAILED`): the far side broke the protocol, sent
-    /// text that is not UTF-8 or a message over the ceiling. Only ever the end piece, whose bytes
-    /// say why; never split.
+    /// text that is not UTF-8 or a message over the ceiling, sent an upgrade request this end
+    /// refused, or ended a refused upgrade's answer short; or an op ended the framing's state.
+    /// Only ever the end piece, whose bytes say why; never split.
     failed: bool,
     /// The stream ends WHOLE here (`PIECE_END`): the empty last piece of its frames. An empty
     /// message (`bytes` empty without it) is a message, never the end.
@@ -353,7 +354,6 @@ struct Owed {
     spare: Vec<Vec<u8>>,
     ended: bool,
     deadline: Option<u64>,
-    error: String,
 }
 
 impl Drop for Owed {
@@ -768,18 +768,18 @@ impl Slot for Locate {
     }
 }
 
-/// Why an open was refused, said without the op's name (the text is static: nothing allocates).
+/// Why an op failed, said without the op's name (the text is static: nothing allocates).
 fn refused(e: &TransportError) -> &'static str {
     match e {
         TransportError::Refused => "the far side refused the connection",
-        TransportError::Timeout => "the opening handshake timed out",
-        TransportError::Reset => "the connection was reset during the opening handshake",
-        TransportError::Closed => "the connection was already closed",
+        TransportError::Timeout => "a deadline expired",
+        TransportError::Reset => "the connection was reset",
+        TransportError::Closed => "the connection is closed",
         TransportError::HandshakeFailed => "the WebSocket opening handshake failed",
-        TransportError::KeyUnavailable => "key material for the opening handshake is unavailable",
+        TransportError::KeyUnavailable => "key material is unavailable",
         TransportError::AddressRefused => "the target is not a ws:// or wss:// URL",
-        TransportError::Backpressure => "the far side stopped reading during the opening handshake",
-        TransportError::Framing => "the opening handshake bytes broke the WebSocket framing",
+        TransportError::Backpressure => "the far side stopped reading and the buffer is full",
+        TransportError::Framing => "the bytes broke the WebSocket framing",
         TransportError::HandoffMismatch => "the stream handed over is not one this end can adopt",
     }
 }
@@ -839,7 +839,7 @@ fn framing(
     token: u64,
     sink: &FramerSink,
     o: &mut FramerOut,
-    op: impl FnOnce(&WsFramer, &mut Collect<'_>) -> Result<(), String>,
+    op: impl FnOnce(&WsFramer, &mut Collect<'_>) -> Result<(), TransportError>,
 ) -> Outcome {
     let inst = instance(p);
     let Some(slot) = inst.queues().get(&token).cloned() else {
@@ -855,25 +855,23 @@ fn framing(
         owed: &mut held,
         now: time(sink),
     };
+    let alive = inst.framer.holds(token);
     let done = op(&inst.framer, &mut c);
     let owed = &mut *held;
     if let Err(e) = done {
-        // The framer still holds the framing: the op alone failed, whatever is queued, and the
-        // queue stays for the next call.
-        if inst.framer.holds(token) {
-            owed.error = e;
-            o.head.error = AbiStr {
-                ptr: owed.error.as_ptr(),
-                len: owed.error.len(),
-            };
+        let why = refused(&e);
+        // The framer still holds the framing, or did not hold it before the op: the op alone
+        // failed, whatever is queued, and the queue stays for the next call.
+        if inst.framer.holds(token) || !alive {
+            o.head.error = abi_str(why);
             return Outcome::Failed;
         }
-        // The state is gone: what the failing op produced still goes out, then the stream ends
-        // failed (its end piece says why) and the connection with it.
+        // This op ended the state: what it produced still goes out, then the stream ends failed
+        // (its end piece says why) and the connection with it.
         if !owed.ended {
             owed.pieces.push_back(Piece {
                 failed: true,
-                ..Piece::plain(0, e.into_bytes(), true)
+                ..Piece::plain(0, why.as_bytes().to_vec(), true)
             });
             owed.ended = true;
         }
@@ -1086,8 +1084,7 @@ impl Slot for Ingest {
                 return Ok(());
             }
             let ended_before = c.owed.ended;
-            f.ingest(i.framing, bytes, end, c)
-                .map_err(|e| format!("{e:?}"))?;
+            f.ingest(i.framing, bytes, end, c)?;
             // THE DIALLED HEAD'S REASON PHRASE rides the head piece this call queued.
             if let Some(reason) = f.take_reason(i.framing) {
                 if let Some(head) = c.owed.pieces.iter_mut().rev().find(|p| p.fields) {
@@ -1113,7 +1110,6 @@ impl Slot for Emit {
                 return Ok(());
             }
             f.emit_text(i.framing, bytes, eof, i.flags & EMIT_TEXT != 0, c)
-                .map_err(|e| format!("{e:?}"))
         })
     }
 }
@@ -1128,7 +1124,6 @@ impl Slot for Refuse {
         let stream = (i.has_stream != 0).then_some(StreamId(i.stream));
         framing(p, i.framing, &i.sink, o, |f, c| {
             f.refusal_with(i.framing, stream, bytes, i.status, c)
-                .map_err(|e| format!("{e:?}"))
         })
     }
 }
@@ -1139,9 +1134,7 @@ impl Slot for Timer {
     type In = FramingIn;
     type Out = FramerOut;
     fn call(p: *mut c_void, i: &FramingIn, o: &mut FramerOut) -> Outcome {
-        framing(p, i.framing, &i.sink, o, |f, c| {
-            f.tick(i.framing, c).map_err(|e| format!("{e:?}"))
-        })
+        framing(p, i.framing, &i.sink, o, |f, c| f.tick(i.framing, c))
     }
 }
 
@@ -1220,9 +1213,6 @@ fn fill(owed: &mut Owed, sink: &FramerSink, o: &mut FramerOut) {
             0
         };
         let mut room = sink.frame_cap - frame_len - reason_len;
-        // A field block is cut only where the host takes a continuation: at a line's start or
-        // inside a value. A name longer than the whole frame buffer is cut anyway (the host
-        // refuses it by name) rather than never moving.
         // A failed end piece is never split (its tail would go out as payload): one that does not
         // fit waits for the next answer; one that does not fit an empty answer is cut to the room.
         if piece.failed && piece.bytes.len() - piece.at > room {
@@ -1231,6 +1221,9 @@ fn fill(owed: &mut Owed, sink: &FramerSink, o: &mut FramerOut) {
             }
             piece.bytes.truncate(piece.at + room);
         }
+        // A field block is cut only where the host takes a continuation: at a line's start or
+        // inside a value. A name longer than the whole frame buffer is cut anyway (the host
+        // refuses it by name) rather than never moving.
         let rest = &piece.bytes[piece.at..];
         let mut take = take_of(piece, rest, room, frame_len + reason_len == 0);
         // A phrase that leaves no room for a cut of the head, in an answer with nothing else in it,
