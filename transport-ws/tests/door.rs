@@ -1066,3 +1066,38 @@ fn an_op_after_a_refuse_fails_and_does_not_end_the_stream_again() {
     assert_eq!(accept.failures.len(), before);
     host.close();
 }
+
+/// A RE-CALLED `refuse` DRAINS: the contract re-calls the same op after READY with `YIELD_MORE`.
+/// A refusal larger than the wire buffer removes the framing at the first call (the close), so the
+/// re-calls find it gone with bytes still owed: they answer READY and hand over every byte of the
+/// refusal and then the close frame. RED before the fix: the re-call answered Failed.
+#[test]
+fn a_re_called_refuse_hands_over_the_whole_refusal_and_the_close() {
+    let mut host = Host::open(linked(), (16, 64 * 1024, 8));
+    let mut dial = host.begin(SIDE_DIAL, "ws://svc.test/stream");
+    let mut accept = host.begin(SIDE_ACCEPT, "");
+    host.carry(&mut dial, &mut accept);
+    accept.wire.clear();
+    let body = [b'r'; 100];
+    let mut more = true;
+    let mut calls = 0;
+    while more {
+        calls += 1;
+        assert!(calls < 1000, "a re-call never ran dry");
+        let mut i: RefuseIn = z();
+        i.framing = accept.framing;
+        i.bytes = body.as_ptr();
+        i.len = body.len();
+        i.sink = host.sink();
+        let mut o: FramerOut = z();
+        let r = call(host.ops.refuse, host.inst, &mut i, &mut o, slot::REFUSE);
+        assert_eq!(r, Outcome::Ready, "call {calls}");
+        more = host.take(r, &o, &mut accept);
+    }
+    assert!(calls > 1, "the refusal needed re-calls");
+    let mut expect = vec![0x82, 100];
+    expect.extend_from_slice(&body);
+    expect.extend_from_slice(&[0x88, 2, 0x03, 0xE8]);
+    assert_eq!(accept.wire, expect, "the refusal and the close, whole");
+    host.close();
+}
