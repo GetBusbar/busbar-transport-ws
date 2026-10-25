@@ -767,12 +767,28 @@ impl Slot for Locate {
     }
 }
 
+/// Why an open was refused, said without the op's name (the text is static: nothing allocates).
+fn refused(e: &TransportError) -> &'static str {
+    match e {
+        TransportError::Refused => "the far side refused the connection",
+        TransportError::Timeout => "the opening handshake timed out",
+        TransportError::Reset => "the connection was reset during the opening handshake",
+        TransportError::Closed => "the connection was already closed",
+        TransportError::HandshakeFailed => "the WebSocket opening handshake failed",
+        TransportError::KeyUnavailable => "key material for the opening handshake is unavailable",
+        TransportError::AddressRefused => "the target is not a ws:// or wss:// URL",
+        TransportError::Backpressure => "the far side stopped reading during the opening handshake",
+        TransportError::Framing => "the opening handshake bytes broke the WebSocket framing",
+        TransportError::HandoffMismatch => "the stream handed over is not one this end can adopt",
+    }
+}
+
 /// Run a framer method that opens a framing, then answer what it produced.
 fn opening(
     p: *mut c_void,
     sink: &FramerSink,
     o: &mut FramerOut,
-    open: impl FnOnce(&WsFramer, &mut Collect<'_>) -> Result<u64, String>,
+    open: impl FnOnce(&WsFramer, &mut Collect<'_>) -> Result<u64, TransportError>,
 ) -> Outcome {
     let inst = instance(p);
     let mut owed = Owed::default();
@@ -787,8 +803,8 @@ fn opening(
             inst.queues().insert(token, Arc::new(Mutex::new(owed)));
             Outcome::Ready
         }
-        Err(_) => {
-            o.head.error = abi_str("the framing could not be opened");
+        Err(e) => {
+            o.head.error = abi_str(refused(&e));
             Outcome::Failed
         }
     }
@@ -852,10 +868,7 @@ impl Slot for Begin {
         if matches!(side, Side::Dial) && i.points != 0 {
             return dial_with_auth(p, i, o, &target, &fields);
         }
-        opening(p, &i.sink, o, |f, c| {
-            f.open_with(side, &target, &fields, c)
-                .map_err(|e| format!("{e:?}"))
-        })
+        opening(p, &i.sink, o, |f, c| f.open_with(side, &target, &fields, c))
     }
 }
 
@@ -918,7 +931,10 @@ fn dial_with_auth(
         match peer {
             Poll::Pending => return Outcome::Pending,
             Poll::Ready(Ok(called)) if called.flow == FLOW_CONTINUE => {}
-            Poll::Ready(_) => return refuse(o, "begin: the binding's auth refused the connection"),
+            Poll::Ready(Ok(_)) => {
+                return refuse(o, "begin: the binding's auth stopped the connection")
+            }
+            Poll::Ready(Err(_)) => return refuse(o, "begin: the host's auth call failed"),
         }
     }
     let (point, body): (u32, Option<&[u8]>) = if i.points & POINT_HEAD_BODY != 0 {
@@ -929,9 +945,11 @@ fn dial_with_auth(
         // Only the peer point: the head goes out as the plane's.
         return opening(p, &i.sink, o, |f, c| {
             f.open_with(Side::Dial, target, fields, c)
-                .map_err(|e| format!("{e:?}"))
         });
     };
+    // What the head point's auth did, said by the closure that calls it.
+    let mut why: Option<&'static str> = None;
+    let mut signed = false;
     let mut sign = |head: &UpgradeHead<'_>| {
         let view = HeadViewArgs {
             method: "GET",
@@ -952,16 +970,26 @@ fn dial_with_auth(
             body,
         ) {
             Poll::Pending => Poll::Pending,
-            Poll::Ready(Ok(called)) if called.flow == FLOW_CONTINUE => Poll::Ready(Ok(called
-                .fields
-                .into_iter()
-                .map(|f| AuthLine {
-                    query: f.flags & FIELD_QUERY != 0,
-                    value: zeroize::Zeroizing::new(f.value.expose_own(&Own::here()).clone()),
-                    name: f.name,
-                })
-                .collect())),
-            Poll::Ready(_) => Poll::Ready(Err(TransportError::HandshakeFailed)),
+            Poll::Ready(Ok(called)) if called.flow == FLOW_CONTINUE => {
+                signed = true;
+                Poll::Ready(Ok(called
+                    .fields
+                    .into_iter()
+                    .map(|f| AuthLine {
+                        query: f.flags & FIELD_QUERY != 0,
+                        value: zeroize::Zeroizing::new(f.value.expose_own(&Own::here()).clone()),
+                        name: f.name,
+                    })
+                    .collect()))
+            }
+            Poll::Ready(Ok(_)) => {
+                why = Some("begin: the binding's auth stopped the dial");
+                Poll::Ready(Err(TransportError::HandshakeFailed))
+            }
+            Poll::Ready(Err(_)) => {
+                why = Some("begin: the host's auth call failed");
+                Poll::Ready(Err(TransportError::HandshakeFailed))
+            }
         }
     };
     let parking = Parking {
@@ -974,7 +1002,10 @@ fn dial_with_auth(
         owed: &mut owed,
         now: time(&i.sink),
     };
-    match inst.framer.open_signed(parking, target, fields, &mut sign, &mut c) {
+    match inst
+        .framer
+        .open_signed(parking, target, fields, &mut sign, &mut c)
+    {
         Poll::Pending => Outcome::Pending,
         Poll::Ready(Ok(token)) => {
             o.framing = token;
@@ -982,9 +1013,13 @@ fn dial_with_auth(
             inst.queues().insert(token, Arc::new(Mutex::new(owed)));
             Outcome::Ready
         }
-        Poll::Ready(Err(_)) => refuse(
+        Poll::Ready(Err(e)) => refuse(
             o,
-            "begin: the binding's auth refused the dial, or answered a line the upgrade cannot carry",
+            why.unwrap_or(if signed {
+                "begin: the binding's auth answered a line the upgrade cannot carry"
+            } else {
+                refused(&e)
+            }),
         ),
     }
 }
@@ -1001,10 +1036,7 @@ impl Slot for Adopt {
         };
         let facts = facts_of(i.facts);
         let leftover = raw(i.leftover, i.leftover_len);
-        opening(p, &i.sink, o, |f, c| {
-            f.adopt(side, &facts, leftover, c)
-                .map_err(|e| format!("{e:?}"))
-        })
+        opening(p, &i.sink, o, |f, c| f.adopt(side, &facts, leftover, c))
     }
 }
 
