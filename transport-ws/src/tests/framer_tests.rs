@@ -943,3 +943,49 @@ fn a_pending_sign_parks_the_dial_and_its_resume_signs_the_same_head() {
     let _ = framer.open_signed(later, "ws://svc.test/x", &[], &mut pending, &mut out);
     assert_eq!(framer.parked(), 1, "only the live dial stays parked");
 }
+
+/// The payload of the first data frame (text or binary) in a client's (masked) `wire`.
+fn first_data_payload(wire: &[u8]) -> Option<(u8, Vec<u8>)> {
+    let mut at = 0;
+    while at + 6 <= wire.len() {
+        let op = wire[at] & 0x0f;
+        let len = usize::from(wire[at + 1] & 0x7f);
+        assert!(len < 126, "short frames only");
+        let mask = &wire[at + 2..at + 6];
+        let payload: Vec<u8> = wire[at + 6..at + 6 + len]
+            .iter()
+            .enumerate()
+            .map(|(i, b)| b ^ mask[i % 4])
+            .collect();
+        if op == 0x1 || op == 0x2 || op == 0x0 {
+            return Some((op, payload));
+        }
+        at += 6 + len;
+    }
+    None
+}
+
+/// A REFUSAL GOES OUT AS ITS OWN MESSAGE (codeaudit r1 g1): pieces of an unfinished outbound message
+/// are dropped, not glued to the refusal's front. RED before the fix: the first data frame carried
+/// the half reply followed by the refusal.
+#[test]
+fn a_refusal_is_not_glued_onto_a_gathered_partial_message() {
+    let framer = WsFramer::new(0);
+    let mut out = Out::default();
+    let state = framer
+        .open_with(Side::Dial, "ws://127.0.0.1:9/x", &[], &mut out)
+        .expect("the dial opens");
+    let request = String::from_utf8(out.sent.clone()).unwrap();
+    framer
+        .ingest(state, &switching(&request), false, &mut Out::default())
+        .expect("open");
+    framer
+        .emit_text(state, b"half a reply", false, true, &mut Out::default())
+        .expect("gathered");
+    let mut refused = Out::default();
+    framer
+        .refusal_with(state, None, b"refused", 401, &mut refused)
+        .expect("refused");
+    let (_, payload) = first_data_payload(&refused.sent).expect("a data frame");
+    assert_eq!(payload, b"refused".to_vec());
+}
