@@ -564,9 +564,10 @@ fn lent_text(why: &Unread, buf: *mut u8, cap: usize) -> (AbiStr, usize) {
     )
 }
 
-fn instance<'a>(p: *mut c_void) -> &'a Instance {
-    // SAFETY: the host passes back the pointer `open` answered, until `close`.
-    unsafe { &*p.cast::<Instance>() }
+/// The instance `open` answered; `None` for a call made with none.
+fn instance<'a>(p: *mut c_void) -> Option<&'a Instance> {
+    // SAFETY: the host passes back the pointer `open` answered, until `close`; NULL is no instance.
+    unsafe { p.cast::<Instance>().as_ref() }
 }
 
 fn text(s: &AbiStr) -> &[u8] {
@@ -704,8 +705,7 @@ impl Slot for Refresh {
     type In = RefreshIn;
     type Out = OutHead;
     fn call(p: *mut c_void, i: &RefreshIn, o: &mut OutHead) -> Outcome {
-        // SAFETY: the host passes back the pointer `open` answered, until `close`; NULL is none.
-        let Some(inst) = (unsafe { p.cast::<Instance>().as_ref() }) else {
+        let Some(inst) = instance(p) else {
             o.error = abi_str("refresh: no open instance");
             return Outcome::Failed;
         };
@@ -752,10 +752,8 @@ impl Slot for Cancel {
     type In = CancelIn;
     type Out = CancelOut;
     fn call(p: *mut c_void, i: &CancelIn, o: &mut CancelOut) -> Outcome {
-        if !p.is_null() {
-            instance(p)
-                .framer
-                .release((i.ticket.slot, i.ticket.generation));
+        if let Some(inst) = instance(p) {
+            inst.framer.release((i.ticket.slot, i.ticket.generation));
         }
         o.disposition = CANCEL_NOTHING_MOVED;
         Outcome::Ready
@@ -781,16 +779,32 @@ answer!(Tick, TickIn, TickOut, Outcome::Ready);
 answer!(Drive, DriveIn, OutHead, Outcome::Ready);
 answer!(Release, ReleaseIn, OutHead, Outcome::Ready);
 
+/// An op of the role this transport does not play: REFUSED, naming the op (`$op`, its slot's name).
+macro_rules! not_served {
+    ($name:ident, $in:ty, $out:ty, $op:literal, |$o:ident| $head:expr) => {
+        #[doc = concat!("`", $op, "`: refused, a framer is not a carrier.")]
+        pub struct $name;
+        impl Slot for $name {
+            type In = $in;
+            type Out = $out;
+            fn call(_: *mut c_void, _: &$in, $o: &mut $out) -> Outcome {
+                $head.error = abi_str(concat!($op, ": the ws framer does not serve this op"));
+                Outcome::Refused
+            }
+        }
+    };
+}
+
 // A framer is not a carrier: every carrier op is refused. Nothing upgrades out of a WebSocket.
-answer!(Listen, ListenIn, ListenOut, Outcome::Refused);
-answer!(Accept, AcceptIn, AcceptOut, Outcome::Refused);
-answer!(Dial, DialIn, ConnOut, Outcome::Refused);
-answer!(Read, ReadIn, IoOut, Outcome::Refused);
-answer!(Write, WriteIn, IoOut, Outcome::Refused);
-answer!(Flush, ConnIn, OutHead, Outcome::Refused);
-answer!(Shut, ShutIn, OutHead, Outcome::Refused);
-answer!(Arrival, ArrivalIn, ArrivalOut, Outcome::Refused);
-answer!(Detach, FramingIn, FramerOut, Outcome::Refused);
+not_served!(Listen, ListenIn, ListenOut, "listen", |o| o.head);
+not_served!(Accept, AcceptIn, AcceptOut, "accept", |o| o.head);
+not_served!(Dial, DialIn, ConnOut, "dial", |o| o.head);
+not_served!(Read, ReadIn, IoOut, "read", |o| o.head);
+not_served!(Write, WriteIn, IoOut, "write", |o| o.head);
+not_served!(Flush, ConnIn, OutHead, "flush", |o| o);
+not_served!(Shut, ShutIn, OutHead, "shut", |o| o);
+not_served!(Arrival, ArrivalIn, ArrivalOut, "arrival", |o| o.head);
+not_served!(Detach, FramingIn, FramerOut, "detach", |o| o.head);
 
 // ── the framer ───────────────────────────────────────────────────────────────────────────────────
 
@@ -800,6 +814,10 @@ impl Slot for Locate {
     type In = LocateIn;
     type Out = LocateOut;
     fn call(p: *mut c_void, i: &LocateIn, o: &mut LocateOut) -> Outcome {
+        let Some(inst) = instance(p) else {
+            o.head.error = abi_str(LOCATE.no_instance);
+            return Outcome::Failed;
+        };
         // A LISTENER names no far end (`LocateIn::accept`): the answer is the offer it makes, the
         // version-1.1 upgrade the dial side offers too, with no authority and no name.
         if i.accept != 0 {
@@ -818,8 +836,12 @@ impl Slot for Locate {
             o.head.error = abi_str("locate: the target is not text");
             return Outcome::Failed;
         };
-        let Ok(at) = instance(p).framer.locate(target) else {
-            o.head.error = abi_str("locate: the target is not a ws or wss URL");
+        let Ok(at) = inst.framer.locate(target) else {
+            o.head.error = abi_str(if carries_userinfo(target) {
+                LOCATE.userinfo
+            } else {
+                "locate: the target is not a ws or wss URL"
+            });
             return Outcome::Failed;
         };
         let name = at.server_name.clone().unwrap_or_default();
@@ -860,20 +882,75 @@ impl Slot for Locate {
     }
 }
 
-/// Why an op failed, said without the op's name (the text is static: nothing allocates).
+/// Why an op failed, each text opening with `$prefix` (static: nothing allocates).
+macro_rules! why {
+    ($prefix:expr, $e:expr) => {
+        match $e {
+            TransportError::Refused => concat!($prefix, "the far side refused the connection"),
+            TransportError::Timeout => concat!($prefix, "a deadline expired"),
+            TransportError::Reset => concat!($prefix, "the connection was reset"),
+            TransportError::Closed => concat!($prefix, "the connection is closed"),
+            TransportError::HandshakeFailed => {
+                concat!($prefix, "the WebSocket opening handshake failed")
+            }
+            TransportError::KeyUnavailable => concat!($prefix, "key material is unavailable"),
+            TransportError::AddressRefused => {
+                concat!($prefix, "the target is not a ws:// or wss:// URL")
+            }
+            TransportError::Backpressure => concat!(
+                $prefix,
+                "the far side stopped reading and the buffer is full"
+            ),
+            TransportError::Framing => concat!($prefix, "the bytes broke the WebSocket framing"),
+            TransportError::HandoffMismatch => concat!(
+                $prefix,
+                "the stream handed over is not one this end can adopt"
+            ),
+        }
+    };
+}
+
+/// Why a framing's stream ended failed, as its end piece says it: the stream's reason, not an op's.
 fn refused(e: &TransportError) -> &'static str {
-    match e {
-        TransportError::Refused => "the far side refused the connection",
-        TransportError::Timeout => "a deadline expired",
-        TransportError::Reset => "the connection was reset",
-        TransportError::Closed => "the connection is closed",
-        TransportError::HandshakeFailed => "the WebSocket opening handshake failed",
-        TransportError::KeyUnavailable => "key material is unavailable",
-        TransportError::AddressRefused => "the target is not a ws:// or wss:// URL",
-        TransportError::Backpressure => "the far side stopped reading and the buffer is full",
-        TransportError::Framing => "the bytes broke the WebSocket framing",
-        TransportError::HandoffMismatch => "the stream handed over is not one this end can adopt",
-    }
+    why!("", e)
+}
+
+/// One framer op's fixed texts, each opening with the op's name (`<op>: `).
+struct OpTexts {
+    no_instance: &'static str,
+    no_framing: &'static str,
+    framing_failed: &'static str,
+    userinfo: &'static str,
+    why: fn(&TransportError) -> &'static str,
+}
+
+macro_rules! op_texts {
+    ($op:literal) => {
+        OpTexts {
+            no_instance: concat!($op, ": no open instance"),
+            no_framing: concat!($op, ": no such framing"),
+            framing_failed: concat!($op, ": the framing failed"),
+            userinfo: concat!(
+                $op,
+                ": the target carries userinfo; credentials never ride a URL"
+            ),
+            why: |e| why!(concat!($op, ": "), e),
+        }
+    };
+}
+
+const LOCATE: OpTexts = op_texts!("locate");
+const BEGIN: OpTexts = op_texts!("begin");
+const ADOPT: OpTexts = op_texts!("adopt");
+const INGEST: OpTexts = op_texts!("ingest");
+const EMIT: OpTexts = op_texts!("emit");
+const REFUSE: OpTexts = op_texts!("refuse");
+const TIMER: OpTexts = op_texts!("timer");
+const FINISH: OpTexts = op_texts!("finish");
+
+/// The target names a userinfo (`user:pass@`): refused outright, never read on, never echoed.
+fn carries_userinfo(target: &str) -> bool {
+    busbar_contract::net::parse_url(target).is_ok_and(|u| u.userinfo)
 }
 
 /// A connection the far side FAILED ends its stream failed, not cleanly: the reader is told
@@ -899,11 +976,15 @@ fn end_failed(f: &WsFramer, token: u64, owed: &mut Owed, ended_before: bool) {
 /// Run a framer method that opens a framing, then answer what it produced.
 fn opening(
     p: *mut c_void,
+    texts: &OpTexts,
     sink: &FramerSink,
     o: &mut FramerOut,
     open: impl FnOnce(&WsFramer, &mut Collect<'_>) -> Result<u64, TransportError>,
 ) -> Outcome {
-    let inst = instance(p);
+    let Some(inst) = instance(p) else {
+        o.head.error = abi_str(texts.no_instance);
+        return Outcome::Failed;
+    };
     let mut owed = Owed::default();
     let mut c = Collect {
         owed: &mut owed,
@@ -919,7 +1000,7 @@ fn opening(
             Outcome::Ready
         }
         Err(e) => {
-            o.head.error = abi_str(refused(&e));
+            o.head.error = abi_str((texts.why)(&e));
             Outcome::Failed
         }
     }
@@ -929,20 +1010,24 @@ fn opening(
 /// `fresh`: the call carries new input, so it is not a re-call that only drains.
 fn framing(
     p: *mut c_void,
+    texts: &OpTexts,
     token: u64,
     sink: &FramerSink,
     o: &mut FramerOut,
     fresh: bool,
     op: impl FnOnce(&WsFramer, &mut Collect<'_>) -> Result<(), TransportError>,
 ) -> Outcome {
-    let inst = instance(p);
+    let Some(inst) = instance(p) else {
+        o.head.error = abi_str(texts.no_instance);
+        return Outcome::Failed;
+    };
     let Some(slot) = inst.queues().get(&token).cloned() else {
-        o.head.error = abi_str("no such framing");
+        o.head.error = abi_str(texts.no_framing);
         return Outcome::Failed;
     };
     let Ok(mut held) = slot.lock() else {
         // An op on this framing panicked: it is failed, and it alone.
-        o.head.error = abi_str("the framing failed");
+        o.head.error = abi_str(texts.framing_failed);
         return Outcome::Failed;
     };
     let mut c = Collect {
@@ -954,6 +1039,7 @@ fn framing(
     let owed = &mut *held;
     if let Err(e) = done {
         let why = refused(&e);
+        let said = (texts.why)(&e);
         // A state gone before the op with bytes still owed, and no new input, is a RE-CALL after
         // `YIELD_MORE` (a refusal's close removed the state): it drains, whatever the op said, and
         // the connection is over once it has (`YIELD_ENDED`). An op that carried new input fails
@@ -966,7 +1052,7 @@ fn framing(
         // The framer still holds the framing, or did not hold it before the op: the op alone
         // failed, whatever is queued, and the queue stays for the next call.
         if inst.framer.holds(token) || !alive {
-            o.head.error = abi_str(why);
+            o.head.error = abi_str(said);
             return Outcome::Failed;
         }
         // This op ended the state: what it produced still goes out, then the stream ends failed
@@ -989,6 +1075,10 @@ impl Slot for Begin {
     type In = BeginIn;
     type Out = FramerOut;
     fn call(p: *mut c_void, i: &BeginIn, o: &mut FramerOut) -> Outcome {
+        let Some(inst) = instance(p) else {
+            o.head.error = abi_str(BEGIN.no_instance);
+            return Outcome::Failed;
+        };
         let Some(side) = side_of(i.side) else {
             o.head.error = abi_str("begin: the side is neither accept nor dial");
             return Outcome::Failed;
@@ -997,11 +1087,17 @@ impl Slot for Begin {
             o.head.error = abi_str("begin: the target is not text");
             return Outcome::Failed;
         };
+        if matches!(side, Side::Dial) && carries_userinfo(&target) {
+            o.head.error = abi_str(BEGIN.userinfo);
+            return Outcome::Failed;
+        }
         let fields = opening_fields(i.fields, i.fields_len);
         if matches!(side, Side::Dial) && i.points != 0 {
-            return dial_with_auth(p, i, o, &target, &fields);
+            return dial_with_auth(p, inst, i, o, &target, &fields);
         }
-        opening(p, &i.sink, o, |f, c| f.open_with(side, &target, &fields, c))
+        opening(p, &BEGIN, &i.sink, o, |f, c| {
+            f.open_with(side, &target, &fields, c)
+        })
     }
 }
 
@@ -1021,12 +1117,12 @@ const SEQ_HEAD: u32 = 2;
 /// request never leaves.
 fn dial_with_auth(
     p: *mut c_void,
+    inst: &Instance,
     i: &BeginIn,
     o: &mut FramerOut,
     target: &str,
     fields: &[(String, Vec<u8>)],
 ) -> Outcome {
-    let inst = instance(p);
     let refuse = |o: &mut FramerOut, why: &'static str| {
         o.head.error = abi_str(why);
         Outcome::Failed
@@ -1076,7 +1172,7 @@ fn dial_with_auth(
         (POINT_HEAD, None)
     } else {
         // Only the peer point: the head goes out as the plane's.
-        return opening(p, &i.sink, o, |f, c| {
+        return opening(p, &BEGIN, &i.sink, o, |f, c| {
             f.open_with(Side::Dial, target, fields, c)
         });
     };
@@ -1151,7 +1247,7 @@ fn dial_with_auth(
             why.unwrap_or(if signed {
                 "begin: the binding's auth answered a line the upgrade cannot carry"
             } else {
-                refused(&e)
+                (BEGIN.why)(&e)
             }),
         ),
     }
@@ -1169,7 +1265,9 @@ impl Slot for Adopt {
         };
         let facts = facts_of(i.facts);
         let leftover = raw(i.leftover, i.leftover_len);
-        opening(p, &i.sink, o, |f, c| f.adopt(side, &facts, leftover, c))
+        opening(p, &ADOPT, &i.sink, o, |f, c| {
+            f.adopt(side, &facts, leftover, c)
+        })
     }
 }
 
@@ -1183,6 +1281,7 @@ impl Slot for Ingest {
         let end = i.end != 0;
         framing(
             p,
+            &INGEST,
             i.framing,
             &i.sink,
             o,
@@ -1217,6 +1316,7 @@ impl Slot for Emit {
         let eof = i.end_of_frame != 0;
         framing(
             p,
+            &EMIT,
             i.framing,
             &i.sink,
             o,
@@ -1239,7 +1339,7 @@ impl Slot for Refuse {
     fn call(p: *mut c_void, i: &RefuseIn, o: &mut FramerOut) -> Outcome {
         let bytes = raw(i.bytes, i.len);
         let stream = (i.has_stream != 0).then_some(StreamId(i.stream));
-        framing(p, i.framing, &i.sink, o, false, |f, c| {
+        framing(p, &REFUSE, i.framing, &i.sink, o, false, |f, c| {
             f.refusal_with(i.framing, stream, bytes, i.status, c)
         })
     }
@@ -1251,7 +1351,9 @@ impl Slot for Timer {
     type In = FramingIn;
     type Out = FramerOut;
     fn call(p: *mut c_void, i: &FramingIn, o: &mut FramerOut) -> Outcome {
-        framing(p, i.framing, &i.sink, o, false, |f, c| f.tick(i.framing, c))
+        framing(p, &TIMER, i.framing, &i.sink, o, false, |f, c| {
+            f.tick(i.framing, c)
+        })
     }
 }
 
@@ -1262,13 +1364,12 @@ impl Slot for Finish {
     type Out = FramerOut;
     fn call(p: *mut c_void, i: &FinishIn, o: &mut FramerOut) -> Outcome {
         let reason = reason_of(i.reason);
-        let out = framing(p, i.framing, &i.sink, o, false, |f, c| {
+        let out = framing(p, &FINISH, i.framing, &i.sink, o, false, |f, c| {
             f.close(i.framing, reason, c);
             c.owed.ended = true;
             Ok(())
         });
-        if o.yielded.flags & YIELD_MORE == 0 {
-            let inst = instance(p);
+        if let Some(inst) = instance(p).filter(|_| o.yielded.flags & YIELD_MORE == 0) {
             // A framing whose op panicked answered FAILED above without reaching the framer, so
             // its state is closed here too: the framing is gone, and nothing of it is kept for the
             // life of the instance.

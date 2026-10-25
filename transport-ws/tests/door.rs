@@ -885,7 +885,7 @@ fn a_refused_open_says_why() {
     let mut host = auth_host::open(0);
     assert_eq!(
         refused_begin(&mut host, "ws://u:p@host/", 0),
-        "the target is not a ws:// or wss:// URL"
+        "begin: the target carries userinfo; credentials never ride a URL"
     );
     host.close();
 }
@@ -1086,7 +1086,7 @@ fn an_op_after_a_refuse_fails_and_does_not_end_the_stream_again() {
     assert_eq!(r, Outcome::Failed, "the op fails");
     // SAFETY: the door's error text, valid until the next call.
     let why = unsafe { std::slice::from_raw_parts(o.head.error.ptr, o.head.error.len) };
-    assert_eq!(why, b"the connection is closed");
+    assert_eq!(why, b"ingest: the connection is closed");
     assert_eq!(accept.failures.len(), before);
     host.close();
 }
@@ -1155,7 +1155,7 @@ fn an_emit_after_a_refuse_with_a_backlog_fails_and_the_backlog_still_drains() {
     assert_eq!(r, Outcome::Failed, "new data on a closed framing fails");
     // SAFETY: the door's error text, valid until the next call.
     let why = unsafe { std::slice::from_raw_parts(o.head.error.ptr, o.head.error.len) };
-    assert_eq!(why, b"the connection is closed");
+    assert_eq!(why, b"emit: the connection is closed");
     let mut calls = 0;
     while more {
         calls += 1;
@@ -1355,6 +1355,230 @@ fn refresh_rereads_the_settings_for_framings_begun_after_it() {
         host.emit(&before, b"hello", 0).0,
         Outcome::Ready,
         "a framing begun before keeps its own"
+    );
+    host.close();
+}
+
+// ── role stubs, a missing instance, op-prefixed texts (sibling alignment B, C, D) ────────────────
+
+/// A CARRIER OP IS REFUSED BY NAME: the ws framer serves none of them, and says which op it was
+/// asked for. RED before the fix: each answered REFUSED with no text.
+#[test]
+fn a_carrier_op_is_refused_by_name() {
+    use busbar_contract::abi::transport::{
+        AcceptIn, AcceptOut, ArrivalIn, ArrivalOut, ConnIn, ConnOut, DialIn, FramingIn, IoOut,
+        ListenIn, ListenOut, ReadIn, ShutIn, WriteIn,
+    };
+    let host = Host::open(linked(), (1024, 1024, 4));
+    let ops = host.ops;
+    macro_rules! refused {
+        ($field:ident, $slot:ident, $in:ty, $out:ty, $text:literal) => {{
+            let mut i: $in = z();
+            let mut o: $out = z();
+            let r = call(ops.$field, host.inst, &mut i, &mut o, slot::$slot);
+            // SAFETY: every `out` leads with its head.
+            let head = unsafe { &*std::ptr::from_ref(&o).cast::<OutHead>() };
+            assert_eq!((r, said(&head.error)), (Outcome::Refused, $text.to_owned()));
+        }};
+    }
+    refused!(
+        listen,
+        LISTEN,
+        ListenIn,
+        ListenOut,
+        "listen: the ws framer does not serve this op"
+    );
+    refused!(
+        accept,
+        ACCEPT,
+        AcceptIn,
+        AcceptOut,
+        "accept: the ws framer does not serve this op"
+    );
+    refused!(
+        dial,
+        DIAL,
+        DialIn,
+        ConnOut,
+        "dial: the ws framer does not serve this op"
+    );
+    refused!(
+        read,
+        READ,
+        ReadIn,
+        IoOut,
+        "read: the ws framer does not serve this op"
+    );
+    refused!(
+        write,
+        WRITE,
+        WriteIn,
+        IoOut,
+        "write: the ws framer does not serve this op"
+    );
+    refused!(
+        flush,
+        FLUSH,
+        ConnIn,
+        OutHead,
+        "flush: the ws framer does not serve this op"
+    );
+    refused!(
+        shut,
+        SHUT,
+        ShutIn,
+        OutHead,
+        "shut: the ws framer does not serve this op"
+    );
+    refused!(
+        arrival,
+        ARRIVAL,
+        ArrivalIn,
+        ArrivalOut,
+        "arrival: the ws framer does not serve this op"
+    );
+    refused!(
+        detach,
+        DETACH,
+        FramingIn,
+        FramerOut,
+        "detach: the ws framer does not serve this op"
+    );
+    host.close();
+}
+
+/// AN OP ON NO INSTANCE FAILS BY NAME, never reading through a NULL instance. RED before the fix:
+/// the door dereferenced the NULL pointer.
+#[test]
+fn an_op_with_no_instance_fails_by_name() {
+    use busbar_contract::abi::mechanism::lifecycle::RefreshIn;
+    use busbar_contract::abi::transport::{FramingIn, LocateIn, LocateOut};
+    let ops = linked();
+    let none = std::ptr::null_mut();
+    macro_rules! failed {
+        ($field:ident, $slot:expr, $in:ty, $out:ty, $text:literal) => {{
+            let mut i: $in = z();
+            let mut o: $out = z();
+            let r = call($field, none, &mut i, &mut o, $slot);
+            // SAFETY: every `out` leads with its head.
+            let head = unsafe { &*std::ptr::from_ref(&o).cast::<OutHead>() };
+            assert_eq!((r, said(&head.error)), (Outcome::Failed, $text.to_owned()));
+        }};
+    }
+    let (locate, begin, adopt, ingest) = (ops.locate, ops.begin, ops.adopt, ops.ingest);
+    let (emit, refuse, finish, timer) = (ops.emit, ops.refuse, ops.finish, ops.timer);
+    let refresh = ops.head.refresh;
+    let target = "ws://svc.test/";
+    let mut i: LocateIn = z();
+    i.target = AbiStr {
+        ptr: target.as_ptr(),
+        len: target.len(),
+    };
+    let mut o: LocateOut = z();
+    let r = call(locate, none, &mut i, &mut o, slot::LOCATE);
+    assert_eq!(
+        (r, said(&o.head.error)),
+        (Outcome::Failed, "locate: no open instance".to_owned())
+    );
+    failed!(
+        begin,
+        slot::BEGIN,
+        BeginIn,
+        FramerOut,
+        "begin: no open instance"
+    );
+    failed!(
+        adopt,
+        slot::ADOPT,
+        AdoptIn,
+        FramerOut,
+        "adopt: no open instance"
+    );
+    failed!(
+        ingest,
+        slot::INGEST,
+        IngestIn,
+        FramerOut,
+        "ingest: no open instance"
+    );
+    failed!(
+        emit,
+        slot::EMIT,
+        EmitIn,
+        FramerOut,
+        "emit: no open instance"
+    );
+    failed!(
+        refuse,
+        slot::REFUSE,
+        RefuseIn,
+        FramerOut,
+        "refuse: no open instance"
+    );
+    failed!(
+        finish,
+        slot::FINISH,
+        FinishIn,
+        FramerOut,
+        "finish: no open instance"
+    );
+    failed!(
+        timer,
+        slot::TIMER,
+        FramingIn,
+        FramerOut,
+        "timer: no open instance"
+    );
+    failed!(
+        refresh,
+        life::REFRESH,
+        RefreshIn,
+        OutHead,
+        "refresh: no open instance"
+    );
+}
+
+/// A FRAMING THE DOOR DOES NOT HOLD IS NAMED BY ITS OP. RED before the fix: "no such framing".
+#[test]
+fn an_unknown_framing_fails_by_op() {
+    let mut host = Host::open(linked(), (1024, 1024, 4));
+    let mut i: IngestIn = z();
+    i.framing = 77;
+    i.sink = host.sink();
+    let mut o: FramerOut = z();
+    let r = call(host.ops.ingest, host.inst, &mut i, &mut o, slot::INGEST);
+    assert_eq!(
+        (r, said(&o.head.error)),
+        (Outcome::Failed, "ingest: no such framing".to_owned())
+    );
+    host.close();
+}
+
+/// A TARGET CARRYING USERINFO IS REFUSED SAYING SO, and the text repeats no byte of it. RED before
+/// the fix: `locate` said "locate: the target is not a ws or wss URL".
+#[test]
+fn locate_refuses_a_target_carrying_userinfo() {
+    use busbar_contract::abi::transport::{LocateIn, LocateOut};
+    let host = Host::open(linked(), (1024, 1024, 4));
+    let target = "wss://user:hunter2@svc.test/";
+    let (mut auth, mut name) = ([0_u8; 64], [0_u8; 64]);
+    let mut i: LocateIn = z();
+    i.target = AbiStr {
+        ptr: target.as_ptr(),
+        len: target.len(),
+    };
+    i.authority_buf = auth.as_mut_ptr();
+    i.authority_cap = auth.len();
+    i.name_buf = name.as_mut_ptr();
+    i.name_cap = name.len();
+    let mut o: LocateOut = z();
+    let r = call(host.ops.locate, host.inst, &mut i, &mut o, slot::LOCATE);
+    assert_eq!(
+        (r, said(&o.head.error)),
+        (
+            Outcome::Failed,
+            "locate: the target carries userinfo; credentials never ride a URL".to_owned()
+        )
     );
     host.close();
 }
