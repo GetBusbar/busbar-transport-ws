@@ -614,3 +614,30 @@ fn begin_refuses_a_target_that_is_not_text() {
     assert_eq!(why, b"begin: the target is not text");
     host.close();
 }
+
+/// LOCATE ANSWERS AN ACCEPTING LISTENER'S OFFER (codeaudit g2 LOW; `LocateIn::accept`): a listener
+/// names no far end, so the target is empty and the answer is the protocol offer alone, the same
+/// `http/1.1` the dial side makes. RED before the fix: the door refused "not a ws or wss URL".
+#[test]
+fn locate_for_a_listener_answers_the_accepting_offer() {
+    use busbar_contract::abi::transport::{LocateIn, LocateOut};
+    let host = Host::open(linked(), (1024, 1024, 4));
+    let mut alpn = [0_u8; 16];
+    let mut i: LocateIn = z();
+    i.accept = 1;
+    i.alpn_buf = alpn.as_mut_ptr();
+    i.alpn_cap = alpn.len();
+    let mut o: LocateOut = z();
+    let r = call(host.ops.locate, host.inst, &mut i, &mut o, slot::LOCATE);
+    assert_eq!(r, Outcome::Ready, "a listener is located");
+    assert_eq!((o.authority_written, o.name_written, o.has_name), (0, 0, 0));
+    assert_eq!(o.secure, 0);
+    assert_eq!(&alpn[..o.alpn_written as usize], b"\x08http/1.1");
+    // The short-buffer rule: too small an ALPN buffer is told what it needs.
+    i.alpn_cap = 3;
+    let mut o: LocateOut = z();
+    let r = call(host.ops.locate, host.inst, &mut i, &mut o, slot::LOCATE);
+    assert_eq!(r, Outcome::Failed);
+    assert_eq!(o.alpn_needed, 9);
+    host.close();
+}
