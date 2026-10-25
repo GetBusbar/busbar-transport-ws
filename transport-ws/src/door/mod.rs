@@ -784,6 +784,26 @@ fn refused(e: &TransportError) -> &'static str {
     }
 }
 
+/// A connection the far side FAILED ends its stream failed, not cleanly: the reader is told
+/// (`PIECE_STREAM_FAILED` on the end piece, whose bytes say why), and the close carries the code.
+/// `ended_before`: the connection had ended before the call that queued these pieces.
+fn end_failed(f: &WsFramer, token: u64, owed: &mut Owed, ended_before: bool) {
+    if ended_before || !owed.ended {
+        return;
+    }
+    let Some(why) = f.failure(token) else {
+        return;
+    };
+    if let Some(last) = owed.pieces.back_mut() {
+        if last.end {
+            last.failed = true;
+            // A failed stream ends failed, never whole as well, and says why.
+            last.end = false;
+            last.bytes.extend_from_slice(why.as_bytes());
+        }
+    }
+}
+
 /// Run a framer method that opens a framing, then answer what it produced.
 fn opening(
     p: *mut c_void,
@@ -800,6 +820,8 @@ fn opening(
     match open(&inst.framer, &mut c) {
         Ok(token) => {
             o.framing = token;
+            // An adopted connection's leftover may already have been refused.
+            end_failed(&inst.framer, token, &mut owed, false);
             fill(&mut owed, sink, o);
             inst.queues().insert(token, Arc::new(Mutex::new(owed)));
             Outcome::Ready
@@ -1072,20 +1094,7 @@ impl Slot for Ingest {
                     head.reason = Some(reason);
                 }
             }
-            // A connection the far side FAILED ends its stream failed, not cleanly: the reader is
-            // told (`PIECE_STREAM_FAILED` on the end piece, whose bytes say why), and the close carries the code.
-            if !ended_before && c.owed.ended {
-                if let Some(why) = f.failure(i.framing) {
-                    if let Some(last) = c.owed.pieces.back_mut() {
-                        if last.end {
-                            last.failed = true;
-                            // A failed stream ends failed, never whole as well, and says why.
-                            last.end = false;
-                            last.bytes.extend_from_slice(why.as_bytes());
-                        }
-                    }
-                }
-            }
+            end_failed(f, i.framing, c.owed, ended_before);
             Ok(())
         })
     }

@@ -153,6 +153,10 @@ enum Phase {
         chunked: Option<Box<Dechunk>>,
         short: bool,
     },
+    /// An accepted connection whose upgrade request was refused: the answer (`400`, or `426` for a
+    /// version this end does not speak) went out, the frames ended failed, and whatever still
+    /// arrives is nobody's ([`WsFramer::failure`]).
+    Refused(Pipe),
 }
 
 impl Phase {
@@ -172,7 +176,7 @@ impl Phase {
             Phase::Accepting(mid) => mid.get_mut().get_mut(),
             Phase::Dialling { mid, .. } => mid.get_mut().get_mut(),
             Phase::Open { ws, .. } => ws.get_mut(),
-            Phase::Answered { pipe, .. } => pipe,
+            Phase::Answered { pipe, .. } | Phase::Refused(pipe) => pipe,
         }
     }
 }
@@ -1002,6 +1006,11 @@ impl WsFramer {
                 let (phase, ended) = answered_body(pipe, left, chunked, false, out);
                 return Ok((phase, ended, None));
             }
+            // An upgrade request that was refused: what arrives now is nobody's.
+            Phase::Refused(mut pipe) => {
+                pipe.inbound.clear();
+                return Ok((Phase::Refused(pipe), false, None));
+            }
             phase => phase,
         };
         let shaking = !matches!(phase, Phase::Open { .. });
@@ -1027,7 +1036,28 @@ impl WsFramer {
                 Err(HandshakeError::Interrupted(mid)) => {
                     return Ok((Phase::Accepting(mid), false, None))
                 }
-                Err(HandshakeError::Failure(_)) => return Err(TransportError::HandshakeFailed),
+                // A request that is not an upgrade this end accepts is ANSWERED (RFC 6455 4.2.1:
+                // 400; a version it does not speak, 4.4: 426 naming the one it does), and the
+                // connection's frames end failed. A request still incomplete, or a carrier that
+                // broke, has no request to answer.
+                Err(HandshakeError::Failure(e)) => {
+                    if matches!(
+                        e,
+                        WsError::Protocol(ProtocolError::HandshakeIncomplete) | WsError::Io(_)
+                    ) {
+                        return Err(TransportError::HandshakeFailed);
+                    }
+                    let answer: &[u8] = if matches!(
+                        e,
+                        WsError::Protocol(ProtocolError::MissingSecWebSocketVersionHeader)
+                    ) {
+                        b"HTTP/1.1 426 Upgrade Required\r\nSec-WebSocket-Version: 13\r\nConnection: close\r\nContent-Length: 0\r\n\r\n"
+                    } else {
+                        b"HTTP/1.1 400 Bad Request\r\nConnection: close\r\nContent-Length: 0\r\n\r\n"
+                    };
+                    out.send(answer);
+                    return Ok((Phase::Refused(Pipe::default()), true, None));
+                }
             },
             Phase::Dialling { mid, held, message } => match mid.handshake() {
                 Ok((mut ws, response)) => {
@@ -1409,6 +1439,9 @@ impl WsFramer {
             }),
             Phase::Answered { short: true, .. } => {
                 Some("the far end's answer ended before its body was whole")
+            }
+            Phase::Refused(_) => {
+                Some("the upgrade request is not a WebSocket opening handshake this end can accept")
             }
             _ => None,
         }
