@@ -8,7 +8,7 @@
 //! other as binary.
 
 use busbar_contract::transport::wire::WireStatusClass;
-use busbar_contract::transport::{Framed, Framer, FramerOut, HostTime, Side};
+use busbar_contract::transport::{ConnFacts, Framed, Framer, FramerOut, HostTime, Side};
 use tungstenite::handshake::derive_accept_key;
 
 use std::task::Poll;
@@ -1094,4 +1094,35 @@ fn a_non_chunked_transfer_encoding_overrides_content_length() {
     );
     assert!(heard.ended && !framer.failed(state));
     assert_eq!(heard.frames[1..].concat(), b"okmore".to_vec());
+}
+
+/// AFTER THE PEER'S CLOSE, WHAT ARRIVES IS NOBODY'S (codeaudit r1 g1): the frames ended, the machine
+/// no longer reads, so later bytes are not kept. RED before the fix: they were appended to the
+/// pipe's inbound without end.
+#[test]
+fn nothing_is_kept_after_the_peers_close() {
+    let upgrade = b"GET /echo HTTP/1.1\r\nHost: svc.test\r\nUpgrade: websocket\r\n\
+        Connection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
+        Sec-WebSocket-Version: 13\r\n\r\n";
+    let framer = WsFramer::new(0);
+    let mut out = Out::default();
+    let state = framer
+        .open(Side::Accept, "", &ConnFacts::default(), &mut out)
+        .expect("an accepted framing opens");
+    framer
+        .ingest(state, upgrade, false, &mut out)
+        .expect("the upgrade is answered");
+    // A client's masked (all-zero key) close frame.
+    let mut closed = Out::default();
+    framer
+        .ingest(state, &[0x88, 0x80, 0, 0, 0, 0], false, &mut closed)
+        .expect("the peer closes");
+    assert!(closed.ended, "the frames end");
+    assert_eq!(framer.inbound_len(state), Some(0));
+    for _ in 0..3 {
+        framer
+            .ingest(state, &[0x81, 0x80, 0, 0, 0, 0], false, &mut Out::default())
+            .expect("ingested");
+        assert_eq!(framer.inbound_len(state), Some(0), "nobody's bytes");
+    }
 }
