@@ -903,3 +903,47 @@ fn a_failed_piece_is_never_handed_as_payload() {
     assert!(accept.ended);
     host.close();
 }
+
+// ── a failing op's fate does not depend on the backlog (codeaudit g5 F) ──────────────────────────
+
+/// AN OVER-CEILING EMIT FAILS THE OP, NOT THE CONNECTION, WHATEVER IS QUEUED: with pieces still
+/// owed to the host, the refused message is answered `Failed` with its text, the connection is not
+/// ended, a later message goes out, and the backlog is still handed over. RED before the fix: a
+/// non-empty backlog turned the refusal into the connection's end.
+#[test]
+fn a_refused_emit_with_a_backlog_fails_the_op_and_keeps_the_connection() {
+    // A sink so small every answer leaves pieces queued.
+    let mut host = Host::open(linked(), (64 * 1024, 3, 1));
+    let mut dial = host.begin(SIDE_DIAL, "ws://svc.test/stream");
+    let mut accept = host.begin(SIDE_ACCEPT, "");
+    host.carry(&mut dial, &mut accept);
+    host.carry(&mut accept, &mut dial);
+    let heard = [
+        client_message(0x1, b"hello world"),
+        client_message(0x1, b"second"),
+    ]
+    .concat();
+    let mut i: IngestIn = z();
+    i.framing = accept.framing;
+    i.bytes = heard.as_ptr();
+    i.len = heard.len();
+    i.sink = host.sink();
+    let mut o: FramerOut = z();
+    let r = call(host.ops.ingest, host.inst, &mut i, &mut o, slot::INGEST);
+    assert!(host.take(r, &o, &mut accept), "pieces are still owed");
+    let big = vec![b'x'; 32 * 1024 * 1024 + 1];
+    let (r, o) = host.emit(&accept, &big, 0);
+    assert_eq!(r, Outcome::Failed, "the refused message fails the op");
+    assert!(o.head.error.len > 0, "and says why");
+    assert!(!accept.ended, "the connection is not ended");
+    host.say(&mut accept, "ok");
+    host.carry(&mut accept, &mut dial);
+    assert_eq!(texts(&dial), ["ok"], "a later message goes out");
+    assert_eq!(
+        texts(&accept),
+        ["hello world", "second"],
+        "the backlog is handed over"
+    );
+    assert!(!accept.ended && !accept.stream_end);
+    host.close();
+}
