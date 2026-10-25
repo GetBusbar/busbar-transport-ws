@@ -19,9 +19,10 @@ use busbar_contract::abi::mechanism::lifecycle::{slot as life, OpenIn, OpenOut};
 use busbar_contract::abi::transport::check::{check_framer, check_framer_fields};
 use busbar_contract::abi::transport::fields::lines;
 use busbar_contract::abi::transport::{
-    slot, BeginIn, EmitIn, FinishIn, FramePiece, FramerOut, FramerSink, IngestIn, Ops,
-    CLOSE_NORMAL, EMIT_TEXT, PIECE_CONTINUED, PIECE_END, PIECE_END_OF_FRAME, PIECE_FIELDS,
-    PIECE_HAS_CODE, PIECE_TEXT, SIDE_ACCEPT, SIDE_DIAL, STATUS_SUCCESS, YIELD_ENDED, YIELD_MORE,
+    slot, AdoptIn, BeginIn, EmitIn, FinishIn, FramePiece, FramerOut, FramerSink, IngestIn, Ops,
+    RefuseIn, CLOSE_NORMAL, EMIT_TEXT, PIECE_CONTINUED, PIECE_END, PIECE_END_OF_FRAME,
+    PIECE_FIELDS, PIECE_HAS_CODE, PIECE_STREAM_FAILED, PIECE_TEXT, SIDE_ACCEPT, SIDE_DIAL,
+    STATUS_SUCCESS, YIELD_ENDED, YIELD_MORE,
 };
 use tungstenite::handshake::derive_accept_key;
 
@@ -56,6 +57,8 @@ struct End {
     text: Vec<bool>,
     /// The stream ended whole (`PIECE_END`).
     stream_end: bool,
+    /// Each piece that ended the stream FAILED (`PIECE_STREAM_FAILED`): its bytes, the reason.
+    failures: Vec<Vec<u8>>,
     ended: bool,
     /// Each field block it heard (`PIECE_FIELDS`), never a message: its bytes, reassembled across
     /// pieces, the code and class its pieces stated (`PIECE_HAS_CODE`), whether it is whole, and
@@ -151,6 +154,10 @@ impl Host {
         for p in &self.pieces[..n] {
             let b = &self.frame[p.offset as usize..(p.offset + p.len) as usize];
             self.log.extend_from_slice(b);
+            if p.flags & PIECE_STREAM_FAILED != 0 {
+                end.failures.push(b.to_vec());
+                continue;
+            }
             // The stream's end is said, and is no frame.
             if p.flags & PIECE_END != 0 {
                 end.stream_end = true;
@@ -399,8 +406,9 @@ fn written_as_text(label: &str, ops: &'static Ops, caps: (usize, usize, usize)) 
         [(b"{\"t\":1}".to_vec(), true), (b"\x01\x02".to_vec(), true)]
     );
     assert_eq!(accept.text, [true, false], "written as text, heard as text");
-    let (r, _) = host.emit(&dial, b"\xff\xfe", EMIT_TEXT);
-    assert_ne!(r, Outcome::Ready, "text that is not UTF-8 is refused");
+    let (r, o) = host.emit(&dial, b"\xff\xfe", EMIT_TEXT);
+    assert_eq!(r, Outcome::Failed, "text that is not UTF-8 is refused");
+    assert_eq!(o.yielded.wire_len, 0, "and nothing goes out");
     host.close();
 }
 
@@ -588,5 +596,575 @@ fn a_refused_upgrade_s_retry_after_reaches_the_host() {
     assert_eq!(dial.heads.len(), 1, "one head");
     assert_eq!(dial.heads[0].code, Some(429));
     assert_eq!(dial.heads[0].retry_after, Some(7), "the wait crosses");
+    host.close();
+}
+
+/// BEGIN REFUSES A TARGET THAT IS NOT TEXT, as `locate` does (codeaudit g2 LOW): it never dials a
+/// U+FFFD-repaired address the host did not name. RED before the fix: the dial opened on the
+/// repaired target.
+#[test]
+fn begin_refuses_a_target_that_is_not_text() {
+    let mut host = Host::open(linked(), (64 * 1024, 64 * 1024, 64));
+    let target: &'static [u8] = b"ws://svc.test/\xff\xfe";
+    let mut i: BeginIn = z();
+    i.side = SIDE_DIAL;
+    i.scheme = SCHEME_PLAIN;
+    i.target = AbiStr {
+        ptr: target.as_ptr(),
+        len: target.len(),
+    };
+    i.sink = host.sink();
+    let mut o: FramerOut = z();
+    let r = call(host.ops.begin, host.inst, &mut i, &mut o, slot::BEGIN);
+    assert_eq!(r, Outcome::Failed, "a target that is not text is refused");
+    // SAFETY: the door's error text, valid until the next call.
+    let why = unsafe { std::slice::from_raw_parts(o.head.error.ptr, o.head.error.len) };
+    assert_eq!(why, b"begin: the target is not text");
+    host.close();
+}
+
+/// LOCATE ANSWERS AN ACCEPTING LISTENER'S OFFER (codeaudit g2 LOW; `LocateIn::accept`): a listener
+/// names no far end, so the target is empty and the answer is the protocol offer alone, the same
+/// `http/1.1` the dial side makes. RED before the fix: the door refused "not a ws or wss URL".
+#[test]
+fn locate_for_a_listener_answers_the_accepting_offer() {
+    use busbar_contract::abi::transport::{LocateIn, LocateOut};
+    let host = Host::open(linked(), (1024, 1024, 4));
+    let mut alpn = [0_u8; 16];
+    let mut i: LocateIn = z();
+    i.accept = 1;
+    i.alpn_buf = alpn.as_mut_ptr();
+    i.alpn_cap = alpn.len();
+    let mut o: LocateOut = z();
+    let r = call(host.ops.locate, host.inst, &mut i, &mut o, slot::LOCATE);
+    assert_eq!(r, Outcome::Ready, "a listener is located");
+    assert_eq!((o.authority_written, o.name_written, o.has_name), (0, 0, 0));
+    assert_eq!(o.secure, 0);
+    assert_eq!(&alpn[..o.alpn_written as usize], b"\x08http/1.1");
+    // The short-buffer rule: too small an ALPN buffer is told what it needs.
+    i.alpn_cap = 3;
+    let mut o: LocateOut = z();
+    let r = call(host.ops.locate, host.inst, &mut i, &mut o, slot::LOCATE);
+    assert_eq!(r, Outcome::Failed);
+    assert_eq!(o.alpn_needed, 9);
+    host.close();
+}
+
+/// A REFUSED UPGRADE'S WAIT, IN ITS HTTP-DATE FORM, CROSSES THE ABI (RFC 9110 §10.2.3): a `503`
+/// whose `Retry-After` is an IMF-fixdate 120 s after the sink's unix clock (1790000000 s, so
+/// 1790000120 s is Mon, 21 Sep 2026 14:15:20 GMT) is heard as 120 seconds, read against the wall
+/// clock and not the monotonic one.
+#[test]
+fn a_refused_upgrade_s_retry_after_http_date_reaches_the_host() {
+    let mut host = Host::open(linked(), (64 * 1024, 64 * 1024, 64));
+    let mut dial = host.begin(SIDE_DIAL, "ws://svc.test/stream");
+    dial.wire.clear();
+    host.hear(
+        &mut dial,
+        b"HTTP/1.1 503 Service Unavailable\r\nRetry-After: Mon, 21 Sep 2026 14:15:20 GMT\r\nContent-Length: 0\r\n\r\n",
+    );
+    assert_eq!(dial.heads.len(), 1, "one head");
+    assert_eq!(dial.heads[0].code, Some(503));
+    assert_eq!(
+        dial.heads[0].retry_after,
+        Some(120),
+        "the date's wait crosses"
+    );
+    host.close();
+}
+
+/// A BODY CEILING OF ZERO IS REFUSED, NOT OPENED WITHOUT AN OUTBOUND CEILING (codeaudit g5 LOW):
+/// `validate` (and `open`) answer why. RED before the fix: validate answered Ready.
+#[test]
+fn a_zero_message_ceiling_is_refused_by_validate_and_open() {
+    use busbar_contract::abi::mechanism::call::Blob;
+    use busbar_contract::abi::mechanism::lifecycle::ValidateIn;
+    let settings = br#"{"limits.request_body_max_bytes": 0}"#;
+    let l = linked();
+    let mut i: ValidateIn = z();
+    i.settings = Blob {
+        ptr: settings.as_ptr(),
+        len: settings.len(),
+        ..z()
+    };
+    let mut o: OutHead = z();
+    let r = call(
+        l.head.validate,
+        std::ptr::null_mut(),
+        &mut i,
+        &mut o,
+        life::VALIDATE,
+    );
+    assert_eq!(r, Outcome::Failed, "validate refuses a zero ceiling");
+    // SAFETY: the door's error text, valid until the next call.
+    let why = unsafe { std::slice::from_raw_parts(o.error.ptr, o.error.len) };
+    assert_eq!(
+        why,
+        b"settings: limits.request_body_max_bytes must be above 0"
+    );
+    let mut oi: OpenIn = z();
+    oi.settings = Blob {
+        ptr: settings.as_ptr(),
+        len: settings.len(),
+        ..z()
+    };
+    let mut oo: OpenOut = z();
+    let r = call(
+        l.head.open,
+        std::ptr::null_mut(),
+        &mut oi,
+        &mut oo,
+        life::OPEN,
+    );
+    assert_eq!(r, Outcome::Failed, "open refuses a zero ceiling");
+}
+
+// ── a refused open says why (codeaudit g5 H) ─────────────────────────────────────────────────────
+
+/// A host that serves `auth_call` and nothing else. Its `ctx.handle` says what the auth does.
+mod auth_host {
+    use super::*;
+    use busbar_contract::abi::auth::{FieldSpan, POINT_PEER};
+    use busbar_contract::abi::host::service::{
+        AuthAnswer, AuthCallIn, HostSlots, ServiceFn, ServiceOut, UnitRef, FLOW_CONTINUE,
+        FLOW_STOP, SERVICES,
+    };
+    use busbar_contract::abi::mechanism::call::{RawOutcome, Span};
+    use busbar_contract::abi::mechanism::ticket::{HostCtx, HostTables};
+
+    /// The auth call fails (the host declines it).
+    pub const FAILS: u64 = 1;
+    /// The auth answers stop.
+    pub const STOPS: u64 = 2;
+    /// The auth answers continue with a line the upgrade cannot carry (`upgrade`).
+    pub const BAD_LINE: u64 = 3;
+
+    extern "C" fn auth_call(
+        ctx: HostCtx,
+        input: *const c_void,
+        out: *mut ServiceOut,
+    ) -> RawOutcome {
+        // SAFETY: the door passes an `AuthCallIn` and a `ServiceOut` of the contract's sizes.
+        let (i, out) = unsafe { (&*input.cast::<AuthCallIn>(), &mut *out) };
+        out.size = size_of::<ServiceOut>() as u32;
+        if ctx.handle == FAILS {
+            out.outcome = RawOutcome::of(Outcome::Failed);
+            return RawOutcome::of(Outcome::Failed);
+        }
+        let flow = if ctx.handle == STOPS {
+            FLOW_STOP
+        } else {
+            FLOW_CONTINUE
+        };
+        let peer = i.point == POINT_PEER;
+        // SAFETY: the caller's own answer slot, buffer and spans.
+        unsafe {
+            *i.answer = AuthAnswer {
+                size: size_of::<AuthAnswer>() as u32,
+                flow,
+                unit: if peer {
+                    UnitRef::NONE
+                } else {
+                    UnitRef { id: 1, mac: 1 }
+                },
+            };
+            if ctx.handle == BAD_LINE && !peer {
+                let text = b"upgradewebsocket";
+                std::ptr::copy_nonoverlapping(text.as_ptr(), i.buf, text.len());
+                *i.spans = FieldSpan {
+                    name: Span { offset: 0, len: 7 },
+                    value: Span { offset: 7, len: 9 },
+                    flags: 0,
+                    _reserved: 0,
+                };
+                out.len = text.len() as u64;
+                out.items = 1;
+            }
+        }
+        out.outcome = RawOutcome::of(Outcome::Ready);
+        RawOutcome::of(Outcome::Ready)
+    }
+
+    /// An instance opened on this host, behaving as `what` says.
+    pub fn open(what: u64) -> Host {
+        let mut slots: HostSlots = z();
+        slots.size = size_of::<HostSlots>() as u32;
+        slots.slots = SERVICES;
+        slots.auth_call = Some(auth_call as ServiceFn);
+        // The tables outlive the instance: leaked, as a host's are static.
+        let slots: &'static HostSlots = Box::leak(Box::new(slots));
+        let mut tables: HostTables = z();
+        tables.size = size_of::<HostTables>() as u32;
+        tables.ctx = HostCtx { handle: what };
+        tables.services = slots;
+        let tables: &'static HostTables = Box::leak(Box::new(tables));
+        let l = linked();
+        let mut i: OpenIn = z();
+        i.host = tables;
+        let mut o: OpenOut = z();
+        let r = call(
+            l.head.open,
+            std::ptr::null_mut(),
+            &mut i,
+            &mut o,
+            life::OPEN,
+        );
+        assert_eq!(r, Outcome::Ready);
+        Host {
+            ops: l,
+            inst: o.instance,
+            caps: (64 * 1024, 64 * 1024, 64),
+            wire: vec![0; 64 * 1024],
+            frame: vec![0; 64 * 1024],
+            pieces: vec![z(); 64],
+            log: Vec::new(),
+        }
+    }
+}
+
+/// `begin` on `target`, the binding's auth at `points`; the refusal's text.
+fn refused_begin(host: &mut Host, target: &'static str, points: u32) -> String {
+    let mut i: BeginIn = z();
+    i.side = SIDE_DIAL;
+    i.scheme = SCHEME_PLAIN;
+    i.target = AbiStr {
+        ptr: target.as_ptr(),
+        len: target.len(),
+    };
+    i.points = points;
+    i.sink = host.sink();
+    let mut o: FramerOut = z();
+    let r = call(host.ops.begin, host.inst, &mut i, &mut o, slot::BEGIN);
+    assert_eq!(r, Outcome::Failed, "the open is refused");
+    // SAFETY: the door's error text, valid until the next call.
+    String::from_utf8(
+        unsafe { std::slice::from_raw_parts(o.head.error.ptr, o.head.error.len) }.to_vec(),
+    )
+    .expect("the reason is text")
+}
+
+/// EACH REFUSAL SAYS ITS OWN CAUSE: the peer point's and the head point's auth outcomes, and an
+/// address the target cannot be dialled at, are told apart. RED before the fix: the head point
+/// said one text for all three, the peer point one for a failure and a stop, and an address
+/// said "the framing could not be opened".
+#[test]
+fn a_refused_open_says_why() {
+    use busbar_contract::abi::auth::{POINT_HEAD, POINT_PEER};
+    let cases: [(u64, u32, &str); 5] = [
+        (
+            auth_host::FAILS,
+            POINT_PEER,
+            "begin: the host's auth call failed",
+        ),
+        (
+            auth_host::STOPS,
+            POINT_PEER,
+            "begin: the binding's auth stopped the connection",
+        ),
+        (
+            auth_host::FAILS,
+            POINT_HEAD,
+            "begin: the host's auth call failed",
+        ),
+        (
+            auth_host::STOPS,
+            POINT_HEAD,
+            "begin: the binding's auth stopped the dial",
+        ),
+        (
+            auth_host::BAD_LINE,
+            POINT_HEAD,
+            "begin: the binding's auth answered a line the upgrade cannot carry",
+        ),
+    ];
+    for (what, point, text) in cases {
+        let mut host = auth_host::open(what);
+        assert_eq!(refused_begin(&mut host, "ws://svc.test/", point), text);
+        host.close();
+    }
+    let mut host = auth_host::open(0);
+    assert_eq!(
+        refused_begin(&mut host, "ws://u:p@host/", 0),
+        "the target is not a ws:// or wss:// URL"
+    );
+    host.close();
+}
+
+// ── a failed stream's end piece says why (codeaudit g5 G) ────────────────────────────────────────
+
+/// An accepted framing whose far end broke the protocol (a reserved opcode), on a host whose frame
+/// buffer holds `frame_cap` bytes: the accepted end, after it has heard the violation.
+fn broken_accept(frame_cap: usize) -> (Host, End) {
+    let mut host = Host::open(linked(), (64 * 1024, frame_cap, 8));
+    let mut dial = host.begin(SIDE_DIAL, "ws://svc.test/stream");
+    let mut accept = host.begin(SIDE_ACCEPT, "");
+    host.carry(&mut dial, &mut accept);
+    host.carry(&mut accept, &mut dial);
+    host.hear(&mut accept, &client_message(0x3, b""));
+    (host, accept)
+}
+
+/// THE FAILED END PIECE CARRIES THE REASON: the bytes of the piece that ends a stream the far end
+/// broke state how it broke it. RED before the fix: the piece was empty.
+#[test]
+fn a_failed_stream_s_end_piece_says_why() {
+    let (host, accept) = broken_accept(64 * 1024);
+    assert_eq!(
+        accept.failures,
+        [b"the far end broke the WebSocket protocol".to_vec()]
+    );
+    assert!(accept.ended && !accept.stream_end);
+    host.close();
+}
+
+/// A FAILED PIECE IS NEVER SPLIT: a frame buffer smaller than its reason hands it as ONE piece,
+/// flagged failed, its reason cut to the room; never as unflagged payload.
+#[test]
+fn a_failed_piece_is_never_handed_as_payload() {
+    let (host, accept) = broken_accept(5);
+    assert!(accept.frames.is_empty(), "no unflagged payload");
+    assert_eq!(accept.failures, [b"the f".to_vec()]);
+    assert!(accept.ended);
+    host.close();
+}
+
+// ── a failing op's fate does not depend on the backlog (codeaudit g5 F) ──────────────────────────
+
+/// AN OVER-CEILING EMIT FAILS THE OP, NOT THE CONNECTION, WHATEVER IS QUEUED: with pieces still
+/// owed to the host, the refused message is answered `Failed` with its text, the connection is not
+/// ended, a later message goes out, and the backlog is still handed over. RED before the fix: a
+/// non-empty backlog turned the refusal into the connection's end.
+#[test]
+fn a_refused_emit_with_a_backlog_fails_the_op_and_keeps_the_connection() {
+    // A sink so small every answer leaves pieces queued.
+    let mut host = Host::open(linked(), (64 * 1024, 3, 1));
+    let mut dial = host.begin(SIDE_DIAL, "ws://svc.test/stream");
+    let mut accept = host.begin(SIDE_ACCEPT, "");
+    host.carry(&mut dial, &mut accept);
+    host.carry(&mut accept, &mut dial);
+    let heard = [
+        client_message(0x1, b"hello world"),
+        client_message(0x1, b"second"),
+    ]
+    .concat();
+    let mut i: IngestIn = z();
+    i.framing = accept.framing;
+    i.bytes = heard.as_ptr();
+    i.len = heard.len();
+    i.sink = host.sink();
+    let mut o: FramerOut = z();
+    let r = call(host.ops.ingest, host.inst, &mut i, &mut o, slot::INGEST);
+    assert!(host.take(r, &o, &mut accept), "pieces are still owed");
+    let big = vec![b'x'; 32 * 1024 * 1024 + 1];
+    let (r, o) = host.emit(&accept, &big, 0);
+    assert_eq!(r, Outcome::Failed, "the refused message fails the op");
+    assert!(o.head.error.len > 0, "and says why");
+    host.say(&mut accept, "ok");
+    host.carry(&mut accept, &mut dial);
+    assert_eq!(texts(&dial), ["ok"], "a later message goes out");
+    assert_eq!(
+        texts(&accept),
+        ["hello world", "second"],
+        "the backlog is handed over"
+    );
+    assert!(!accept.ended && !accept.stream_end);
+    host.close();
+}
+
+// ── an accepted upgrade that is refused is answered (codeaudit g5 A) ─────────────────────────────
+
+/// An upgrade request, its `Sec-WebSocket-Version` and `Sec-WebSocket-Key` lines as given.
+fn upgrade_request(version: &str, key: &str) -> Vec<u8> {
+    format!(
+        "GET /chat HTTP/1.1\r\nHost: svc.test\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n{key}{version}\r\n"
+    )
+    .into_bytes()
+}
+
+const KEY: &str = "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n";
+const REFUSED_WHY: &[u8] =
+    b"the upgrade request is not a WebSocket opening handshake this end can accept";
+
+/// What the accepted end said after being refused: answered on the wire, the stream ended FAILED
+/// (never whole), the connection ended.
+fn assert_answered(end: &End, status_line: &str) {
+    let wire = String::from_utf8_lossy(&end.wire);
+    assert!(wire.starts_with(status_line), "the wire answers: {wire:?}");
+    assert!(wire.contains("Connection: close\r\n"), "{wire:?}");
+    if status_line.contains("426") {
+        assert!(wire.contains("Sec-WebSocket-Version: 13\r\n"), "{wire:?}");
+    }
+    assert_eq!(
+        end.failures,
+        [REFUSED_WHY.to_vec()],
+        "the stream ended failed"
+    );
+    assert!(!end.stream_end, "never whole");
+    assert!(end.ended, "the connection ended");
+}
+
+/// A REQUEST FOR A VERSION THIS END DOES NOT SPEAK IS ANSWERED 426 with the version it does (RFC
+/// 6455 4.4), and one missing its key 400 (4.2.1); either way the stream ends failed. RED before
+/// the fix: nothing was answered and the ingest failed with no HTTP on the wire.
+#[test]
+fn a_refused_upgrade_request_is_answered() {
+    for (request, status) in [
+        (
+            upgrade_request("Sec-WebSocket-Version: 8\r\n", KEY),
+            "HTTP/1.1 426",
+        ),
+        (
+            upgrade_request("Sec-WebSocket-Version: 13\r\n", ""),
+            "HTTP/1.1 400",
+        ),
+    ] {
+        let mut host = Host::open(linked(), (64 * 1024, 64 * 1024, 8));
+        let mut accept = host.begin(SIDE_ACCEPT, "");
+        host.hear(&mut accept, &request);
+        assert_answered(&accept, status);
+        host.close();
+    }
+}
+
+/// THE SAME REFUSAL THROUGH ADOPT: the request is the connection's leftover; `adopt` answers READY
+/// with the 400/426 on the wire and a failed end piece.
+#[test]
+fn an_adopted_connection_whose_leftover_is_refused_is_answered() {
+    for (request, status) in [
+        (
+            upgrade_request("Sec-WebSocket-Version: 8\r\n", KEY),
+            "HTTP/1.1 426",
+        ),
+        (
+            upgrade_request("Sec-WebSocket-Version: 13\r\n", ""),
+            "HTTP/1.1 400",
+        ),
+    ] {
+        let mut host = Host::open(linked(), (64 * 1024, 64 * 1024, 8));
+        let mut accept = End::default();
+        let mut i: AdoptIn = z();
+        i.side = SIDE_ACCEPT;
+        i.leftover = request.as_ptr();
+        i.leftover_len = request.len();
+        i.sink = host.sink();
+        let mut o: FramerOut = z();
+        let r = call(host.ops.adopt, host.inst, &mut i, &mut o, slot::ADOPT);
+        accept.framing = o.framing;
+        let more = host.take(r, &o, &mut accept);
+        host.again(more, &mut accept);
+        assert_answered(&accept, status);
+        host.close();
+    }
+}
+
+/// AN OP ON A FRAMING THAT WAS ALREADY GONE FAILS THE OP: after a successful `refuse` the state is
+/// gone; a later `ingest` answers `Failed` with an explained text, and ends nothing a second time.
+/// RED before the fix: it answered READY with a failed end piece reading "Closed".
+#[test]
+fn an_op_after_a_refuse_fails_and_does_not_end_the_stream_again() {
+    let mut host = Host::open(linked(), (64 * 1024, 64 * 1024, 8));
+    let mut dial = host.begin(SIDE_DIAL, "ws://svc.test/stream");
+    let mut accept = host.begin(SIDE_ACCEPT, "");
+    host.carry(&mut dial, &mut accept);
+    let mut i: RefuseIn = z();
+    i.framing = accept.framing;
+    i.sink = host.sink();
+    let mut o: FramerOut = z();
+    let r = call(host.ops.refuse, host.inst, &mut i, &mut o, slot::REFUSE);
+    assert_eq!(r, Outcome::Ready);
+    let more = host.take(r, &o, &mut accept);
+    host.again(more, &mut accept);
+    let before = accept.failures.len();
+    let bytes = client_message(0x1, b"late");
+    let mut i: IngestIn = z();
+    i.framing = accept.framing;
+    i.bytes = bytes.as_ptr();
+    i.len = bytes.len();
+    i.sink = host.sink();
+    let mut o: FramerOut = z();
+    let r = call(host.ops.ingest, host.inst, &mut i, &mut o, slot::INGEST);
+    assert_eq!(r, Outcome::Failed, "the op fails");
+    // SAFETY: the door's error text, valid until the next call.
+    let why = unsafe { std::slice::from_raw_parts(o.head.error.ptr, o.head.error.len) };
+    assert_eq!(why, b"the connection is closed");
+    assert_eq!(accept.failures.len(), before);
+    host.close();
+}
+
+/// A RE-CALLED `refuse` DRAINS: the contract re-calls the same op after READY with `YIELD_MORE`.
+/// A refusal larger than the wire buffer removes the framing at the first call (the close), so the
+/// re-calls find it gone with bytes still owed: they answer READY and hand over every byte of the
+/// refusal and then the close frame. RED before the fix: the re-call answered Failed.
+#[test]
+fn a_re_called_refuse_hands_over_the_whole_refusal_and_the_close() {
+    let mut host = Host::open(linked(), (16, 64 * 1024, 8));
+    let mut dial = host.begin(SIDE_DIAL, "ws://svc.test/stream");
+    let mut accept = host.begin(SIDE_ACCEPT, "");
+    host.carry(&mut dial, &mut accept);
+    accept.wire.clear();
+    let body = [b'r'; 100];
+    let mut more = true;
+    let mut calls = 0;
+    while more {
+        calls += 1;
+        assert!(calls < 1000, "a re-call never ran dry");
+        let mut i: RefuseIn = z();
+        i.framing = accept.framing;
+        i.bytes = body.as_ptr();
+        i.len = body.len();
+        i.sink = host.sink();
+        let mut o: FramerOut = z();
+        let r = call(host.ops.refuse, host.inst, &mut i, &mut o, slot::REFUSE);
+        assert_eq!(r, Outcome::Ready, "call {calls}");
+        more = host.take(r, &o, &mut accept);
+    }
+    assert!(calls > 1, "the refusal needed re-calls");
+    let mut expect = vec![0x82, 100];
+    expect.extend_from_slice(&body);
+    expect.extend_from_slice(&[0x88, 2, 0x03, 0xE8]);
+    assert_eq!(accept.wire, expect, "the refusal and the close, whole");
+    host.close();
+}
+
+/// NEW INPUT ON A FRAMING A REFUSAL ALREADY CLOSED IS NOT SWALLOWED BY THE DRAIN: an emit with
+/// bytes, while the refusal is still owed, answers `Failed` with the closed text, and the refusal
+/// and its close still drain in full through the `refuse` re-calls. RED before the fix: the emit
+/// answered READY and its data vanished.
+#[test]
+fn an_emit_after_a_refuse_with_a_backlog_fails_and_the_backlog_still_drains() {
+    let mut host = Host::open(linked(), (16, 64 * 1024, 8));
+    let mut dial = host.begin(SIDE_DIAL, "ws://svc.test/stream");
+    let mut accept = host.begin(SIDE_ACCEPT, "");
+    host.carry(&mut dial, &mut accept);
+    accept.wire.clear();
+    let body = [b'r'; 100];
+    let refuse = |host: &mut Host, accept: &mut End| {
+        let mut i: RefuseIn = z();
+        i.framing = accept.framing;
+        i.bytes = body.as_ptr();
+        i.len = body.len();
+        i.sink = host.sink();
+        let mut o: FramerOut = z();
+        let r = call(host.ops.refuse, host.inst, &mut i, &mut o, slot::REFUSE);
+        assert_eq!(r, Outcome::Ready);
+        host.take(r, &o, accept)
+    };
+    let mut more = refuse(&mut host, &mut accept);
+    assert!(more, "the refusal is still owed");
+    let (r, o) = host.emit(&accept, b"new data", 0);
+    assert_eq!(r, Outcome::Failed, "new data on a closed framing fails");
+    // SAFETY: the door's error text, valid until the next call.
+    let why = unsafe { std::slice::from_raw_parts(o.head.error.ptr, o.head.error.len) };
+    assert_eq!(why, b"the connection is closed");
+    let mut calls = 0;
+    while more {
+        calls += 1;
+        assert!(calls < 1000, "a re-call never ran dry");
+        more = refuse(&mut host, &mut accept);
+    }
+    let mut expect = vec![0x82, 100];
+    expect.extend_from_slice(&body);
+    expect.extend_from_slice(&[0x88, 2, 0x03, 0xE8]);
+    assert_eq!(accept.wire, expect, "the backlog drains in full");
     host.close();
 }

@@ -143,16 +143,23 @@ enum Phase {
     /// (its declared `Content-Length`), or with none declared, every byte until the carrier ends.
     /// At `Some(0)` its frames have ended and nothing more is read. `chunked`: the body's transfer
     /// coding is `chunked` (RFC 9112 §7.1), decoded here and ended at its last chunk; `left` is then
-    /// `None` until it ends.
+    /// `None` until it ends. With a transfer coding whose final coding is not `chunked`,
+    /// `Content-Length` is ignored and the body runs to the carrier's end (RFC 9112 §6.3).
     ///
     /// `short`: the carrier ended before the body did (short of its declared `Content-Length`, or
-    /// of its last chunk): the frames end FAILED, not whole ([`WsFramer::failed`]).
+    /// of its last chunk), or the declared `Content-Length` is not a length or disagrees with
+    /// itself (RFC 9110 §8.6), which fails the body at once: the frames end FAILED, not whole
+    /// ([`WsFramer::failed`]).
     Answered {
         pipe: Pipe,
         left: Option<u64>,
         chunked: Option<Box<Dechunk>>,
         short: bool,
     },
+    /// An accepted connection whose upgrade request was refused: the answer (`400`, or `426` for a
+    /// version this end does not speak) went out, the frames ended failed, and whatever still
+    /// arrives is nobody's ([`WsFramer::failure`]).
+    Refused(Pipe),
 }
 
 impl Phase {
@@ -172,7 +179,7 @@ impl Phase {
             Phase::Accepting(mid) => mid.get_mut().get_mut(),
             Phase::Dialling { mid, .. } => mid.get_mut().get_mut(),
             Phase::Open { ws, .. } => ws.get_mut(),
-            Phase::Answered { pipe, .. } => pipe,
+            Phase::Answered { pipe, .. } | Phase::Refused(pipe) => pipe,
         }
     }
 }
@@ -351,10 +358,19 @@ fn status_class(code: u16) -> WireStatusClass {
 /// the seconds left until it (`0` once past). A value read as neither is absent.
 pub(crate) fn retry_after(headers: &HeaderMap, now_secs: u64) -> Option<u64> {
     let raw = headers.get("retry-after")?.to_str().ok()?.trim();
-    if let Ok(n) = raw.parse::<u64>() {
+    if let Some(n) = digits(raw, 10) {
         return Some(n);
     }
     imf_fixdate_secs(raw).map(|at| at.saturating_sub(now_secs))
+}
+
+/// `s` as a number in `radix` when it is all digits of it and at least one (RFC 9110's `1*DIGIT`,
+/// RFC 9112's `1*HEXDIG`): no sign, no space. An overflowing run is no number either.
+fn digits(s: &str, radix: u32) -> Option<u64> {
+    if s.is_empty() || !s.bytes().all(|b| char::from(b).is_digit(radix)) {
+        return None;
+    }
+    u64::from_str_radix(s, radix).ok()
 }
 
 /// An HTTP-date (RFC 9110 §5.6.7: the IMF-fixdate, and the two obsolete forms a recipient must
@@ -453,7 +469,7 @@ impl Dechunk {
                     let size = line.split(|c| *c == b';').next().unwrap_or_default();
                     match std::str::from_utf8(size)
                         .ok()
-                        .and_then(|t| u64::from_str_radix(t.trim(), 16).ok())
+                        .and_then(|t| digits(t.trim(), 16))
                     {
                         Some(0) => Chunked::Trailer,
                         Some(n) => Chunked::Data(n),
@@ -469,22 +485,56 @@ impl Dechunk {
     }
 }
 
-/// The `Content-Length` an answer declares.
-fn content_length(headers: &HeaderMap) -> Option<u64> {
-    headers
-        .get("content-length")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.trim().parse().ok())
+/// The `Content-Length` an answer declares: `Ok(None)` when it states none, and `Err` when what it
+/// states is not a length (RFC 9110 §8.6: `1*DIGIT`) or its values disagree (RFC 9112 §6.3: across
+/// lines and across a comma-separated list), which leaves the body's end unknowable.
+fn content_length(headers: &HeaderMap) -> Result<Option<u64>, ()> {
+    let mut declared = None;
+    for value in headers.get_all("content-length") {
+        for member in value.to_str().map_err(|_| ())?.split(',') {
+            let n = digits(member.trim(), 10).ok_or(())?;
+            if *declared.get_or_insert(n) != n {
+                return Err(());
+            }
+        }
+    }
+    Ok(declared)
 }
 
 /// A dialled head's REASON PHRASE (HEAD-FIELDS: the dialled side fills `reason`, HTTP/1 as sent):
 /// the status line's text after its code, once the line is whole (`HTTP/1.1 401 Unauthorized` →
 /// `Unauthorized`); `None` before the line ends, or for a line with no phrase.
 pub(crate) fn reason_phrase(seen: &[u8]) -> Option<Vec<u8>> {
-    let end = seen.windows(2).position(|w| w == b"\r\n")?;
-    let mut parts = seen[..end].splitn(3, |b| *b == b' ');
+    let end = seen.iter().position(|b| *b == b'\n')?;
+    let line = &seen[..end];
+    let line = line.strip_suffix(b"\r").unwrap_or(line);
+    let mut parts = line.splitn(3, |b| *b == b' ');
     let (_version, _code) = (parts.next()?, parts.next()?);
     parts.next().filter(|r| !r.is_empty()).map(<[u8]>::to_vec)
+}
+
+/// Whether `value` is a valid header field value (the rule `HeaderValue::from_bytes` applies: every
+/// byte a tab or visible/space/obs-text, none a control or DEL), checked where it lies: an auth
+/// answer's secret is never copied into a buffer this crate does not wipe.
+pub(crate) fn header_value_ok(value: &[u8]) -> bool {
+    value
+        .iter()
+        .all(|&b| (b >= 0x20 && b != 0x7f) || b == b'\t')
+}
+
+/// Where a response head ends in `seen`: just past its first empty line, which the protocol
+/// library's parser takes as a bare `\n` or a `\r\n` alike. `None` while the head is not whole.
+fn head_end(seen: &[u8]) -> Option<usize> {
+    (0..seen.len()).find_map(|i| {
+        if seen[i] != b'\n' {
+            return None;
+        }
+        match seen[i + 1..] {
+            [b'\n', ..] => Some(i + 2),
+            [b'\r', b'\n', ..] => Some(i + 3),
+            _ => None,
+        }
+    })
 }
 
 /// A refused upgrade's BODY: frame what the pipe holds, decoded by its transfer coding when it is
@@ -673,6 +723,17 @@ impl WsFramer {
         status: u32,
         out: &mut dyn FramerOut,
     ) -> Result<(), TransportError> {
+        // The refusal is its own message: the pieces of an unfinished outbound message are dropped,
+        // not sent glued to its front.
+        if let Ok(conn) = self.conn(state) {
+            if let Ok(mut guard) = Self::enter(&conn) {
+                if let Some(Phase::Open { message, .. } | Phase::Dialling { message, .. }) =
+                    guard.as_mut()
+                {
+                    message.clear();
+                }
+            }
+        }
         let sent = self.emit(state, StreamId(0), bytes, true, false, out);
         self.close_with(state, close_code_of_status(status), out);
         sent
@@ -902,10 +963,19 @@ impl WsFramer {
             .remove(&state);
     }
 
-    /// Whether framing `state` is still held (a test reads that a finished framing is gone).
-    #[cfg(test)]
+    /// Whether framing `state` is still held: an op that failed with its state alive failed that
+    /// op alone, one that left it gone ended the connection.
     pub(crate) fn holds(&self, state: u64) -> bool {
         self.map().contains_key(&state)
+    }
+
+    /// How many ingested bytes framing `state` holds unread (a test reads that bytes nobody will
+    /// read are not kept).
+    #[cfg(test)]
+    pub(crate) fn inbound_len(&self, state: u64) -> Option<usize> {
+        let conn = self.conn(state).ok()?;
+        let mut guard = Self::enter(&conn).ok()?;
+        guard.as_mut().map(|phase| phase.pipe().inbound.len())
     }
 
     /// Framing `state`'s own lock, found under the map's.
@@ -1002,6 +1072,11 @@ impl WsFramer {
                 let (phase, ended) = answered_body(pipe, left, chunked, false, out);
                 return Ok((phase, ended, None));
             }
+            // An upgrade request that was refused: what arrives now is nobody's.
+            Phase::Refused(mut pipe) => {
+                pipe.inbound.clear();
+                return Ok((Phase::Refused(pipe), false, None));
+            }
             phase => phase,
         };
         let shaking = !matches!(phase, Phase::Open { .. });
@@ -1027,7 +1102,28 @@ impl WsFramer {
                 Err(HandshakeError::Interrupted(mid)) => {
                     return Ok((Phase::Accepting(mid), false, None))
                 }
-                Err(HandshakeError::Failure(_)) => return Err(TransportError::HandshakeFailed),
+                // A request that is not an upgrade this end accepts is ANSWERED (RFC 6455 4.2.1:
+                // 400; a version it does not speak, 4.4: 426 naming the one it does), and the
+                // connection's frames end failed. A request still incomplete, or a carrier that
+                // broke, has no request to answer.
+                Err(HandshakeError::Failure(e)) => {
+                    if matches!(
+                        e,
+                        WsError::Protocol(ProtocolError::HandshakeIncomplete) | WsError::Io(_)
+                    ) {
+                        return Err(TransportError::HandshakeFailed);
+                    }
+                    let answer: &[u8] = if matches!(
+                        e,
+                        WsError::Protocol(ProtocolError::MissingSecWebSocketVersionHeader)
+                    ) {
+                        b"HTTP/1.1 426 Upgrade Required\r\nSec-WebSocket-Version: 13\r\nConnection: close\r\nContent-Length: 0\r\n\r\n"
+                    } else {
+                        b"HTTP/1.1 400 Bad Request\r\nConnection: close\r\nContent-Length: 0\r\n\r\n"
+                    };
+                    out.send(answer);
+                    return Ok((Phase::Refused(Pipe::default()), true, None));
+                }
             },
             Phase::Dialling { mid, held, message } => match mid.handshake() {
                 Ok((mut ws, response)) => {
@@ -1058,7 +1154,10 @@ impl WsFramer {
                 // byte past the head (what came with it, then what still arrives) up to its declared
                 // `Content-Length`, or with none declared until the carrier ends, unless its
                 // transfer coding is `chunked`, which frames it instead (decoded, to its last
-                // chunk; RFC 9112 §6.3); then the frames end.
+                // chunk; RFC 9112 §6.3). With a transfer coding whose final coding is not `chunked`,
+                // `Content-Length` is ignored and the body runs to the carrier's end (§6.3); a
+                // `Content-Length` that is not a length or disagrees fails the body at once (RFC 9110
+                // §8.6); then the frames end.
                 Err(HandshakeError::Failure(WsError::Http(response))) => {
                     let code = response.status().as_u16();
                     let block = head_block(response.headers());
@@ -1072,10 +1171,7 @@ impl WsFramer {
                         ..Framed::plain(StreamId(0), &block, true)
                     });
                     let (seen, carrier_ended) = shaken.unwrap_or_default();
-                    let at = seen
-                        .windows(4)
-                        .position(|w| w == b"\r\n\r\n")
-                        .map_or(seen.len(), |p| p + 4);
+                    let at = head_end(&seen).unwrap_or(seen.len());
                     let pipe = Pipe {
                         inbound: seen[at..].iter().copied().collect(),
                         ended: carrier_ended,
@@ -1086,12 +1182,29 @@ impl WsFramer {
                     let bodiless = matches!(code, 100..=199 | 204 | 304);
                     let chunked =
                         (!bodiless && is_chunked(response.headers())).then(Box::<Dechunk>::default);
+                    // A transfer coding that does not end in `chunked` leaves the body to the carrier's
+                    // end, whatever `Content-Length` says (RFC 9112 §6.3).
                     let declared = if bodiless {
-                        Some(0)
-                    } else if chunked.is_some() {
-                        None
+                        Ok(Some(0))
+                    } else if chunked.is_some()
+                        || response.headers().contains_key("transfer-encoding")
+                    {
+                        Ok(None)
                     } else {
                         content_length(response.headers())
+                    };
+                    let Ok(declared) = declared else {
+                        // A length that is invalid or in conflict: the body is failed at once.
+                        out.frame(Framed::plain(StreamId(0), &[], true));
+                        let mut pipe = pipe;
+                        pipe.inbound.clear();
+                        let phase = Phase::Answered {
+                            pipe,
+                            left: Some(0),
+                            chunked: None,
+                            short: true,
+                        };
+                        return Ok((phase, true, reason));
                     };
                     let (phase, ended) = answered_body(pipe, declared, chunked, true, out);
                     return Ok((phase, ended, reason));
@@ -1150,8 +1263,12 @@ impl WsFramer {
             }
         }
         if failed.is_some() {
-            ws.get_mut().inbound.clear();
             ended = true;
+        }
+        if ended {
+            // The frames ended (the peer's close, the connection gone, or a failure): the machine
+            // reads no more, so what is still in `inbound`, and what arrives later, is nobody's.
+            ws.get_mut().inbound.clear();
         }
         // Whatever the machine owes the far side (a pong, a close answer) goes out now.
         match ws.flush() {
@@ -1314,7 +1431,7 @@ fn signed_inner(wire: &[u8], sign: Signer<'_>) -> Result<Option<Vec<u8>>, Transp
             pairs.retain(|p| p.split(|&b| b == b'=').next() != Some(name));
         } else {
             if HeaderName::from_bytes(name).is_err()
-                || HeaderValue::from_bytes(&line.value).is_err()
+                || !header_value_ok(&line.value)
                 || !rides_upgrade(&line.name)
             {
                 return Err(broken());
@@ -1388,24 +1505,34 @@ fn request_url(url: &str) -> Result<String, TransportError> {
 
 impl WsFramer {
     /// Whether the far side FAILED the connection in `state` (a protocol violation, text that is
-    /// not UTF-8, a message over the ceiling), or a refused upgrade's body was cut short by the
-    /// carrier's end: its frames ended failed, not cleanly.
+    /// not UTF-8, a message over the ceiling), an upgrade request this end refused, or a refused
+    /// upgrade's body was cut short by the carrier's end or declared a `Content-Length` that is not
+    /// a length or disagrees (RFC 9110 §8.6): its frames ended failed, not cleanly.
+    #[cfg(test)]
     pub(crate) fn failed(&self, state: u64) -> bool {
-        let Ok(conn) = self.conn(state) else {
-            return false;
-        };
-        let Ok(held) = Self::enter(&conn) else {
-            return false;
-        };
-        matches!(
-            held.as_ref(),
-            Some(
-                Phase::Open {
-                    failed: Some(_),
-                    ..
-                } | Phase::Answered { short: true, .. }
-            )
-        )
+        self.failure(state).is_some()
+    }
+
+    /// Why the frames of `state` ended failed ([`Self::failed`]), in words for the end piece.
+    pub(crate) fn failure(&self, state: u64) -> Option<&'static str> {
+        let conn = self.conn(state).ok()?;
+        let held = Self::enter(&conn).ok()?;
+        match held.as_ref()? {
+            Phase::Open {
+                failed: Some(code), ..
+            } => Some(match code {
+                CloseCode::Invalid => "the far end sent a text message that is not UTF-8",
+                CloseCode::Size => "the far end sent a message over the message ceiling",
+                _ => "the far end broke the WebSocket protocol",
+            }),
+            Phase::Answered { short: true, .. } => {
+                Some("the far end's answer body was cut short or declared no valid length")
+            }
+            Phase::Refused(_) => {
+                Some("the upgrade request is not a WebSocket opening handshake this end can accept")
+            }
+            _ => None,
+        }
     }
 }
 

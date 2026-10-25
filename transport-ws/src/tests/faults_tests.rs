@@ -288,9 +288,18 @@ struct Counting;
 
 thread_local! {
     static COUNT: Cell<Option<usize>> = const { Cell::new(None) };
+    /// While set: the size from which an allocation counts, and how many have.
+    static BIG: Cell<Option<(usize, usize)>> = const { Cell::new(None) };
 }
 
-fn bump() {
+fn bump(size: usize) {
+    let _ = BIG.try_with(|b| {
+        if let Some((at, n)) = b.get() {
+            if size >= at {
+                b.set(Some((at, n + 1)));
+            }
+        }
+    });
     let _ = COUNT.try_with(|c| {
         if let Some(n) = c.get() {
             c.set(Some(n + 1));
@@ -301,7 +310,7 @@ fn bump() {
 // SAFETY: every call is `System`'s, unchanged; the counter only bumps a per-thread cell.
 unsafe impl GlobalAlloc for Counting {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        bump();
+        bump(layout.size());
         // SAFETY: the caller's layout, passed on.
         unsafe { System.alloc(layout) }
     }
@@ -310,7 +319,7 @@ unsafe impl GlobalAlloc for Counting {
         unsafe { System.dealloc(ptr, layout) }
     }
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-        bump();
+        bump(new_size);
         // SAFETY: as allocated above.
         unsafe { System.realloc(ptr, layout, new_size) }
     }
@@ -512,5 +521,44 @@ fn a_steady_framing_adds_no_allocation_of_its_own_per_message() {
     assert!(
         outbound <= crossing + library_out + slack,
         "an outbound message costs {outbound} allocations; the crossing {crossing} and the library {library_out}"
+    );
+}
+
+/// A CREDENTIAL IS VALIDATED IN PLACE (codeaudit r1 g1): signing a dial with a 4 KiB header
+/// credential makes only the allocations the request's own buffers need (four, measured: the signed
+/// request and its hand-off to the pipe and the host), and none for validating the value: copying
+/// it into a `HeaderValue` (an unwiped `Bytes`) makes a fifth.
+#[test]
+fn signing_a_dial_copies_a_credential_only_into_the_request() {
+    use crate::transport::{AuthLine, Parking};
+    use std::task::Poll;
+    use zeroize::Zeroizing;
+
+    let secret = vec![b'k'; 4096];
+    let mut once = Some(AuthLine {
+        name: "x-key".into(),
+        value: Zeroizing::new(secret.clone()),
+        query: false,
+    });
+    let mut sign =
+        |_: &crate::transport::UpgradeHead<'_>| Poll::Ready(Ok(once.take().into_iter().collect()));
+    let framer = WsFramer::new(0);
+    let mut out = Out::default();
+    let parking = Parking {
+        ticket: (7, 1),
+        deadline: 1_000,
+        now: 10,
+    };
+    BIG.with(|b| b.set(Some((secret.len(), 0))));
+    let opened = framer.open_signed(parking, "ws://svc.test:9/x", &[], &mut sign, &mut out);
+    let (_, big) = BIG.with(|b| b.replace(None)).unwrap_or((0, 0));
+    assert!(matches!(opened, Poll::Ready(Ok(_))), "the dial opens");
+    assert!(
+        out.wire.windows(secret.len()).any(|w| w == secret),
+        "the credential rides the request"
+    );
+    assert_eq!(
+        big, 4,
+        "{big} allocations of the secret's size or more; the request's own buffers make four"
     );
 }

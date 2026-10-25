@@ -8,7 +8,7 @@
 //! other as binary.
 
 use busbar_contract::transport::wire::WireStatusClass;
-use busbar_contract::transport::{Framed, Framer, FramerOut, HostTime, Side};
+use busbar_contract::transport::{ConnFacts, Framed, Framer, FramerOut, HostTime, Side};
 use tungstenite::handshake::derive_accept_key;
 
 use std::task::Poll;
@@ -942,4 +942,187 @@ fn a_pending_sign_parks_the_dial_and_its_resume_signs_the_same_head() {
     };
     let _ = framer.open_signed(later, "ws://svc.test/x", &[], &mut pending, &mut out);
     assert_eq!(framer.parked(), 1, "only the live dial stays parked");
+}
+
+/// The payload of the first data frame (text or binary) in a client's (masked) `wire`.
+fn first_data_payload(wire: &[u8]) -> Option<(u8, Vec<u8>)> {
+    let mut at = 0;
+    while at + 6 <= wire.len() {
+        let op = wire[at] & 0x0f;
+        let len = usize::from(wire[at + 1] & 0x7f);
+        assert!(len < 126, "short frames only");
+        let mask = &wire[at + 2..at + 6];
+        let payload: Vec<u8> = wire[at + 6..at + 6 + len]
+            .iter()
+            .enumerate()
+            .map(|(i, b)| b ^ mask[i % 4])
+            .collect();
+        if op == 0x1 || op == 0x2 || op == 0x0 {
+            return Some((op, payload));
+        }
+        at += 6 + len;
+    }
+    None
+}
+
+/// A REFUSAL GOES OUT AS ITS OWN MESSAGE (codeaudit r1 g1): pieces of an unfinished outbound message
+/// are dropped, not glued to the refusal's front. RED before the fix: the first data frame carried
+/// the half reply followed by the refusal.
+#[test]
+fn a_refusal_is_not_glued_onto_a_gathered_partial_message() {
+    let framer = WsFramer::new(0);
+    let mut out = Out::default();
+    let state = framer
+        .open_with(Side::Dial, "ws://127.0.0.1:9/x", &[], &mut out)
+        .expect("the dial opens");
+    let request = String::from_utf8(out.sent.clone()).unwrap();
+    framer
+        .ingest(state, &switching(&request), false, &mut Out::default())
+        .expect("open");
+    framer
+        .emit_text(state, b"half a reply", false, true, &mut Out::default())
+        .expect("gathered");
+    let mut refused = Out::default();
+    framer
+        .refusal_with(state, None, b"refused", 401, &mut refused)
+        .expect("refused");
+    let (_, payload) = first_data_payload(&refused.sent).expect("a data frame");
+    assert_eq!(payload, b"refused".to_vec());
+}
+
+/// A BARE-LF RESPONSE HEAD IS READ AS THE PROTOCOL LIBRARY READS IT (codeaudit r1 g1): the status
+/// line ends at the first line feed, and the head at the first empty line, so the reason phrase is
+/// just the phrase and the body that arrived with the head is handed up. RED before the fix: the
+/// reason phrase spanned header lines and the body was dropped.
+#[test]
+fn a_bare_lf_response_head_is_read_whole() {
+    assert_eq!(
+        reason_phrase(b"HTTP/1.1 401 Unauthorized\nX-A: b\n\n"),
+        Some(b"Unauthorized".to_vec())
+    );
+    let framer = WsFramer::new(0);
+    let mut out = Out::default();
+    let state = framer
+        .open_with(Side::Dial, "ws://127.0.0.1:9/x", &[], &mut out)
+        .expect("the dial opens");
+    let mut heard = Out::default();
+    framer
+        .ingest(
+            state,
+            b"HTTP/1.1 401 Unauthorized\nX-A: b\nContent-Length: 5\n\nhello",
+            false,
+            &mut heard,
+        )
+        .expect("the far end answered");
+    assert_eq!(heard.frames[1..].concat(), b"hello".to_vec());
+    assert!(heard.ended && !framer.failed(state));
+}
+
+/// Dial, ingest `wire` (the carrier ended or not), and hand back what the framer produced.
+fn refused_with(wire: &[u8], carrier_ended: bool) -> (WsFramer, u64, Out) {
+    let framer = WsFramer::new(0);
+    let mut out = Out::default();
+    let state = framer
+        .open_with(Side::Dial, "ws://127.0.0.1:9/x", &[], &mut out)
+        .expect("the dial opens");
+    let mut heard = Out::default();
+    framer
+        .ingest(state, wire, carrier_ended, &mut heard)
+        .expect("the far end answered");
+    (framer, state, heard)
+}
+
+/// `Retry-After` delay-seconds is 1*DIGIT (RFC 9110 §10.2.3): a signed number is not one. RED before
+/// the fix: `+30` read as 30.
+#[test]
+fn a_signed_retry_after_is_not_delay_seconds() {
+    let mut h = HeaderMap::new();
+    h.insert("retry-after", HeaderValue::from_static("+30"));
+    assert_eq!(retry_after(&h, 0), None);
+    h.insert("retry-after", HeaderValue::from_static("30"));
+    assert_eq!(retry_after(&h, 0), Some(30));
+}
+
+/// A chunk-size is 1*HEXDIG (RFC 9112 §7.1): a signed one is malformed. RED before the fix: `+5`
+/// was read as a chunk of 5.
+#[test]
+fn a_signed_chunk_size_is_malformed() {
+    let (framer, state, heard) = refused_with(
+        b"HTTP/1.1 401 Unauthorized\r\nTransfer-Encoding: chunked\r\n\r\n+5\r\nhello\r\n0\r\n\r\n",
+        false,
+    );
+    assert!(heard.ended, "the frames end");
+    assert!(framer.failed(state), "a signed chunk-size ends failed");
+}
+
+/// A `Content-Length` is 1*DIGIT, and every value stated must agree (RFC 9110 §8.6, RFC 9112 §6.3):
+/// otherwise the body is failed at once, not read as close-delimited. RED before the fix: `+5` read
+/// as 5, a conflict took the first value, a list was not read.
+#[test]
+fn an_invalid_or_conflicting_content_length_ends_failed() {
+    for head in [
+        "Content-Length: +5\r\n",
+        "Content-Length: 5\r\nContent-Length: 6\r\n",
+        "Content-Length: 5, 6\r\n",
+        "Content-Length: 5,\r\n",
+        "Content-Length: \r\n",
+    ] {
+        let wire = format!("HTTP/1.1 401 Unauthorized\r\n{head}\r\nhello");
+        let (framer, state, heard) = refused_with(wire.as_bytes(), false);
+        assert!(heard.ended, "{head:?}: the frames end");
+        assert!(framer.failed(state), "{head:?}: ends failed");
+    }
+    // Agreeing values are one length.
+    for head in [
+        "Content-Length: 5, 5\r\n",
+        "Content-Length: 5\r\nContent-Length: 5\r\n",
+    ] {
+        let wire = format!("HTTP/1.1 401 Unauthorized\r\n{head}\r\nhelloEXTRA");
+        let (framer, state, heard) = refused_with(wire.as_bytes(), false);
+        assert!(heard.ended && !framer.failed(state), "{head:?}: whole");
+        assert_eq!(heard.frames[1..].concat(), b"hello".to_vec(), "{head:?}");
+    }
+}
+
+/// A `Transfer-Encoding` whose final coding is not `chunked` leaves the body to run to the carrier's
+/// end, `Content-Length` ignored (RFC 9112 §6.3). RED before the fix: the length was honoured.
+#[test]
+fn a_non_chunked_transfer_encoding_overrides_content_length() {
+    let (framer, state, heard) = refused_with(
+        b"HTTP/1.1 401 Unauthorized\r\nTransfer-Encoding: gzip\r\nContent-Length: 2\r\n\r\nokmore",
+        true,
+    );
+    assert!(heard.ended && !framer.failed(state));
+    assert_eq!(heard.frames[1..].concat(), b"okmore".to_vec());
+}
+
+/// AFTER THE PEER'S CLOSE, WHAT ARRIVES IS NOBODY'S (codeaudit r1 g1): the frames ended, the machine
+/// no longer reads, so later bytes are not kept. RED before the fix: they were appended to the
+/// pipe's inbound without end.
+#[test]
+fn nothing_is_kept_after_the_peers_close() {
+    let upgrade = b"GET /echo HTTP/1.1\r\nHost: svc.test\r\nUpgrade: websocket\r\n\
+        Connection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
+        Sec-WebSocket-Version: 13\r\n\r\n";
+    let framer = WsFramer::new(0);
+    let mut out = Out::default();
+    let state = framer
+        .open(Side::Accept, "", &ConnFacts::default(), &mut out)
+        .expect("an accepted framing opens");
+    framer
+        .ingest(state, upgrade, false, &mut out)
+        .expect("the upgrade is answered");
+    // A client's masked (all-zero key) close frame.
+    let mut closed = Out::default();
+    framer
+        .ingest(state, &[0x88, 0x80, 0, 0, 0, 0], false, &mut closed)
+        .expect("the peer closes");
+    assert!(closed.ended, "the frames end");
+    assert_eq!(framer.inbound_len(state), Some(0));
+    for _ in 0..3 {
+        framer
+            .ingest(state, &[0x81, 0x80, 0, 0, 0, 0], false, &mut Out::default())
+            .expect("ingested");
+        assert_eq!(framer.inbound_len(state), Some(0), "nobody's bytes");
+    }
 }
