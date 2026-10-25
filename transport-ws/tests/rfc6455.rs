@@ -84,10 +84,21 @@ const CAP: usize = 64 * 1024;
 
 impl Host {
     fn new() -> Self {
+        Self::with_settings(b"")
+    }
+
+    /// An instance opened with `settings` (JSON; empty = the host handed none).
+    fn with_settings(settings: &[u8]) -> Self {
         let d = busbar_transport_ws::door::door();
         // SAFETY: the door's `'static` table.
         let ops: &'static Ops = unsafe { &*(*d).ops.cast::<Ops>() };
         let mut i: OpenIn = z();
+        i.settings = busbar_contract::abi::mechanism::call::Blob {
+            ptr: settings.as_ptr(),
+            len: settings.len(),
+            fmt: busbar_contract::abi::mechanism::call::BLOB_JSON,
+            flags: 0,
+        };
         let mut o: OpenOut = z();
         let r = call(
             ops.head.open,
@@ -847,4 +858,21 @@ fn autobahn_9_7_1_a_thousand_empty_text_messages() {
 #[test]
 fn autobahn_9_8_1_a_thousand_empty_binary_messages() {
     empty_echoed("9.8.1", &client(true, 0, BINARY, b""), OCTETS, 1000);
+}
+
+// ── 5. A PING IS ANSWERED, AND THE DEPLOYMENT'S CEILING BOUNDS A MESSAGE ─────────────────────────
+
+const PONG: u8 = 0xa;
+
+/// A client PING with a payload is answered, on the bytes the same call writes, with an unmasked
+/// PONG carrying that payload; the ping hands nothing up and does not end the stream.
+#[test]
+fn a_ping_is_answered_with_its_pong() {
+    let mut h = Host::new();
+    let f = h.accept();
+    let said = h.ingest(f, &client(true, 0, PING, b"are you there"));
+    let frames = server_frames(&said.wire);
+    println!("PROOF ping: the door wrote {frames:?}");
+    assert_eq!(frames, [(PONG, b"are you there".to_vec())]);
+    assert!(said.frames.is_empty() && !said.stream_end);
 }
