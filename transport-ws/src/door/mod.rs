@@ -860,6 +860,12 @@ fn framing(
     let owed = &mut *held;
     if let Err(e) = done {
         let why = refused(&e);
+        // A state gone before the op with bytes still owed is a RE-CALL after `YIELD_MORE` (a
+        // refusal's close removed the state): it drains, whatever the op said.
+        if !alive && (!owed.wire_owed().is_empty() || !owed.pieces.is_empty()) {
+            fill(owed, sink, o);
+            return Outcome::Ready;
+        }
         // The framer still holds the framing, or did not hold it before the op: the op alone
         // failed, whatever is queued, and the queue stays for the next call.
         if inst.framer.holds(token) || !alive {
