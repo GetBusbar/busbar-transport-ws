@@ -506,6 +506,15 @@ pub(crate) fn reason_phrase(seen: &[u8]) -> Option<Vec<u8>> {
     parts.next().filter(|r| !r.is_empty()).map(<[u8]>::to_vec)
 }
 
+/// Whether `value` is a valid header field value (the rule `HeaderValue::from_bytes` applies: every
+/// byte a tab or visible/space/obs-text, none a control or DEL), checked where it lies: an auth
+/// answer's secret is never copied into a buffer this crate does not wipe.
+pub(crate) fn header_value_ok(value: &[u8]) -> bool {
+    value
+        .iter()
+        .all(|&b| (b >= 0x20 && b != 0x7f) || b == b'\t')
+}
+
 /// Where a response head ends in `seen`: just past its first empty line, which the protocol
 /// library's parser takes as a bare `\n` or a `\r\n` alike. `None` while the head is not whole.
 fn head_end(seen: &[u8]) -> Option<usize> {
@@ -1373,7 +1382,7 @@ fn signed_inner(wire: &[u8], sign: Signer<'_>) -> Result<Option<Vec<u8>>, Transp
             pairs.retain(|p| p.split(|&b| b == b'=').next() != Some(name));
         } else {
             if HeaderName::from_bytes(name).is_err()
-                || HeaderValue::from_bytes(&line.value).is_err()
+                || !header_value_ok(&line.value)
                 || !rides_upgrade(&line.name)
             {
                 return Err(broken());
