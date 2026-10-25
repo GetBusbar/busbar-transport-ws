@@ -240,6 +240,9 @@ pub const STATEMENT: Statement = Statement {
 struct Piece {
     stream: u64,
     bytes: Vec<u8>,
+    /// The bytes before this offset are handed over already: a piece taken in parts moves nothing
+    /// down, it reads on from here.
+    at: usize,
     end_of_frame: bool,
     /// The bytes belong to a text message (`PIECE_TEXT`).
     text: bool,
@@ -270,6 +273,7 @@ impl Piece {
         Self {
             stream,
             bytes,
+            at: 0,
             end_of_frame,
             text: false,
             failed: false,
@@ -324,7 +328,9 @@ fn field_cut(bytes: &[u8], room: usize, in_value: bool) -> usize {
 struct Owed {
     /// Bytes owed to the far side: a dialled upgrade request carries its auth's credential lines,
     /// so every byte leaves this buffer wiped ([`push_wiped`], [`consume_wiped`], and on drop).
+    /// The bytes before `wire_at` are handed over already (and wiped); the rest is owed.
     wire: Vec<u8>,
+    wire_at: usize,
     pieces: VecDeque<Piece>,
     /// The byte buffers of pieces already handed over, kept for the next pieces: a framing in
     /// steady state queues its messages without allocating.
@@ -340,30 +346,40 @@ impl Drop for Owed {
     }
 }
 
-/// Append `bytes` to `wire`, never leaving a copy behind in a buffer it outgrows.
-fn push_wiped(wire: &mut Vec<u8>, bytes: &[u8]) {
+/// Append `bytes` to `wire` (whose bytes before `at` are handed over), never leaving a copy behind
+/// in a buffer it outgrows.
+fn push_wiped(wire: &mut Vec<u8>, at: &mut usize, bytes: &[u8]) {
     if wire.capacity() - wire.len() < bytes.len() {
-        let mut grown = Vec::with_capacity((wire.len() + bytes.len()).max(wire.capacity() * 2));
-        grown.extend_from_slice(wire);
+        let owed = wire.len() - *at;
+        let mut grown = Vec::with_capacity((owed + bytes.len()).max(wire.capacity() * 2));
+        grown.extend_from_slice(&wire[*at..]);
         wire.zeroize();
         *wire = grown;
+        *at = 0;
     }
     wire.extend_from_slice(bytes);
 }
 
-/// Drop the first `n` bytes of `wire` (handed to the host), wiping every byte the remainder no
-/// longer covers.
-fn consume_wiped(wire: &mut Vec<u8>, n: usize) {
-    let rest = wire.len() - n;
-    wire.copy_within(n.., 0);
-    wire[rest..].zeroize();
-    wire.truncate(rest);
+/// Mark the next `n` bytes of `wire` (from `at`) handed to the host, wiping them in place; once
+/// all are handed over the buffer empties, every byte of it wiped.
+fn consume_wiped(wire: &mut Vec<u8>, at: &mut usize, n: usize) {
+    wire[*at..*at + n].zeroize();
+    *at += n;
+    if *at == wire.len() {
+        wire.clear();
+        *at = 0;
+    }
 }
 
 /// The most handed-over piece buffers a framing keeps for reuse.
 const SPARE_MAX: usize = 8;
 
 impl Owed {
+    /// The bytes owed to the far side and not handed over yet.
+    fn wire_owed(&self) -> &[u8] {
+        &self.wire[self.wire_at..]
+    }
+
     /// A buffer holding `bytes`, a kept one where there is one.
     fn buffer(&mut self, bytes: &[u8]) -> Vec<u8> {
         let mut b = self.spare.pop().unwrap_or_default();
@@ -409,7 +425,7 @@ struct Collect<'a> {
 
 impl Out for Collect<'_> {
     fn send(&mut self, bytes: &[u8]) {
-        push_wiped(&mut self.owed.wire, bytes);
+        push_wiped(&mut self.owed.wire, &mut self.owed.wire_at, bytes);
     }
     fn frame(&mut self, piece: Framed<'_>) {
         // The framer states a status on ONE frame only, the dialled stream's head: a message
@@ -446,7 +462,7 @@ impl Out for Collect<'_> {
 
 impl BytesOut for Collect<'_> {
     fn put(&mut self, bytes: &[u8]) {
-        push_wiped(&mut self.owed.wire, bytes);
+        push_wiped(&mut self.owed.wire, &mut self.owed.wire_at, bytes);
     }
 }
 
@@ -766,7 +782,7 @@ fn framing(
     let done = op(&inst.framer, &mut c);
     let owed = &mut *held;
     if let Err(e) = done {
-        if owed.wire.is_empty() && owed.pieces.is_empty() {
+        if owed.wire_owed().is_empty() && owed.pieces.is_empty() {
             owed.error = e;
             o.head.error = AbiStr {
                 ptr: owed.error.as_ptr(),
@@ -1080,11 +1096,11 @@ impl Slot for Encode {
 
 /// Hand the host what the framing owes it, as far as the sink holds.
 fn fill(owed: &mut Owed, sink: &FramerSink, o: &mut FramerOut) {
-    let w = owed.wire.len().min(sink.wire_cap);
+    let w = owed.wire_owed().len().min(sink.wire_cap);
     // SAFETY: `w <= wire_cap`: the run lands inside the host's wire buffer, which no queue byte
     // overlaps.
-    unsafe { std::ptr::copy_nonoverlapping(owed.wire.as_ptr(), sink.wire, w) };
-    consume_wiped(&mut owed.wire, w);
+    unsafe { std::ptr::copy_nonoverlapping(owed.wire_owed().as_ptr(), sink.wire, w) };
+    consume_wiped(&mut owed.wire, &mut owed.wire_at, w);
     let y = &mut o.yielded;
     y.wire_len = w as u64;
     let mut frame_len = 0_usize;
@@ -1112,15 +1128,16 @@ fn fill(owed: &mut Owed, sink: &FramerSink, o: &mut FramerOut) {
         // A field block is cut only where the host takes a continuation: at a line's start or
         // inside a value. A name longer than the whole frame buffer is cut anyway (the host
         // refuses it by name) rather than never moving.
+        let rest = &piece.bytes[piece.at..];
         let take = if piece.fields {
-            match field_cut(&piece.bytes, room, piece.continued) {
-                0 if frame_len + reason_len == 0 => piece.bytes.len().min(room),
+            match field_cut(rest, room, piece.continued) {
+                0 if frame_len + reason_len == 0 => rest.len().min(room),
                 cut => cut,
             }
         } else {
-            piece.bytes.len().min(room)
+            rest.len().min(room)
         };
-        if take == 0 && !piece.bytes.is_empty() {
+        if take == 0 && !rest.is_empty() {
             break;
         }
         // The piece goes out in this answer: its phrase, when it fits, goes ahead of it.
@@ -1145,11 +1162,11 @@ fn fill(owed: &mut Owed, sink: &FramerSink, o: &mut FramerOut) {
             frame_len += reason.len();
             heads += 1;
         }
-        let whole = take == piece.bytes.len();
+        let whole = take == rest.len();
         let (code, status_class) = piece.status.unwrap_or((0, STATUS_NONE));
         // SAFETY: host buffers of the stated capacities; `take <= room`, `n < pieces_cap`.
         unsafe {
-            std::ptr::copy_nonoverlapping(piece.bytes.as_ptr(), sink.frame.add(frame_len), take);
+            std::ptr::copy_nonoverlapping(rest.as_ptr(), sink.frame.add(frame_len), take);
             sink.pieces.add(n).write(FramePiece {
                 stream: piece.stream,
                 offset: frame_len as u64,
@@ -1200,15 +1217,15 @@ fn fill(owed: &mut Owed, sink: &FramerSink, o: &mut FramerOut) {
         } else {
             // The rest of a field block opens mid-line unless what was taken ended one.
             if piece.fields {
-                piece.continued = !piece.bytes[..take].ends_with(b"\n");
+                piece.continued = !rest[..take].ends_with(b"\n");
             }
-            piece.bytes.drain(..take);
+            piece.at += take;
         }
     }
     y.frame_len = frame_len as u64;
     y.pieces_len = n as u32;
     y.heads_len = heads as u32;
-    let more = !owed.wire.is_empty() || !owed.pieces.is_empty();
+    let more = !owed.wire_owed().is_empty() || !owed.pieces.is_empty();
     let mut flags = 0;
     if more {
         flags |= YIELD_MORE;
