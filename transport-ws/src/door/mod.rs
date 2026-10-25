@@ -807,7 +807,10 @@ impl Slot for Begin {
             o.head.error = abi_str("begin: the side is neither accept nor dial");
             return Outcome::Failed;
         };
-        let target = String::from_utf8_lossy(text(&i.target)).into_owned();
+        let Ok(target) = std::str::from_utf8(text(&i.target)).map(str::to_owned) else {
+            o.head.error = abi_str("begin: the target is not text");
+            return Outcome::Failed;
+        };
         let fields = opening_fields(i.fields, i.fields_len);
         if matches!(side, Side::Dial) && i.points != 0 {
             return dial_with_auth(p, i, o, &target, &fields);
