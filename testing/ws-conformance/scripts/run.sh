@@ -99,6 +99,8 @@ run_autobahn() {
   local agent="$1" port="$2" tag="$3"
   local outdir="$REPORTS_DIR/$tag"
   mkdir -p "$outdir"
+  # The per-tag dir is reused across runs: a stale index.json must never be graded as this run's.
+  rm -f "$outdir/index.json"
   if ! command -v docker >/dev/null 2>&1; then
     echo "Docker is unavailable in this environment. Docker-live Autobahn runs are CI-only;" >&2
     echo "this local environment can only prove the parser and the subject's arm state (see --selftest)." >&2
@@ -108,12 +110,15 @@ run_autobahn() {
   cfg="$(mktemp)"
   sed -e "s/__TAG__/$tag/" -e "s/__AGENT__/$agent/" -e "s/__PORT__/$port/" \
     "$ROOT/config/fuzzingclient.json.tmpl" > "$cfg"
+  local docker_rc=0
   docker run --rm --network host \
     -v "$cfg:/config/fuzzingclient.json:ro" \
     -v "$outdir:/reports" \
     crossbario/autobahn-testsuite@sha256:519915fb568b04c9383f70a1c405ae3ff44ab9e35835b085239c258b6fac3074 \
-    wstest -m fuzzingclient -s /config/fuzzingclient.json
+    wstest -m fuzzingclient -s /config/fuzzingclient.json || docker_rc=$?
   rm -f "$cfg"
+  # docker's own status, not rm's: a failed run must not read as a clean one.
+  return "$docker_rc"
 }
 
 case "$mode" in
@@ -146,11 +151,26 @@ case "$mode" in
     rc=0; run_autobahn broken "$port" negative-control || rc=$?
     kill "$pid" 2>/dev/null || true
     [ "$rc" -eq 3 ] && exit 3
+    [ "$rc" -eq 0 ] || { echo "RED: docker exited $rc -- the negative control did not run" >&2; exit "$rc"; }
     # This leg is proven correct when the SUITE catches the defect -- i.e. the parser must find
-    # it RED. The docker run itself exiting non-zero is not required (Autobahn exits 0 having
-    # produced a report; the defect shows up IN the report).
-    if node "$PARSER" --report "$REPORTS_DIR/negative-control/index.json" --armed true --out "$REPORTS_DIR/negative-control/verdict.json"; then
+    # it RED over a report it could read. Autobahn exits 0 having produced a report; the defect
+    # shows up IN the report. An absent report is the parser's UNREADABLE_REPORT (also red), which
+    # proves nothing, so the report must exist and the verdict must say "fail".
+    nc_report="$REPORTS_DIR/negative-control/index.json"
+    nc_verdict="$REPORTS_DIR/negative-control/verdict.json"
+    if [ ! -s "$nc_report" ]; then
+      echo "RED: the negative control wrote no report ($nc_report) -- nothing was graded" >&2
+      exit 1
+    fi
+    # A verdict left by an earlier run never stands for this one.
+    rm -f "$nc_verdict"
+    if node "$PARSER" --report "$nc_report" --armed true --out "$nc_verdict"; then
       echo "RED: the negative control was graded green -- the suite failed to catch a deliberately broken peer" >&2
+      exit 1
+    fi
+    nc_status="$(node -e "console.log(JSON.parse(require('fs').readFileSync(process.argv[1],'utf8')).status)" "$nc_verdict" 2>/dev/null || true)"
+    if [ "$nc_status" != "fail" ]; then
+      echo "RED: the negative control's verdict status is '$nc_status', want fail -- not a graded failure" >&2
       exit 1
     fi
     echo "ok: the negative control was correctly graded red"
@@ -172,9 +192,11 @@ case "$mode" in
     rc=0
     if [ "$armed" = "true" ]; then
       run_autobahn busbar "$port" subject || rc=$?
-      kill "$pid" 2>/dev/null || true
-      [ "$rc" -eq 3 ] && exit 3
     fi
+    # Every path out: a subject that started but never printed its port is killed too.
+    if [ -n "${pid:-}" ]; then kill "$pid" 2>/dev/null || true; fi
+    [ "$rc" -eq 3 ] && exit 3
+    [ "$rc" -eq 0 ] || { echo "RED: docker exited $rc -- the subject run did not complete" >&2; exit "$rc"; }
     mkdir -p "$REPORTS_DIR/subject"
     node "$PARSER" --report "$REPORTS_DIR/subject/index.json" --armed "$armed" --commit "${GITHUB_SHA:-local}" --out "$REPORTS_DIR/subject/verdict.json"
     exit $?
