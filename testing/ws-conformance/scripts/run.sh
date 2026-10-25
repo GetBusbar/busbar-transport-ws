@@ -162,6 +162,8 @@ case "$mode" in
       echo "RED: the negative control wrote no report ($nc_report) -- nothing was graded" >&2
       exit 1
     fi
+    # A verdict left by an earlier run never stands for this one.
+    rm -f "$nc_verdict"
     if node "$PARSER" --report "$nc_report" --armed true --out "$nc_verdict"; then
       echo "RED: the negative control was graded green -- the suite failed to catch a deliberately broken peer" >&2
       exit 1
