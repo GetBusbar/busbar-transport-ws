@@ -836,7 +836,9 @@ fn framing(
     let done = op(&inst.framer, &mut c);
     let owed = &mut *held;
     if let Err(e) = done {
-        if owed.wire_owed().is_empty() && owed.pieces.is_empty() {
+        // The framer still holds the framing: the op alone failed, whatever is queued, and the
+        // queue stays for the next call.
+        if inst.framer.holds(token) {
             owed.error = e;
             o.head.error = AbiStr {
                 ptr: owed.error.as_ptr(),
@@ -844,8 +846,15 @@ fn framing(
             };
             return Outcome::Failed;
         }
-        // What the failing op produced still goes out; the connection's end follows it.
-        owed.ended = true;
+        // The state is gone: what the failing op produced still goes out, then the stream ends
+        // failed (its end piece says why) and the connection with it.
+        if !owed.ended {
+            owed.pieces.push_back(Piece {
+                failed: true,
+                ..Piece::plain(0, e.into_bytes(), true)
+            });
+            owed.ended = true;
+        }
     }
     fill(owed, sink, o);
     Outcome::Ready

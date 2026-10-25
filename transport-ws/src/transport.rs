@@ -902,8 +902,8 @@ impl WsFramer {
             .remove(&state);
     }
 
-    /// Whether framing `state` is still held (a test reads that a finished framing is gone).
-    #[cfg(test)]
+    /// Whether framing `state` is still held: an op that failed with its state alive failed that
+    /// op alone, one that left it gone ended the connection.
     pub(crate) fn holds(&self, state: u64) -> bool {
         self.map().contains_key(&state)
     }
