@@ -399,8 +399,9 @@ fn written_as_text(label: &str, ops: &'static Ops, caps: (usize, usize, usize)) 
         [(b"{\"t\":1}".to_vec(), true), (b"\x01\x02".to_vec(), true)]
     );
     assert_eq!(accept.text, [true, false], "written as text, heard as text");
-    let (r, _) = host.emit(&dial, b"\xff\xfe", EMIT_TEXT);
-    assert_ne!(r, Outcome::Ready, "text that is not UTF-8 is refused");
+    let (r, o) = host.emit(&dial, b"\xff\xfe", EMIT_TEXT);
+    assert_eq!(r, Outcome::Failed, "text that is not UTF-8 is refused");
+    assert_eq!(o.yielded.wire_len, 0, "and nothing goes out");
     host.close();
 }
 
@@ -639,5 +640,28 @@ fn locate_for_a_listener_answers_the_accepting_offer() {
     let r = call(host.ops.locate, host.inst, &mut i, &mut o, slot::LOCATE);
     assert_eq!(r, Outcome::Failed);
     assert_eq!(o.alpn_needed, 9);
+    host.close();
+}
+
+/// A REFUSED UPGRADE'S WAIT, IN ITS HTTP-DATE FORM, CROSSES THE ABI (RFC 9110 §10.2.3): a `503`
+/// whose `Retry-After` is an IMF-fixdate 120 s after the sink's unix clock (1790000000 s, so
+/// 1790000120 s is Mon, 21 Sep 2026 14:15:20 GMT) is heard as 120 seconds, read against the wall
+/// clock and not the monotonic one.
+#[test]
+fn a_refused_upgrade_s_retry_after_http_date_reaches_the_host() {
+    let mut host = Host::open(linked(), (64 * 1024, 64 * 1024, 64));
+    let mut dial = host.begin(SIDE_DIAL, "ws://svc.test/stream");
+    dial.wire.clear();
+    host.hear(
+        &mut dial,
+        b"HTTP/1.1 503 Service Unavailable\r\nRetry-After: Mon, 21 Sep 2026 14:15:20 GMT\r\nContent-Length: 0\r\n\r\n",
+    );
+    assert_eq!(dial.heads.len(), 1, "one head");
+    assert_eq!(dial.heads[0].code, Some(503));
+    assert_eq!(
+        dial.heads[0].retry_after,
+        Some(120),
+        "the date's wait crosses"
+    );
     host.close();
 }
