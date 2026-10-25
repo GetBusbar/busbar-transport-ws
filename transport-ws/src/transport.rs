@@ -1390,22 +1390,28 @@ impl WsFramer {
     /// Whether the far side FAILED the connection in `state` (a protocol violation, text that is
     /// not UTF-8, a message over the ceiling), or a refused upgrade's body was cut short by the
     /// carrier's end: its frames ended failed, not cleanly.
+    #[cfg(test)]
     pub(crate) fn failed(&self, state: u64) -> bool {
-        let Ok(conn) = self.conn(state) else {
-            return false;
-        };
-        let Ok(held) = Self::enter(&conn) else {
-            return false;
-        };
-        matches!(
-            held.as_ref(),
-            Some(
-                Phase::Open {
-                    failed: Some(_),
-                    ..
-                } | Phase::Answered { short: true, .. }
-            )
-        )
+        self.failure(state).is_some()
+    }
+
+    /// Why the frames of `state` ended failed ([`Self::failed`]), in words for the end piece.
+    pub(crate) fn failure(&self, state: u64) -> Option<&'static str> {
+        let conn = self.conn(state).ok()?;
+        let held = Self::enter(&conn).ok()?;
+        match held.as_ref()? {
+            Phase::Open {
+                failed: Some(code), ..
+            } => Some(match code {
+                CloseCode::Invalid => "the far end sent a text message that is not UTF-8",
+                CloseCode::Size => "the far end sent a message over the message ceiling",
+                _ => "the far end broke the WebSocket protocol",
+            }),
+            Phase::Answered { short: true, .. } => {
+                Some("the far end's answer ended before its body was whole")
+            }
+            _ => None,
+        }
     }
 }
 
