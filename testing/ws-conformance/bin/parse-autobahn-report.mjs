@@ -32,6 +32,8 @@ import { fileURLToPath } from 'node:url';
 
 const ALLOWED_BEHAVIORS = new Set(['OK', 'INFORMATIONAL']);
 const UNCLAIMED_BEHAVIORS = new Set(['UNIMPLEMENTED']);
+// UNIMPLEMENTED is unclaimed only for the permessage-deflate groups; on any other case it is a failure.
+const isDeflateCase = (caseId) => caseId.startsWith('12.') || caseId.startsWith('13.');
 
 /**
  * @param {object} report Autobahn's parsed `index.json`.
@@ -41,16 +43,20 @@ export function judge(report) {
   const failures = [];
   const unimplemented = [];
   let totalCases = 0;
+  let emptyAgent = false;
   const agents = Object.keys(report ?? {});
   for (const agent of agents) {
     const cases = report[agent] ?? {};
+    if (Object.keys(cases).length === 0) {
+      emptyAgent = true;
+    }
     for (const [caseId, result] of Object.entries(cases)) {
       totalCases += 1;
       const behavior = result?.behavior ?? 'MISSING';
       if (ALLOWED_BEHAVIORS.has(behavior)) {
         continue;
       }
-      if (UNCLAIMED_BEHAVIORS.has(behavior)) {
+      if (UNCLAIMED_BEHAVIORS.has(behavior) && isDeflateCase(caseId)) {
         unimplemented.push({ agent, case: caseId, behavior });
         continue;
       }
@@ -66,7 +72,7 @@ export function judge(report) {
     }
   }
   // FLOOR: zero agents, or an agent that ran zero cases, is refused rather than accepted.
-  if (agents.length === 0 || totalCases === 0) {
+  if (agents.length === 0 || totalCases === 0 || emptyAgent) {
     failures.push({ agent: '(none)', case: '(none)', behavior: 'EMPTY_REPORT' });
   }
   return { ok: failures.length === 0, totalCases, failures, unimplemented };
@@ -200,6 +206,31 @@ function selftest() {
     failures += 1;
   } else {
     console.log('  ok: an agent with zero cases is refused (FLOOR)');
+  }
+
+  // FLOOR, per agent: one agent with cases must not carry an agent that ran none.
+  const oneEmptyAgent = judge({ a: { '1.1.1': { behavior: 'OK' } }, b: {} });
+  if (oneEmptyAgent.ok) {
+    console.log('  MISS: a report with one zero-case agent was accepted -- FLOOR did not bite');
+    failures += 1;
+  } else {
+    console.log('  ok: a report with one zero-case agent is refused (FLOOR, per agent)');
+  }
+
+  // UNIMPLEMENTED is the permessage-deflate bucket (groups 12/13) only; elsewhere it is a failure.
+  const coreUnimpl = judge({ a: { '1.1.1': { behavior: 'UNIMPLEMENTED' }, '2.1.1': { behavior: 'UNIMPLEMENTED' } } });
+  if (coreUnimpl.ok || coreUnimpl.unimplemented.length !== 0) {
+    console.log('  MISS: UNIMPLEMENTED on core (non-12/13) cases was accepted');
+    failures += 1;
+  } else {
+    console.log('  ok: UNIMPLEMENTED outside groups 12/13 is a failure');
+  }
+  const deflateUnimpl = judge({ a: { '13.7.18': { behavior: 'UNIMPLEMENTED' }, '12.1.1': { behavior: 'UNIMPLEMENTED' }, '1.1.1': { behavior: 'OK' } } });
+  if (!deflateUnimpl.ok || deflateUnimpl.unimplemented.length !== 2) {
+    console.log('  MISS: UNIMPLEMENTED on groups 12/13 was not kept in its own bucket');
+    failures += 1;
+  } else {
+    console.log('  ok: UNIMPLEMENTED on groups 12/13 stays in its own bucket');
   }
 
   // The armed/status contract: unarmed can never be "pass", regardless of the report.
