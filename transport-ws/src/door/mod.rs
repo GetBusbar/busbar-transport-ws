@@ -491,10 +491,18 @@ fn read_settings(b: &Blob) -> Result<usize, &'static str> {
     let v: serde_json::Value = serde_json::from_slice(text).map_err(|_| "settings: not JSON")?;
     match v.get(BODY_MAX_BYTES) {
         None => Ok(DEFAULT_REQUEST_BODY_MAX_BYTES),
-        Some(x) => x
-            .as_u64()
-            .and_then(|n| usize::try_from(n).ok())
-            .ok_or("settings: a value is not of its declared kind"),
+        Some(x) => {
+            let n = x
+                .as_u64()
+                .and_then(|n| usize::try_from(n).ok())
+                .ok_or("settings: a value is not of its declared kind")?;
+            // `WsFramer::new(0)` means the library's inbound default and NO outbound ceiling: refuse
+            // rather than open without one.
+            if n == 0 {
+                return Err("settings: limits.request_body_max_bytes must be above 0");
+            }
+            Ok(n)
+        }
     }
 }
 
