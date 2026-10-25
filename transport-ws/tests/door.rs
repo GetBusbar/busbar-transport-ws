@@ -399,8 +399,9 @@ fn written_as_text(label: &str, ops: &'static Ops, caps: (usize, usize, usize)) 
         [(b"{\"t\":1}".to_vec(), true), (b"\x01\x02".to_vec(), true)]
     );
     assert_eq!(accept.text, [true, false], "written as text, heard as text");
-    let (r, _) = host.emit(&dial, b"\xff\xfe", EMIT_TEXT);
-    assert_ne!(r, Outcome::Ready, "text that is not UTF-8 is refused");
+    let (r, o) = host.emit(&dial, b"\xff\xfe", EMIT_TEXT);
+    assert_eq!(r, Outcome::Failed, "text that is not UTF-8 is refused");
+    assert_eq!(o.yielded.wire_len, 0, "and nothing goes out");
     host.close();
 }
 
