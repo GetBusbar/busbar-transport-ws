@@ -351,10 +351,19 @@ fn status_class(code: u16) -> WireStatusClass {
 /// the seconds left until it (`0` once past). A value read as neither is absent.
 pub(crate) fn retry_after(headers: &HeaderMap, now_secs: u64) -> Option<u64> {
     let raw = headers.get("retry-after")?.to_str().ok()?.trim();
-    if let Ok(n) = raw.parse::<u64>() {
+    if let Some(n) = digits(raw, 10) {
         return Some(n);
     }
     imf_fixdate_secs(raw).map(|at| at.saturating_sub(now_secs))
+}
+
+/// `s` as a number in `radix` when it is all digits of it and at least one (RFC 9110's `1*DIGIT`,
+/// RFC 9112's `1*HEXDIG`): no sign, no space. An overflowing run is no number either.
+fn digits(s: &str, radix: u32) -> Option<u64> {
+    if s.is_empty() || !s.bytes().all(|b| char::from(b).is_digit(radix)) {
+        return None;
+    }
+    u64::from_str_radix(s, radix).ok()
 }
 
 /// An HTTP-date (RFC 9110 §5.6.7: the IMF-fixdate, and the two obsolete forms a recipient must
@@ -453,7 +462,7 @@ impl Dechunk {
                     let size = line.split(|c| *c == b';').next().unwrap_or_default();
                     match std::str::from_utf8(size)
                         .ok()
-                        .and_then(|t| u64::from_str_radix(t.trim(), 16).ok())
+                        .and_then(|t| digits(t.trim(), 16))
                     {
                         Some(0) => Chunked::Trailer,
                         Some(n) => Chunked::Data(n),
@@ -469,12 +478,20 @@ impl Dechunk {
     }
 }
 
-/// The `Content-Length` an answer declares.
-fn content_length(headers: &HeaderMap) -> Option<u64> {
-    headers
-        .get("content-length")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.trim().parse().ok())
+/// The `Content-Length` an answer declares: `Ok(None)` when it states none, and `Err` when what it
+/// states is not a length (RFC 9110 §8.6: `1*DIGIT`) or its values disagree (RFC 9112 §6.3: across
+/// lines and across a comma-separated list), which leaves the body's end unknowable.
+fn content_length(headers: &HeaderMap) -> Result<Option<u64>, ()> {
+    let mut declared = None;
+    for value in headers.get_all("content-length") {
+        for member in value.to_str().map_err(|_| ())?.split(',') {
+            let n = digits(member.trim(), 10).ok_or(())?;
+            if *declared.get_or_insert(n) != n {
+                return Err(());
+            }
+        }
+    }
+    Ok(declared)
 }
 
 /// A dialled head's REASON PHRASE (HEAD-FIELDS: the dialled side fills `reason`, HTTP/1 as sent):
@@ -1111,12 +1128,29 @@ impl WsFramer {
                     let bodiless = matches!(code, 100..=199 | 204 | 304);
                     let chunked =
                         (!bodiless && is_chunked(response.headers())).then(Box::<Dechunk>::default);
+                    // A transfer coding that does not end in `chunked` leaves the body to the carrier's
+                    // end, whatever `Content-Length` says (RFC 9112 §6.3).
                     let declared = if bodiless {
-                        Some(0)
-                    } else if chunked.is_some() {
-                        None
+                        Ok(Some(0))
+                    } else if chunked.is_some()
+                        || response.headers().contains_key("transfer-encoding")
+                    {
+                        Ok(None)
                     } else {
                         content_length(response.headers())
+                    };
+                    let Ok(declared) = declared else {
+                        // A length that is invalid or in conflict: the body is failed at once.
+                        out.frame(Framed::plain(StreamId(0), &[], true));
+                        let mut pipe = pipe;
+                        pipe.inbound.clear();
+                        let phase = Phase::Answered {
+                            pipe,
+                            left: Some(0),
+                            chunked: None,
+                            short: true,
+                        };
+                        return Ok((phase, true, reason));
                     };
                     let (phase, ended) = answered_body(pipe, declared, chunked, true, out);
                     return Ok((phase, ended, reason));

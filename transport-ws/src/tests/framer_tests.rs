@@ -1017,3 +1017,81 @@ fn a_bare_lf_response_head_is_read_whole() {
     assert_eq!(heard.frames[1..].concat(), b"hello".to_vec());
     assert!(heard.ended && !framer.failed(state));
 }
+
+/// Dial, ingest `wire` (the carrier ended or not), and hand back what the framer produced.
+fn refused_with(wire: &[u8], carrier_ended: bool) -> (WsFramer, u64, Out) {
+    let framer = WsFramer::new(0);
+    let mut out = Out::default();
+    let state = framer
+        .open_with(Side::Dial, "ws://127.0.0.1:9/x", &[], &mut out)
+        .expect("the dial opens");
+    let mut heard = Out::default();
+    framer
+        .ingest(state, wire, carrier_ended, &mut heard)
+        .expect("the far end answered");
+    (framer, state, heard)
+}
+
+/// `Retry-After` delay-seconds is 1*DIGIT (RFC 9110 §10.2.3): a signed number is not one. RED before
+/// the fix: `+30` read as 30.
+#[test]
+fn a_signed_retry_after_is_not_delay_seconds() {
+    let mut h = HeaderMap::new();
+    h.insert("retry-after", HeaderValue::from_static("+30"));
+    assert_eq!(retry_after(&h, 0), None);
+    h.insert("retry-after", HeaderValue::from_static("30"));
+    assert_eq!(retry_after(&h, 0), Some(30));
+}
+
+/// A chunk-size is 1*HEXDIG (RFC 9112 §7.1): a signed one is malformed. RED before the fix: `+5`
+/// was read as a chunk of 5.
+#[test]
+fn a_signed_chunk_size_is_malformed() {
+    let (framer, state, heard) = refused_with(
+        b"HTTP/1.1 401 Unauthorized\r\nTransfer-Encoding: chunked\r\n\r\n+5\r\nhello\r\n0\r\n\r\n",
+        false,
+    );
+    assert!(heard.ended, "the frames end");
+    assert!(framer.failed(state), "a signed chunk-size ends failed");
+}
+
+/// A `Content-Length` is 1*DIGIT, and every value stated must agree (RFC 9110 §8.6, RFC 9112 §6.3):
+/// otherwise the body is failed at once, not read as close-delimited. RED before the fix: `+5` read
+/// as 5, a conflict took the first value, a list was not read.
+#[test]
+fn an_invalid_or_conflicting_content_length_ends_failed() {
+    for head in [
+        "Content-Length: +5\r\n",
+        "Content-Length: 5\r\nContent-Length: 6\r\n",
+        "Content-Length: 5, 6\r\n",
+        "Content-Length: 5,\r\n",
+        "Content-Length: \r\n",
+    ] {
+        let wire = format!("HTTP/1.1 401 Unauthorized\r\n{head}\r\nhello");
+        let (framer, state, heard) = refused_with(wire.as_bytes(), false);
+        assert!(heard.ended, "{head:?}: the frames end");
+        assert!(framer.failed(state), "{head:?}: ends failed");
+    }
+    // Agreeing values are one length.
+    for head in [
+        "Content-Length: 5, 5\r\n",
+        "Content-Length: 5\r\nContent-Length: 5\r\n",
+    ] {
+        let wire = format!("HTTP/1.1 401 Unauthorized\r\n{head}\r\nhelloEXTRA");
+        let (framer, state, heard) = refused_with(wire.as_bytes(), false);
+        assert!(heard.ended && !framer.failed(state), "{head:?}: whole");
+        assert_eq!(heard.frames[1..].concat(), b"hello".to_vec(), "{head:?}");
+    }
+}
+
+/// A `Transfer-Encoding` whose final coding is not `chunked` leaves the body to run to the carrier's
+/// end, `Content-Length` ignored (RFC 9112 §6.3). RED before the fix: the length was honoured.
+#[test]
+fn a_non_chunked_transfer_encoding_overrides_content_length() {
+    let (framer, state, heard) = refused_with(
+        b"HTTP/1.1 401 Unauthorized\r\nTransfer-Encoding: gzip\r\nContent-Length: 2\r\n\r\nokmore",
+        true,
+    );
+    assert!(heard.ended && !framer.failed(state));
+    assert_eq!(heard.frames[1..].concat(), b"okmore".to_vec());
+}
