@@ -247,7 +247,9 @@ struct Piece {
     /// The bytes belong to a text message (`PIECE_TEXT`).
     text: bool,
     /// The stream's end is a FAILURE (`PIECE_STREAM_FAILED`): the far side broke the protocol, sent
-    /// text that is not UTF-8 or a message over the ceiling. Only ever the empty end piece.
+    /// text that is not UTF-8 or a message over the ceiling, sent an upgrade request this end
+    /// refused, or ended a refused upgrade's answer short; or an op ended the framing's state.
+    /// Only ever the end piece, whose bytes say why; never split.
     failed: bool,
     /// The stream ends WHOLE here (`PIECE_END`): the empty last piece of its frames. An empty
     /// message (`bytes` empty without it) is a message, never the end.
@@ -352,7 +354,6 @@ struct Owed {
     spare: Vec<Vec<u8>>,
     ended: bool,
     deadline: Option<u64>,
-    error: String,
 }
 
 impl Drop for Owed {
@@ -491,10 +492,18 @@ fn read_settings(b: &Blob) -> Result<usize, &'static str> {
     let v: serde_json::Value = serde_json::from_slice(text).map_err(|_| "settings: not JSON")?;
     match v.get(BODY_MAX_BYTES) {
         None => Ok(DEFAULT_REQUEST_BODY_MAX_BYTES),
-        Some(x) => x
-            .as_u64()
-            .and_then(|n| usize::try_from(n).ok())
-            .ok_or("settings: a value is not of its declared kind"),
+        Some(x) => {
+            let n = x
+                .as_u64()
+                .and_then(|n| usize::try_from(n).ok())
+                .ok_or("settings: a value is not of its declared kind")?;
+            // `WsFramer::new(0)` means the library's inbound default and NO outbound ceiling: refuse
+            // rather than open without one.
+            if n == 0 {
+                return Err("settings: limits.request_body_max_bytes must be above 0");
+            }
+            Ok(n)
+        }
     }
 }
 
@@ -759,12 +768,48 @@ impl Slot for Locate {
     }
 }
 
+/// Why an op failed, said without the op's name (the text is static: nothing allocates).
+fn refused(e: &TransportError) -> &'static str {
+    match e {
+        TransportError::Refused => "the far side refused the connection",
+        TransportError::Timeout => "a deadline expired",
+        TransportError::Reset => "the connection was reset",
+        TransportError::Closed => "the connection is closed",
+        TransportError::HandshakeFailed => "the WebSocket opening handshake failed",
+        TransportError::KeyUnavailable => "key material is unavailable",
+        TransportError::AddressRefused => "the target is not a ws:// or wss:// URL",
+        TransportError::Backpressure => "the far side stopped reading and the buffer is full",
+        TransportError::Framing => "the bytes broke the WebSocket framing",
+        TransportError::HandoffMismatch => "the stream handed over is not one this end can adopt",
+    }
+}
+
+/// A connection the far side FAILED ends its stream failed, not cleanly: the reader is told
+/// (`PIECE_STREAM_FAILED` on the end piece, whose bytes say why), and the close carries the code.
+/// `ended_before`: the connection had ended before the call that queued these pieces.
+fn end_failed(f: &WsFramer, token: u64, owed: &mut Owed, ended_before: bool) {
+    if ended_before || !owed.ended {
+        return;
+    }
+    let Some(why) = f.failure(token) else {
+        return;
+    };
+    if let Some(last) = owed.pieces.back_mut() {
+        if last.end {
+            last.failed = true;
+            // A failed stream ends failed, never whole as well, and says why.
+            last.end = false;
+            last.bytes.extend_from_slice(why.as_bytes());
+        }
+    }
+}
+
 /// Run a framer method that opens a framing, then answer what it produced.
 fn opening(
     p: *mut c_void,
     sink: &FramerSink,
     o: &mut FramerOut,
-    open: impl FnOnce(&WsFramer, &mut Collect<'_>) -> Result<u64, String>,
+    open: impl FnOnce(&WsFramer, &mut Collect<'_>) -> Result<u64, TransportError>,
 ) -> Outcome {
     let inst = instance(p);
     let mut owed = Owed::default();
@@ -775,12 +820,14 @@ fn opening(
     match open(&inst.framer, &mut c) {
         Ok(token) => {
             o.framing = token;
+            // An adopted connection's leftover may already have been refused.
+            end_failed(&inst.framer, token, &mut owed, false);
             fill(&mut owed, sink, o);
             inst.queues().insert(token, Arc::new(Mutex::new(owed)));
             Outcome::Ready
         }
-        Err(_) => {
-            o.head.error = abi_str("the framing could not be opened");
+        Err(e) => {
+            o.head.error = abi_str(refused(&e));
             Outcome::Failed
         }
     }
@@ -792,7 +839,7 @@ fn framing(
     token: u64,
     sink: &FramerSink,
     o: &mut FramerOut,
-    op: impl FnOnce(&WsFramer, &mut Collect<'_>) -> Result<(), String>,
+    op: impl FnOnce(&WsFramer, &mut Collect<'_>) -> Result<(), TransportError>,
 ) -> Outcome {
     let inst = instance(p);
     let Some(slot) = inst.queues().get(&token).cloned() else {
@@ -808,19 +855,26 @@ fn framing(
         owed: &mut held,
         now: time(sink),
     };
+    let alive = inst.framer.holds(token);
     let done = op(&inst.framer, &mut c);
     let owed = &mut *held;
     if let Err(e) = done {
-        if owed.wire_owed().is_empty() && owed.pieces.is_empty() {
-            owed.error = e;
-            o.head.error = AbiStr {
-                ptr: owed.error.as_ptr(),
-                len: owed.error.len(),
-            };
+        let why = refused(&e);
+        // The framer still holds the framing, or did not hold it before the op: the op alone
+        // failed, whatever is queued, and the queue stays for the next call.
+        if inst.framer.holds(token) || !alive {
+            o.head.error = abi_str(why);
             return Outcome::Failed;
         }
-        // What the failing op produced still goes out; the connection's end follows it.
-        owed.ended = true;
+        // This op ended the state: what it produced still goes out, then the stream ends failed
+        // (its end piece says why) and the connection with it.
+        if !owed.ended {
+            owed.pieces.push_back(Piece {
+                failed: true,
+                ..Piece::plain(0, why.as_bytes().to_vec(), true)
+            });
+            owed.ended = true;
+        }
     }
     fill(owed, sink, o);
     Outcome::Ready
@@ -844,10 +898,7 @@ impl Slot for Begin {
         if matches!(side, Side::Dial) && i.points != 0 {
             return dial_with_auth(p, i, o, &target, &fields);
         }
-        opening(p, &i.sink, o, |f, c| {
-            f.open_with(side, &target, &fields, c)
-                .map_err(|e| format!("{e:?}"))
-        })
+        opening(p, &i.sink, o, |f, c| f.open_with(side, &target, &fields, c))
     }
 }
 
@@ -910,7 +961,10 @@ fn dial_with_auth(
         match peer {
             Poll::Pending => return Outcome::Pending,
             Poll::Ready(Ok(called)) if called.flow == FLOW_CONTINUE => {}
-            Poll::Ready(_) => return refuse(o, "begin: the binding's auth refused the connection"),
+            Poll::Ready(Ok(_)) => {
+                return refuse(o, "begin: the binding's auth stopped the connection")
+            }
+            Poll::Ready(Err(_)) => return refuse(o, "begin: the host's auth call failed"),
         }
     }
     let (point, body): (u32, Option<&[u8]>) = if i.points & POINT_HEAD_BODY != 0 {
@@ -921,9 +975,11 @@ fn dial_with_auth(
         // Only the peer point: the head goes out as the plane's.
         return opening(p, &i.sink, o, |f, c| {
             f.open_with(Side::Dial, target, fields, c)
-                .map_err(|e| format!("{e:?}"))
         });
     };
+    // What the head point's auth did, said by the closure that calls it.
+    let mut why: Option<&'static str> = None;
+    let mut signed = false;
     let mut sign = |head: &UpgradeHead<'_>| {
         let view = HeadViewArgs {
             method: "GET",
@@ -944,16 +1000,26 @@ fn dial_with_auth(
             body,
         ) {
             Poll::Pending => Poll::Pending,
-            Poll::Ready(Ok(called)) if called.flow == FLOW_CONTINUE => Poll::Ready(Ok(called
-                .fields
-                .into_iter()
-                .map(|f| AuthLine {
-                    query: f.flags & FIELD_QUERY != 0,
-                    value: zeroize::Zeroizing::new(f.value.expose_own(&Own::here()).clone()),
-                    name: f.name,
-                })
-                .collect())),
-            Poll::Ready(_) => Poll::Ready(Err(TransportError::HandshakeFailed)),
+            Poll::Ready(Ok(called)) if called.flow == FLOW_CONTINUE => {
+                signed = true;
+                Poll::Ready(Ok(called
+                    .fields
+                    .into_iter()
+                    .map(|f| AuthLine {
+                        query: f.flags & FIELD_QUERY != 0,
+                        value: zeroize::Zeroizing::new(f.value.expose_own(&Own::here()).clone()),
+                        name: f.name,
+                    })
+                    .collect()))
+            }
+            Poll::Ready(Ok(_)) => {
+                why = Some("begin: the binding's auth stopped the dial");
+                Poll::Ready(Err(TransportError::HandshakeFailed))
+            }
+            Poll::Ready(Err(_)) => {
+                why = Some("begin: the host's auth call failed");
+                Poll::Ready(Err(TransportError::HandshakeFailed))
+            }
         }
     };
     let parking = Parking {
@@ -966,7 +1032,10 @@ fn dial_with_auth(
         owed: &mut owed,
         now: time(&i.sink),
     };
-    match inst.framer.open_signed(parking, target, fields, &mut sign, &mut c) {
+    match inst
+        .framer
+        .open_signed(parking, target, fields, &mut sign, &mut c)
+    {
         Poll::Pending => Outcome::Pending,
         Poll::Ready(Ok(token)) => {
             o.framing = token;
@@ -974,9 +1043,13 @@ fn dial_with_auth(
             inst.queues().insert(token, Arc::new(Mutex::new(owed)));
             Outcome::Ready
         }
-        Poll::Ready(Err(_)) => refuse(
+        Poll::Ready(Err(e)) => refuse(
             o,
-            "begin: the binding's auth refused the dial, or answered a line the upgrade cannot carry",
+            why.unwrap_or(if signed {
+                "begin: the binding's auth answered a line the upgrade cannot carry"
+            } else {
+                refused(&e)
+            }),
         ),
     }
 }
@@ -993,10 +1066,7 @@ impl Slot for Adopt {
         };
         let facts = facts_of(i.facts);
         let leftover = raw(i.leftover, i.leftover_len);
-        opening(p, &i.sink, o, |f, c| {
-            f.adopt(side, &facts, leftover, c)
-                .map_err(|e| format!("{e:?}"))
-        })
+        opening(p, &i.sink, o, |f, c| f.adopt(side, &facts, leftover, c))
     }
 }
 
@@ -1014,25 +1084,14 @@ impl Slot for Ingest {
                 return Ok(());
             }
             let ended_before = c.owed.ended;
-            f.ingest(i.framing, bytes, end, c)
-                .map_err(|e| format!("{e:?}"))?;
+            f.ingest(i.framing, bytes, end, c)?;
             // THE DIALLED HEAD'S REASON PHRASE rides the head piece this call queued.
             if let Some(reason) = f.take_reason(i.framing) {
                 if let Some(head) = c.owed.pieces.iter_mut().rev().find(|p| p.fields) {
                     head.reason = Some(reason);
                 }
             }
-            // A connection the far side FAILED ends its stream failed, not cleanly: the reader is
-            // told (`PIECE_STREAM_FAILED` on the empty end piece), and the close carries the code.
-            if !ended_before && c.owed.ended && f.failed(i.framing) {
-                if let Some(last) = c.owed.pieces.back_mut() {
-                    if last.end {
-                        last.failed = true;
-                        // A failed stream ends failed, never whole as well.
-                        last.end = false;
-                    }
-                }
-            }
+            end_failed(f, i.framing, c.owed, ended_before);
             Ok(())
         })
     }
@@ -1051,7 +1110,6 @@ impl Slot for Emit {
                 return Ok(());
             }
             f.emit_text(i.framing, bytes, eof, i.flags & EMIT_TEXT != 0, c)
-                .map_err(|e| format!("{e:?}"))
         })
     }
 }
@@ -1066,7 +1124,6 @@ impl Slot for Refuse {
         let stream = (i.has_stream != 0).then_some(StreamId(i.stream));
         framing(p, i.framing, &i.sink, o, |f, c| {
             f.refusal_with(i.framing, stream, bytes, i.status, c)
-                .map_err(|e| format!("{e:?}"))
         })
     }
 }
@@ -1077,9 +1134,7 @@ impl Slot for Timer {
     type In = FramingIn;
     type Out = FramerOut;
     fn call(p: *mut c_void, i: &FramingIn, o: &mut FramerOut) -> Outcome {
-        framing(p, i.framing, &i.sink, o, |f, c| {
-            f.tick(i.framing, c).map_err(|e| format!("{e:?}"))
-        })
+        framing(p, i.framing, &i.sink, o, |f, c| f.tick(i.framing, c))
     }
 }
 
@@ -1158,6 +1213,14 @@ fn fill(owed: &mut Owed, sink: &FramerSink, o: &mut FramerOut) {
             0
         };
         let mut room = sink.frame_cap - frame_len - reason_len;
+        // A failed end piece is never split (its tail would go out as payload): one that does not
+        // fit waits for the next answer; one that does not fit an empty answer is cut to the room.
+        if piece.failed && piece.bytes.len() - piece.at > room {
+            if frame_len > 0 {
+                break;
+            }
+            piece.bytes.truncate(piece.at + room);
+        }
         // A field block is cut only where the host takes a continuation: at a line's start or
         // inside a value. A name longer than the whole frame buffer is cut anyway (the host
         // refuses it by name) rather than never moving.

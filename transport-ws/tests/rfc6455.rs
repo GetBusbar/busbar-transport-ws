@@ -161,7 +161,12 @@ impl Host {
                 // The stream's end is SAID (`PIECE_END`, or `PIECE_STREAM_FAILED` for a failed
                 // one); an empty piece without it is an empty message, its kind stated.
                 if p.flags & (PIECE_END | PIECE_STREAM_FAILED) != 0 {
-                    assert!(bytes.is_empty(), "a stream's end carries no message");
+                    // A clean end carries no message; a failed one carries its reason.
+                    assert_eq!(
+                        bytes.is_empty(),
+                        p.flags & PIECE_STREAM_FAILED == 0,
+                        "a stream's end carries no message, a failed one says why"
+                    );
                     said.stream_end = true;
                     said.failed |= p.flags & PIECE_STREAM_FAILED != 0;
                 } else {

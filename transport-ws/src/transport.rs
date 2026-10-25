@@ -156,6 +156,10 @@ enum Phase {
         chunked: Option<Box<Dechunk>>,
         short: bool,
     },
+    /// An accepted connection whose upgrade request was refused: the answer (`400`, or `426` for a
+    /// version this end does not speak) went out, the frames ended failed, and whatever still
+    /// arrives is nobody's ([`WsFramer::failure`]).
+    Refused(Pipe),
 }
 
 impl Phase {
@@ -175,7 +179,7 @@ impl Phase {
             Phase::Accepting(mid) => mid.get_mut().get_mut(),
             Phase::Dialling { mid, .. } => mid.get_mut().get_mut(),
             Phase::Open { ws, .. } => ws.get_mut(),
-            Phase::Answered { pipe, .. } => pipe,
+            Phase::Answered { pipe, .. } | Phase::Refused(pipe) => pipe,
         }
     }
 }
@@ -959,8 +963,8 @@ impl WsFramer {
             .remove(&state);
     }
 
-    /// Whether framing `state` is still held (a test reads that a finished framing is gone).
-    #[cfg(test)]
+    /// Whether framing `state` is still held: an op that failed with its state alive failed that
+    /// op alone, one that left it gone ended the connection.
     pub(crate) fn holds(&self, state: u64) -> bool {
         self.map().contains_key(&state)
     }
@@ -1068,6 +1072,11 @@ impl WsFramer {
                 let (phase, ended) = answered_body(pipe, left, chunked, false, out);
                 return Ok((phase, ended, None));
             }
+            // An upgrade request that was refused: what arrives now is nobody's.
+            Phase::Refused(mut pipe) => {
+                pipe.inbound.clear();
+                return Ok((Phase::Refused(pipe), false, None));
+            }
             phase => phase,
         };
         let shaking = !matches!(phase, Phase::Open { .. });
@@ -1093,7 +1102,28 @@ impl WsFramer {
                 Err(HandshakeError::Interrupted(mid)) => {
                     return Ok((Phase::Accepting(mid), false, None))
                 }
-                Err(HandshakeError::Failure(_)) => return Err(TransportError::HandshakeFailed),
+                // A request that is not an upgrade this end accepts is ANSWERED (RFC 6455 4.2.1:
+                // 400; a version it does not speak, 4.4: 426 naming the one it does), and the
+                // connection's frames end failed. A request still incomplete, or a carrier that
+                // broke, has no request to answer.
+                Err(HandshakeError::Failure(e)) => {
+                    if matches!(
+                        e,
+                        WsError::Protocol(ProtocolError::HandshakeIncomplete) | WsError::Io(_)
+                    ) {
+                        return Err(TransportError::HandshakeFailed);
+                    }
+                    let answer: &[u8] = if matches!(
+                        e,
+                        WsError::Protocol(ProtocolError::MissingSecWebSocketVersionHeader)
+                    ) {
+                        b"HTTP/1.1 426 Upgrade Required\r\nSec-WebSocket-Version: 13\r\nConnection: close\r\nContent-Length: 0\r\n\r\n"
+                    } else {
+                        b"HTTP/1.1 400 Bad Request\r\nConnection: close\r\nContent-Length: 0\r\n\r\n"
+                    };
+                    out.send(answer);
+                    return Ok((Phase::Refused(Pipe::default()), true, None));
+                }
             },
             Phase::Dialling { mid, held, message } => match mid.handshake() {
                 Ok((mut ws, response)) => {
@@ -1475,25 +1505,34 @@ fn request_url(url: &str) -> Result<String, TransportError> {
 
 impl WsFramer {
     /// Whether the far side FAILED the connection in `state` (a protocol violation, text that is
-    /// not UTF-8, a message over the ceiling), or a refused upgrade's body was cut short by the
-    /// carrier's end, or declared a `Content-Length` that is not a length or disagrees (RFC 9110
-    /// §8.6): its frames ended failed, not cleanly.
+    /// not UTF-8, a message over the ceiling), an upgrade request this end refused, or a refused
+    /// upgrade's body was cut short by the carrier's end or declared a `Content-Length` that is not
+    /// a length or disagrees (RFC 9110 §8.6): its frames ended failed, not cleanly.
+    #[cfg(test)]
     pub(crate) fn failed(&self, state: u64) -> bool {
-        let Ok(conn) = self.conn(state) else {
-            return false;
-        };
-        let Ok(held) = Self::enter(&conn) else {
-            return false;
-        };
-        matches!(
-            held.as_ref(),
-            Some(
-                Phase::Open {
-                    failed: Some(_),
-                    ..
-                } | Phase::Answered { short: true, .. }
-            )
-        )
+        self.failure(state).is_some()
+    }
+
+    /// Why the frames of `state` ended failed ([`Self::failed`]), in words for the end piece.
+    pub(crate) fn failure(&self, state: u64) -> Option<&'static str> {
+        let conn = self.conn(state).ok()?;
+        let held = Self::enter(&conn).ok()?;
+        match held.as_ref()? {
+            Phase::Open {
+                failed: Some(code), ..
+            } => Some(match code {
+                CloseCode::Invalid => "the far end sent a text message that is not UTF-8",
+                CloseCode::Size => "the far end sent a message over the message ceiling",
+                _ => "the far end broke the WebSocket protocol",
+            }),
+            Phase::Answered { short: true, .. } => {
+                Some("the far end's answer body was cut short or declared no valid length")
+            }
+            Phase::Refused(_) => {
+                Some("the upgrade request is not a WebSocket opening handshake this end can accept")
+            }
+            _ => None,
+        }
     }
 }
 
