@@ -863,9 +863,11 @@ fn framing(
     if let Err(e) = done {
         let why = refused(&e);
         // A state gone before the op with bytes still owed, and no new input, is a RE-CALL after
-        // `YIELD_MORE` (a refusal's close removed the state): it drains, whatever the op said.
-        // An op that carried new input fails instead (its data is not taken).
+        // `YIELD_MORE` (a refusal's close removed the state): it drains, whatever the op said, and
+        // the connection is over once it has (`YIELD_ENDED`). An op that carried new input fails
+        // instead (its data is not taken).
         if !alive && !fresh && (!owed.wire_owed().is_empty() || !owed.pieces.is_empty()) {
+            owed.ended = true;
             fill(owed, sink, o);
             return Outcome::Ready;
         }
