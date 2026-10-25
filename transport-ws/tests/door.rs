@@ -641,3 +641,49 @@ fn locate_for_a_listener_answers_the_accepting_offer() {
     assert_eq!(o.alpn_needed, 9);
     host.close();
 }
+
+/// A BODY CEILING OF ZERO IS REFUSED, NOT OPENED WITHOUT AN OUTBOUND CEILING (codeaudit g5 LOW):
+/// `validate` (and `open`) answer why. RED before the fix: validate answered Ready.
+#[test]
+fn a_zero_message_ceiling_is_refused_by_validate_and_open() {
+    use busbar_contract::abi::mechanism::call::Blob;
+    use busbar_contract::abi::mechanism::lifecycle::ValidateIn;
+    let settings = br#"{"limits.request_body_max_bytes": 0}"#;
+    let l = linked();
+    let mut i: ValidateIn = z();
+    i.settings = Blob {
+        ptr: settings.as_ptr(),
+        len: settings.len(),
+        ..z()
+    };
+    let mut o: OutHead = z();
+    let r = call(
+        l.head.validate,
+        std::ptr::null_mut(),
+        &mut i,
+        &mut o,
+        life::VALIDATE,
+    );
+    assert_eq!(r, Outcome::Failed, "validate refuses a zero ceiling");
+    // SAFETY: the door's error text, valid until the next call.
+    let why = unsafe { std::slice::from_raw_parts(o.error.ptr, o.error.len) };
+    assert_eq!(
+        why,
+        b"settings: limits.request_body_max_bytes must be above 0"
+    );
+    let mut oi: OpenIn = z();
+    oi.settings = Blob {
+        ptr: settings.as_ptr(),
+        len: settings.len(),
+        ..z()
+    };
+    let mut oo: OpenOut = z();
+    let r = call(
+        l.head.open,
+        std::ptr::null_mut(),
+        &mut oi,
+        &mut oo,
+        life::OPEN,
+    );
+    assert_eq!(r, Outcome::Failed, "open refuses a zero ceiling");
+}
