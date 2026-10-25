@@ -834,11 +834,13 @@ fn opening(
 }
 
 /// Run a framer method on framing `token`, then answer what it produced (and what was owed).
+/// `fresh`: the call carries new input, so it is not a re-call that only drains.
 fn framing(
     p: *mut c_void,
     token: u64,
     sink: &FramerSink,
     o: &mut FramerOut,
+    fresh: bool,
     op: impl FnOnce(&WsFramer, &mut Collect<'_>) -> Result<(), TransportError>,
 ) -> Outcome {
     let inst = instance(p);
@@ -860,9 +862,10 @@ fn framing(
     let owed = &mut *held;
     if let Err(e) = done {
         let why = refused(&e);
-        // A state gone before the op with bytes still owed is a RE-CALL after `YIELD_MORE` (a
-        // refusal's close removed the state): it drains, whatever the op said.
-        if !alive && (!owed.wire_owed().is_empty() || !owed.pieces.is_empty()) {
+        // A state gone before the op with bytes still owed, and no new input, is a RE-CALL after
+        // `YIELD_MORE` (a refusal's close removed the state): it drains, whatever the op said.
+        // An op that carried new input fails instead (its data is not taken).
+        if !alive && !fresh && (!owed.wire_owed().is_empty() || !owed.pieces.is_empty()) {
             fill(owed, sink, o);
             return Outcome::Ready;
         }
@@ -1084,22 +1087,29 @@ impl Slot for Ingest {
     fn call(p: *mut c_void, i: &IngestIn, o: &mut FramerOut) -> Outcome {
         let bytes = raw(i.bytes, i.len);
         let end = i.end != 0;
-        framing(p, i.framing, &i.sink, o, |f, c| {
-            // A `YIELD_MORE` re-call carries no new bytes: nothing reaches the machine.
-            if bytes.is_empty() && !end {
-                return Ok(());
-            }
-            let ended_before = c.owed.ended;
-            f.ingest(i.framing, bytes, end, c)?;
-            // THE DIALLED HEAD'S REASON PHRASE rides the head piece this call queued.
-            if let Some(reason) = f.take_reason(i.framing) {
-                if let Some(head) = c.owed.pieces.iter_mut().rev().find(|p| p.fields) {
-                    head.reason = Some(reason);
+        framing(
+            p,
+            i.framing,
+            &i.sink,
+            o,
+            !bytes.is_empty() || end,
+            |f, c| {
+                // A `YIELD_MORE` re-call carries no new bytes: nothing reaches the machine.
+                if bytes.is_empty() && !end {
+                    return Ok(());
                 }
-            }
-            end_failed(f, i.framing, c.owed, ended_before);
-            Ok(())
-        })
+                let ended_before = c.owed.ended;
+                f.ingest(i.framing, bytes, end, c)?;
+                // THE DIALLED HEAD'S REASON PHRASE rides the head piece this call queued.
+                if let Some(reason) = f.take_reason(i.framing) {
+                    if let Some(head) = c.owed.pieces.iter_mut().rev().find(|p| p.fields) {
+                        head.reason = Some(reason);
+                    }
+                }
+                end_failed(f, i.framing, c.owed, ended_before);
+                Ok(())
+            },
+        )
     }
 }
 
@@ -1111,12 +1121,19 @@ impl Slot for Emit {
     fn call(p: *mut c_void, i: &EmitIn, o: &mut FramerOut) -> Outcome {
         let bytes = raw(i.bytes, i.len);
         let eof = i.end_of_frame != 0;
-        framing(p, i.framing, &i.sink, o, |f, c| {
-            if bytes.is_empty() && !eof {
-                return Ok(());
-            }
-            f.emit_text(i.framing, bytes, eof, i.flags & EMIT_TEXT != 0, c)
-        })
+        framing(
+            p,
+            i.framing,
+            &i.sink,
+            o,
+            !bytes.is_empty() || eof,
+            |f, c| {
+                if bytes.is_empty() && !eof {
+                    return Ok(());
+                }
+                f.emit_text(i.framing, bytes, eof, i.flags & EMIT_TEXT != 0, c)
+            },
+        )
     }
 }
 
@@ -1128,7 +1145,7 @@ impl Slot for Refuse {
     fn call(p: *mut c_void, i: &RefuseIn, o: &mut FramerOut) -> Outcome {
         let bytes = raw(i.bytes, i.len);
         let stream = (i.has_stream != 0).then_some(StreamId(i.stream));
-        framing(p, i.framing, &i.sink, o, |f, c| {
+        framing(p, i.framing, &i.sink, o, false, |f, c| {
             f.refusal_with(i.framing, stream, bytes, i.status, c)
         })
     }
@@ -1140,7 +1157,7 @@ impl Slot for Timer {
     type In = FramingIn;
     type Out = FramerOut;
     fn call(p: *mut c_void, i: &FramingIn, o: &mut FramerOut) -> Outcome {
-        framing(p, i.framing, &i.sink, o, |f, c| f.tick(i.framing, c))
+        framing(p, i.framing, &i.sink, o, false, |f, c| f.tick(i.framing, c))
     }
 }
 
@@ -1151,7 +1168,7 @@ impl Slot for Finish {
     type Out = FramerOut;
     fn call(p: *mut c_void, i: &FinishIn, o: &mut FramerOut) -> Outcome {
         let reason = reason_of(i.reason);
-        let out = framing(p, i.framing, &i.sink, o, |f, c| {
+        let out = framing(p, i.framing, &i.sink, o, false, |f, c| {
             f.close(i.framing, reason, c);
             c.owed.ended = true;
             Ok(())
