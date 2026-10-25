@@ -700,7 +700,7 @@ fn a_zero_message_ceiling_is_refused_by_validate_and_open() {
     let why = unsafe { std::slice::from_raw_parts(o.error.ptr, o.error.len) };
     assert_eq!(
         why,
-        b"settings: limits.request_body_max_bytes must be above 0"
+        b"settings: limits.request_body_max_bytes must be a count of bytes above 0"
     );
     let mut oi: OpenIn = z();
     oi.settings = Blob {
@@ -1166,5 +1166,195 @@ fn an_emit_after_a_refuse_with_a_backlog_fails_and_the_backlog_still_drains() {
     expect.extend_from_slice(&body);
     expect.extend_from_slice(&[0x88, 2, 0x03, 0xE8]);
     assert_eq!(accept.wire, expect, "the backlog drains in full");
+    host.close();
+}
+
+// ── settings: the canonical texts (sibling alignment A, E) ───────────────────────────────────────
+
+/// The text an answer's head names.
+fn said(error: &AbiStr) -> String {
+    if error.ptr.is_null() {
+        return String::new();
+    }
+    // SAFETY: the door's error text, valid until the next call.
+    String::from_utf8(unsafe { std::slice::from_raw_parts(error.ptr, error.len) }.to_vec())
+        .expect("the reason is text")
+}
+
+/// `validate` over `settings`, a reason buffer lent: its outcome and its text.
+fn validate(settings: &[u8]) -> (Outcome, String) {
+    use busbar_contract::abi::mechanism::call::Blob;
+    use busbar_contract::abi::mechanism::lifecycle::ValidateIn;
+    let mut buf = [0_u8; 256];
+    let mut i: ValidateIn = z();
+    i.settings = Blob {
+        ptr: settings.as_ptr(),
+        len: settings.len(),
+        ..z()
+    };
+    i.err_buf = buf.as_mut_ptr();
+    i.err_cap = buf.len();
+    let mut o: OutHead = z();
+    let r = call(
+        linked().head.validate,
+        std::ptr::null_mut(),
+        &mut i,
+        &mut o,
+        life::VALIDATE,
+    );
+    (r, said(&o.error))
+}
+
+/// `open` over `settings`, a reason buffer lent: its outcome and its text (the instance, if one
+/// opened, is closed).
+fn open_with(settings: &[u8]) -> (Outcome, String) {
+    use busbar_contract::abi::mechanism::call::Blob;
+    let mut buf = [0_u8; 256];
+    let mut i: OpenIn = z();
+    i.settings = Blob {
+        ptr: settings.as_ptr(),
+        len: settings.len(),
+        ..z()
+    };
+    i.err_buf = buf.as_mut_ptr();
+    i.err_cap = buf.len();
+    let mut o: OpenOut = z();
+    let r = call(
+        linked().head.open,
+        std::ptr::null_mut(),
+        &mut i,
+        &mut o,
+        life::OPEN,
+    );
+    let text = said(&o.head.error);
+    if r == Outcome::Ready {
+        let mut ci: InHead = z();
+        let mut co: OutHead = z();
+        call(
+            linked().head.close,
+            o.instance,
+            &mut ci,
+            &mut co,
+            life::CLOSE,
+        );
+    } else if !text.is_empty() && o.head.error.ptr == buf.as_ptr() {
+        assert_eq!(o.err_len, text.len(), "an open states its reason's length");
+    }
+    (r, text)
+}
+
+/// SETTINGS ARE A JSON OBJECT: a number, an array or a string is refused, by `validate` and `open`.
+/// RED before the fix: `5` and `[]` opened with the defaults.
+#[test]
+fn settings_that_are_not_a_json_object_are_refused() {
+    for settings in [&b"5"[..], b"[]", b"\"x\"", b"not json"] {
+        for (r, text) in [validate(settings), open_with(settings)] {
+            assert_eq!(
+                r,
+                Outcome::Failed,
+                "{:?}",
+                String::from_utf8_lossy(settings)
+            );
+            assert_eq!(text, "settings: must be a JSON object");
+        }
+    }
+    assert_eq!(validate(b"").0, Outcome::Ready, "empty settings are `{{}}`");
+    assert_eq!(validate(b"{}").0, Outcome::Ready);
+}
+
+/// A KEY THE TRANSPORT DOES NOT DECLARE IS REFUSED BY NAME. RED before the fix: it was ignored.
+#[test]
+fn an_undeclared_setting_is_refused() {
+    let settings = br#"{"limits.request_body_max_bytes": 5, "nope": 1}"#;
+    for (r, text) in [validate(settings), open_with(settings)] {
+        assert_eq!(r, Outcome::Failed);
+        assert_eq!(text, "settings: nope is not a setting this transport reads");
+    }
+}
+
+/// A CEILING THAT IS NOT A COUNT ABOVE 0 SAYS THE CANONICAL TEXT. RED before the fix: a value of
+/// another kind said "a value is not of its declared kind".
+#[test]
+fn a_bad_message_ceiling_says_the_canonical_text() {
+    for value in ["0", "-1", "\"8\"", "1.5", "null", "true"] {
+        let settings = format!(r#"{{"limits.request_body_max_bytes": {value}}}"#);
+        for (r, text) in [
+            validate(settings.as_bytes()),
+            open_with(settings.as_bytes()),
+        ] {
+            assert_eq!(r, Outcome::Failed, "{value}");
+            assert_eq!(
+                text,
+                "settings: limits.request_body_max_bytes must be a count of bytes above 0"
+            );
+        }
+    }
+}
+
+/// `refresh` on `inst` with `settings`: its outcome and its text.
+fn refresh(inst: *mut c_void, settings: &[u8]) -> (Outcome, String) {
+    use busbar_contract::abi::mechanism::call::Blob;
+    use busbar_contract::abi::mechanism::lifecycle::RefreshIn;
+    let mut i: RefreshIn = z();
+    i.settings = Blob {
+        ptr: settings.as_ptr(),
+        len: settings.len(),
+        ..z()
+    };
+    let mut o: OutHead = z();
+    let r = call(linked().head.refresh, inst, &mut i, &mut o, life::REFRESH);
+    (r, said(&o.error))
+}
+
+/// A connected pair on `host`: the dialled end and the accepted one, past the upgrade.
+fn pair(host: &mut Host) -> (End, End) {
+    let mut dial = host.begin(SIDE_DIAL, "ws://svc.test/stream");
+    let mut accept = host.begin(SIDE_ACCEPT, "");
+    host.carry(&mut dial, &mut accept);
+    host.carry(&mut accept, &mut dial);
+    (dial, accept)
+}
+
+/// REFRESH RE-READS THE SETTINGS: a bad blob is refused with the validate texts and the old ceiling
+/// stays; a good one applies to framings begun after it, and one begun before keeps its own. RED
+/// before the fix: refresh answered READY to anything and the new ceiling never applied.
+#[test]
+fn refresh_rereads_the_settings_for_framings_begun_after_it() {
+    let mut host = Host::open(linked(), (64 * 1024, 64 * 1024, 64));
+    let (_, before) = pair(&mut host);
+    for (settings, text) in [
+        (&b"[]"[..], "settings: must be a JSON object"),
+        (
+            br#"{"x": 1}"#,
+            "settings: x is not a setting this transport reads",
+        ),
+        (
+            br#"{"limits.request_body_max_bytes": 0}"#,
+            "settings: limits.request_body_max_bytes must be a count of bytes above 0",
+        ),
+    ] {
+        assert_eq!(
+            refresh(host.inst, settings),
+            (Outcome::Failed, text.to_owned())
+        );
+    }
+    // The old (default) ceiling stands: a new framing still sends five bytes.
+    let (_, kept) = pair(&mut host);
+    assert_eq!(host.emit(&kept, b"hello", 0).0, Outcome::Ready);
+    assert_eq!(
+        refresh(host.inst, br#"{"limits.request_body_max_bytes": 4}"#),
+        (Outcome::Ready, String::new())
+    );
+    let (_, after) = pair(&mut host);
+    assert_eq!(
+        host.emit(&after, b"hello", 0).0,
+        Outcome::Failed,
+        "a framing begun after the refresh holds the new ceiling"
+    );
+    assert_eq!(
+        host.emit(&before, b"hello", 0).0,
+        Outcome::Ready,
+        "a framing begun before keeps its own"
+    );
     host.close();
 }
