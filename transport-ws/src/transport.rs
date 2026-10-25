@@ -481,10 +481,27 @@ fn content_length(headers: &HeaderMap) -> Option<u64> {
 /// the status line's text after its code, once the line is whole (`HTTP/1.1 401 Unauthorized` →
 /// `Unauthorized`); `None` before the line ends, or for a line with no phrase.
 pub(crate) fn reason_phrase(seen: &[u8]) -> Option<Vec<u8>> {
-    let end = seen.windows(2).position(|w| w == b"\r\n")?;
-    let mut parts = seen[..end].splitn(3, |b| *b == b' ');
+    let end = seen.iter().position(|b| *b == b'\n')?;
+    let line = &seen[..end];
+    let line = line.strip_suffix(b"\r").unwrap_or(line);
+    let mut parts = line.splitn(3, |b| *b == b' ');
     let (_version, _code) = (parts.next()?, parts.next()?);
     parts.next().filter(|r| !r.is_empty()).map(<[u8]>::to_vec)
+}
+
+/// Where a response head ends in `seen`: just past its first empty line, which the protocol
+/// library's parser takes as a bare `\n` or a `\r\n` alike. `None` while the head is not whole.
+fn head_end(seen: &[u8]) -> Option<usize> {
+    (0..seen.len()).find_map(|i| {
+        if seen[i] != b'\n' {
+            return None;
+        }
+        match seen[i + 1..] {
+            [b'\n', ..] => Some(i + 2),
+            [b'\r', b'\n', ..] => Some(i + 3),
+            _ => None,
+        }
+    })
 }
 
 /// A refused upgrade's BODY: frame what the pipe holds, decoded by its transfer coding when it is
@@ -1083,10 +1100,7 @@ impl WsFramer {
                         ..Framed::plain(StreamId(0), &block, true)
                     });
                     let (seen, carrier_ended) = shaken.unwrap_or_default();
-                    let at = seen
-                        .windows(4)
-                        .position(|w| w == b"\r\n\r\n")
-                        .map_or(seen.len(), |p| p + 4);
+                    let at = head_end(&seen).unwrap_or(seen.len());
                     let pipe = Pipe {
                         inbound: seen[at..].iter().copied().collect(),
                         ended: carrier_ended,
