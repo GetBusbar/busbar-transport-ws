@@ -240,11 +240,16 @@ pub const STATEMENT: Statement = Statement {
 struct Piece {
     stream: u64,
     bytes: Vec<u8>,
+    /// The bytes before this offset are handed over already: a piece taken in parts moves nothing
+    /// down, it reads on from here.
+    at: usize,
     end_of_frame: bool,
     /// The bytes belong to a text message (`PIECE_TEXT`).
     text: bool,
     /// The stream's end is a FAILURE (`PIECE_STREAM_FAILED`): the far side broke the protocol, sent
-    /// text that is not UTF-8 or a message over the ceiling. Only ever the empty end piece.
+    /// text that is not UTF-8 or a message over the ceiling, sent an upgrade request this end
+    /// refused, or ended a refused upgrade's answer short; or an op ended the framing's state.
+    /// Only ever the end piece, whose bytes say why; never split.
     failed: bool,
     /// The stream ends WHOLE here (`PIECE_END`): the empty last piece of its frames. An empty
     /// message (`bytes` empty without it) is a message, never the end.
@@ -270,6 +275,7 @@ impl Piece {
         Self {
             stream,
             bytes,
+            at: 0,
             end_of_frame,
             text: false,
             failed: false,
@@ -319,19 +325,35 @@ fn field_cut(bytes: &[u8], room: usize, in_value: bool) -> usize {
     best
 }
 
+/// How much of a piece's unhanded `rest` a sink with `room` takes. A field block is cut only where
+/// the host takes a continuation: at a line's start or inside a value. A name longer than the whole
+/// frame buffer (`alone`: nothing else is in the answer) is cut anyway (the host refuses it by
+/// name) rather than never moving.
+fn take_of(piece: &Piece, rest: &[u8], room: usize, alone: bool) -> usize {
+    if piece.fields {
+        match field_cut(rest, room, piece.continued) {
+            0 if alone => rest.len().min(room),
+            cut => cut,
+        }
+    } else {
+        rest.len().min(room)
+    }
+}
+
 /// What one framing owes the host and has not been able to hand it.
 #[derive(Default)]
 struct Owed {
     /// Bytes owed to the far side: a dialled upgrade request carries its auth's credential lines,
     /// so every byte leaves this buffer wiped ([`push_wiped`], [`consume_wiped`], and on drop).
+    /// The bytes before `wire_at` are handed over already (and wiped); the rest is owed.
     wire: Vec<u8>,
+    wire_at: usize,
     pieces: VecDeque<Piece>,
     /// The byte buffers of pieces already handed over, kept for the next pieces: a framing in
     /// steady state queues its messages without allocating.
     spare: Vec<Vec<u8>>,
     ended: bool,
     deadline: Option<u64>,
-    error: String,
 }
 
 impl Drop for Owed {
@@ -340,30 +362,40 @@ impl Drop for Owed {
     }
 }
 
-/// Append `bytes` to `wire`, never leaving a copy behind in a buffer it outgrows.
-fn push_wiped(wire: &mut Vec<u8>, bytes: &[u8]) {
+/// Append `bytes` to `wire` (whose bytes before `at` are handed over), never leaving a copy behind
+/// in a buffer it outgrows.
+fn push_wiped(wire: &mut Vec<u8>, at: &mut usize, bytes: &[u8]) {
     if wire.capacity() - wire.len() < bytes.len() {
-        let mut grown = Vec::with_capacity((wire.len() + bytes.len()).max(wire.capacity() * 2));
-        grown.extend_from_slice(wire);
+        let owed = wire.len() - *at;
+        let mut grown = Vec::with_capacity(2 * (owed + bytes.len()));
+        grown.extend_from_slice(&wire[*at..]);
         wire.zeroize();
         *wire = grown;
+        *at = 0;
     }
     wire.extend_from_slice(bytes);
 }
 
-/// Drop the first `n` bytes of `wire` (handed to the host), wiping every byte the remainder no
-/// longer covers.
-fn consume_wiped(wire: &mut Vec<u8>, n: usize) {
-    let rest = wire.len() - n;
-    wire.copy_within(n.., 0);
-    wire[rest..].zeroize();
-    wire.truncate(rest);
+/// Mark the next `n` bytes of `wire` (from `at`) handed to the host, wiping them in place; once
+/// all are handed over the buffer empties, every byte of it wiped.
+fn consume_wiped(wire: &mut Vec<u8>, at: &mut usize, n: usize) {
+    wire[*at..*at + n].zeroize();
+    *at += n;
+    if *at == wire.len() {
+        wire.clear();
+        *at = 0;
+    }
 }
 
 /// The most handed-over piece buffers a framing keeps for reuse.
 const SPARE_MAX: usize = 8;
 
 impl Owed {
+    /// The bytes owed to the far side and not handed over yet.
+    fn wire_owed(&self) -> &[u8] {
+        &self.wire[self.wire_at..]
+    }
+
     /// A buffer holding `bytes`, a kept one where there is one.
     fn buffer(&mut self, bytes: &[u8]) -> Vec<u8> {
         let mut b = self.spare.pop().unwrap_or_default();
@@ -409,7 +441,7 @@ struct Collect<'a> {
 
 impl Out for Collect<'_> {
     fn send(&mut self, bytes: &[u8]) {
-        push_wiped(&mut self.owed.wire, bytes);
+        push_wiped(&mut self.owed.wire, &mut self.owed.wire_at, bytes);
     }
     fn frame(&mut self, piece: Framed<'_>) {
         // The framer states a status on ONE frame only, the dialled stream's head: a message
@@ -446,7 +478,7 @@ impl Out for Collect<'_> {
 
 impl BytesOut for Collect<'_> {
     fn put(&mut self, bytes: &[u8]) {
-        push_wiped(&mut self.owed.wire, bytes);
+        push_wiped(&mut self.owed.wire, &mut self.owed.wire_at, bytes);
     }
 }
 
@@ -460,10 +492,18 @@ fn read_settings(b: &Blob) -> Result<usize, &'static str> {
     let v: serde_json::Value = serde_json::from_slice(text).map_err(|_| "settings: not JSON")?;
     match v.get(BODY_MAX_BYTES) {
         None => Ok(DEFAULT_REQUEST_BODY_MAX_BYTES),
-        Some(x) => x
-            .as_u64()
-            .and_then(|n| usize::try_from(n).ok())
-            .ok_or("settings: a value is not of its declared kind"),
+        Some(x) => {
+            let n = x
+                .as_u64()
+                .and_then(|n| usize::try_from(n).ok())
+                .ok_or("settings: a value is not of its declared kind")?;
+            // `WsFramer::new(0)` means the library's inbound default and NO outbound ceiling: refuse
+            // rather than open without one.
+            if n == 0 {
+                return Err("settings: limits.request_body_max_bytes must be above 0");
+            }
+            Ok(n)
+        }
     }
 }
 
@@ -668,6 +708,20 @@ impl Slot for Locate {
     type In = LocateIn;
     type Out = LocateOut;
     fn call(p: *mut c_void, i: &LocateIn, o: &mut LocateOut) -> Outcome {
+        // A LISTENER names no far end (`LocateIn::accept`): the answer is the offer it makes, the
+        // version-1.1 upgrade the dial side offers too, with no authority and no name.
+        if i.accept != 0 {
+            let offer: &[u8] = b"\x08http/1.1";
+            if offer.len() > i.alpn_cap {
+                o.alpn_needed = offer.len() as u64;
+                o.head.error = abi_str("locate: a host buffer is too small");
+                return Outcome::Failed;
+            }
+            // SAFETY: the host's ALPN buffer, of the capacity checked above.
+            unsafe { std::ptr::copy_nonoverlapping(offer.as_ptr(), i.alpn_buf, offer.len()) };
+            o.alpn_written = offer.len() as u64;
+            return Outcome::Ready;
+        }
         let Ok(target) = std::str::from_utf8(text(&i.target)) else {
             o.head.error = abi_str("locate: the target is not text");
             return Outcome::Failed;
@@ -714,12 +768,48 @@ impl Slot for Locate {
     }
 }
 
+/// Why an op failed, said without the op's name (the text is static: nothing allocates).
+fn refused(e: &TransportError) -> &'static str {
+    match e {
+        TransportError::Refused => "the far side refused the connection",
+        TransportError::Timeout => "a deadline expired",
+        TransportError::Reset => "the connection was reset",
+        TransportError::Closed => "the connection is closed",
+        TransportError::HandshakeFailed => "the WebSocket opening handshake failed",
+        TransportError::KeyUnavailable => "key material is unavailable",
+        TransportError::AddressRefused => "the target is not a ws:// or wss:// URL",
+        TransportError::Backpressure => "the far side stopped reading and the buffer is full",
+        TransportError::Framing => "the bytes broke the WebSocket framing",
+        TransportError::HandoffMismatch => "the stream handed over is not one this end can adopt",
+    }
+}
+
+/// A connection the far side FAILED ends its stream failed, not cleanly: the reader is told
+/// (`PIECE_STREAM_FAILED` on the end piece, whose bytes say why), and the close carries the code.
+/// `ended_before`: the connection had ended before the call that queued these pieces.
+fn end_failed(f: &WsFramer, token: u64, owed: &mut Owed, ended_before: bool) {
+    if ended_before || !owed.ended {
+        return;
+    }
+    let Some(why) = f.failure(token) else {
+        return;
+    };
+    if let Some(last) = owed.pieces.back_mut() {
+        if last.end {
+            last.failed = true;
+            // A failed stream ends failed, never whole as well, and says why.
+            last.end = false;
+            last.bytes.extend_from_slice(why.as_bytes());
+        }
+    }
+}
+
 /// Run a framer method that opens a framing, then answer what it produced.
 fn opening(
     p: *mut c_void,
     sink: &FramerSink,
     o: &mut FramerOut,
-    open: impl FnOnce(&WsFramer, &mut Collect<'_>) -> Result<u64, String>,
+    open: impl FnOnce(&WsFramer, &mut Collect<'_>) -> Result<u64, TransportError>,
 ) -> Outcome {
     let inst = instance(p);
     let mut owed = Owed::default();
@@ -730,24 +820,28 @@ fn opening(
     match open(&inst.framer, &mut c) {
         Ok(token) => {
             o.framing = token;
+            // An adopted connection's leftover may already have been refused.
+            end_failed(&inst.framer, token, &mut owed, false);
             fill(&mut owed, sink, o);
             inst.queues().insert(token, Arc::new(Mutex::new(owed)));
             Outcome::Ready
         }
-        Err(_) => {
-            o.head.error = abi_str("the framing could not be opened");
+        Err(e) => {
+            o.head.error = abi_str(refused(&e));
             Outcome::Failed
         }
     }
 }
 
 /// Run a framer method on framing `token`, then answer what it produced (and what was owed).
+/// `fresh`: the call carries new input, so it is not a re-call that only drains.
 fn framing(
     p: *mut c_void,
     token: u64,
     sink: &FramerSink,
     o: &mut FramerOut,
-    op: impl FnOnce(&WsFramer, &mut Collect<'_>) -> Result<(), String>,
+    fresh: bool,
+    op: impl FnOnce(&WsFramer, &mut Collect<'_>) -> Result<(), TransportError>,
 ) -> Outcome {
     let inst = instance(p);
     let Some(slot) = inst.queues().get(&token).cloned() else {
@@ -763,19 +857,35 @@ fn framing(
         owed: &mut held,
         now: time(sink),
     };
+    let alive = inst.framer.holds(token);
     let done = op(&inst.framer, &mut c);
     let owed = &mut *held;
     if let Err(e) = done {
-        if owed.wire.is_empty() && owed.pieces.is_empty() {
-            owed.error = e;
-            o.head.error = AbiStr {
-                ptr: owed.error.as_ptr(),
-                len: owed.error.len(),
-            };
+        let why = refused(&e);
+        // A state gone before the op with bytes still owed, and no new input, is a RE-CALL after
+        // `YIELD_MORE` (a refusal's close removed the state): it drains, whatever the op said, and
+        // the connection is over once it has (`YIELD_ENDED`). An op that carried new input fails
+        // instead (its data is not taken).
+        if !alive && !fresh && (!owed.wire_owed().is_empty() || !owed.pieces.is_empty()) {
+            owed.ended = true;
+            fill(owed, sink, o);
+            return Outcome::Ready;
+        }
+        // The framer still holds the framing, or did not hold it before the op: the op alone
+        // failed, whatever is queued, and the queue stays for the next call.
+        if inst.framer.holds(token) || !alive {
+            o.head.error = abi_str(why);
             return Outcome::Failed;
         }
-        // What the failing op produced still goes out; the connection's end follows it.
-        owed.ended = true;
+        // This op ended the state: what it produced still goes out, then the stream ends failed
+        // (its end piece says why) and the connection with it.
+        if !owed.ended {
+            owed.pieces.push_back(Piece {
+                failed: true,
+                ..Piece::plain(0, why.as_bytes().to_vec(), true)
+            });
+            owed.ended = true;
+        }
     }
     fill(owed, sink, o);
     Outcome::Ready
@@ -791,15 +901,15 @@ impl Slot for Begin {
             o.head.error = abi_str("begin: the side is neither accept nor dial");
             return Outcome::Failed;
         };
-        let target = String::from_utf8_lossy(text(&i.target)).into_owned();
+        let Ok(target) = std::str::from_utf8(text(&i.target)).map(str::to_owned) else {
+            o.head.error = abi_str("begin: the target is not text");
+            return Outcome::Failed;
+        };
         let fields = opening_fields(i.fields, i.fields_len);
         if matches!(side, Side::Dial) && i.points != 0 {
             return dial_with_auth(p, i, o, &target, &fields);
         }
-        opening(p, &i.sink, o, |f, c| {
-            f.open_with(side, &target, &fields, c)
-                .map_err(|e| format!("{e:?}"))
-        })
+        opening(p, &i.sink, o, |f, c| f.open_with(side, &target, &fields, c))
     }
 }
 
@@ -862,7 +972,10 @@ fn dial_with_auth(
         match peer {
             Poll::Pending => return Outcome::Pending,
             Poll::Ready(Ok(called)) if called.flow == FLOW_CONTINUE => {}
-            Poll::Ready(_) => return refuse(o, "begin: the binding's auth refused the connection"),
+            Poll::Ready(Ok(_)) => {
+                return refuse(o, "begin: the binding's auth stopped the connection")
+            }
+            Poll::Ready(Err(_)) => return refuse(o, "begin: the host's auth call failed"),
         }
     }
     let (point, body): (u32, Option<&[u8]>) = if i.points & POINT_HEAD_BODY != 0 {
@@ -873,9 +986,11 @@ fn dial_with_auth(
         // Only the peer point: the head goes out as the plane's.
         return opening(p, &i.sink, o, |f, c| {
             f.open_with(Side::Dial, target, fields, c)
-                .map_err(|e| format!("{e:?}"))
         });
     };
+    // What the head point's auth did, said by the closure that calls it.
+    let mut why: Option<&'static str> = None;
+    let mut signed = false;
     let mut sign = |head: &UpgradeHead<'_>| {
         let view = HeadViewArgs {
             method: "GET",
@@ -896,16 +1011,26 @@ fn dial_with_auth(
             body,
         ) {
             Poll::Pending => Poll::Pending,
-            Poll::Ready(Ok(called)) if called.flow == FLOW_CONTINUE => Poll::Ready(Ok(called
-                .fields
-                .into_iter()
-                .map(|f| AuthLine {
-                    query: f.flags & FIELD_QUERY != 0,
-                    value: zeroize::Zeroizing::new(f.value.expose_own(&Own::here()).clone()),
-                    name: f.name,
-                })
-                .collect())),
-            Poll::Ready(_) => Poll::Ready(Err(TransportError::HandshakeFailed)),
+            Poll::Ready(Ok(called)) if called.flow == FLOW_CONTINUE => {
+                signed = true;
+                Poll::Ready(Ok(called
+                    .fields
+                    .into_iter()
+                    .map(|f| AuthLine {
+                        query: f.flags & FIELD_QUERY != 0,
+                        value: zeroize::Zeroizing::new(f.value.expose_own(&Own::here()).clone()),
+                        name: f.name,
+                    })
+                    .collect()))
+            }
+            Poll::Ready(Ok(_)) => {
+                why = Some("begin: the binding's auth stopped the dial");
+                Poll::Ready(Err(TransportError::HandshakeFailed))
+            }
+            Poll::Ready(Err(_)) => {
+                why = Some("begin: the host's auth call failed");
+                Poll::Ready(Err(TransportError::HandshakeFailed))
+            }
         }
     };
     let parking = Parking {
@@ -918,7 +1043,10 @@ fn dial_with_auth(
         owed: &mut owed,
         now: time(&i.sink),
     };
-    match inst.framer.open_signed(parking, target, fields, &mut sign, &mut c) {
+    match inst
+        .framer
+        .open_signed(parking, target, fields, &mut sign, &mut c)
+    {
         Poll::Pending => Outcome::Pending,
         Poll::Ready(Ok(token)) => {
             o.framing = token;
@@ -926,9 +1054,13 @@ fn dial_with_auth(
             inst.queues().insert(token, Arc::new(Mutex::new(owed)));
             Outcome::Ready
         }
-        Poll::Ready(Err(_)) => refuse(
+        Poll::Ready(Err(e)) => refuse(
             o,
-            "begin: the binding's auth refused the dial, or answered a line the upgrade cannot carry",
+            why.unwrap_or(if signed {
+                "begin: the binding's auth answered a line the upgrade cannot carry"
+            } else {
+                refused(&e)
+            }),
         ),
     }
 }
@@ -945,10 +1077,7 @@ impl Slot for Adopt {
         };
         let facts = facts_of(i.facts);
         let leftover = raw(i.leftover, i.leftover_len);
-        opening(p, &i.sink, o, |f, c| {
-            f.adopt(side, &facts, leftover, c)
-                .map_err(|e| format!("{e:?}"))
-        })
+        opening(p, &i.sink, o, |f, c| f.adopt(side, &facts, leftover, c))
     }
 }
 
@@ -960,33 +1089,29 @@ impl Slot for Ingest {
     fn call(p: *mut c_void, i: &IngestIn, o: &mut FramerOut) -> Outcome {
         let bytes = raw(i.bytes, i.len);
         let end = i.end != 0;
-        framing(p, i.framing, &i.sink, o, |f, c| {
-            // A `YIELD_MORE` re-call carries no new bytes: nothing reaches the machine.
-            if bytes.is_empty() && !end {
-                return Ok(());
-            }
-            let ended_before = c.owed.ended;
-            f.ingest(i.framing, bytes, end, c)
-                .map_err(|e| format!("{e:?}"))?;
-            // THE DIALLED HEAD'S REASON PHRASE rides the head piece this call queued.
-            if let Some(reason) = f.take_reason(i.framing) {
-                if let Some(head) = c.owed.pieces.iter_mut().rev().find(|p| p.fields) {
-                    head.reason = Some(reason);
+        framing(
+            p,
+            i.framing,
+            &i.sink,
+            o,
+            !bytes.is_empty() || end,
+            |f, c| {
+                // A `YIELD_MORE` re-call carries no new bytes: nothing reaches the machine.
+                if bytes.is_empty() && !end {
+                    return Ok(());
                 }
-            }
-            // A connection the far side FAILED ends its stream failed, not cleanly: the reader is
-            // told (`PIECE_STREAM_FAILED` on the empty end piece), and the close carries the code.
-            if !ended_before && c.owed.ended && f.failed(i.framing) {
-                if let Some(last) = c.owed.pieces.back_mut() {
-                    if last.end {
-                        last.failed = true;
-                        // A failed stream ends failed, never whole as well.
-                        last.end = false;
+                let ended_before = c.owed.ended;
+                f.ingest(i.framing, bytes, end, c)?;
+                // THE DIALLED HEAD'S REASON PHRASE rides the head piece this call queued.
+                if let Some(reason) = f.take_reason(i.framing) {
+                    if let Some(head) = c.owed.pieces.iter_mut().rev().find(|p| p.fields) {
+                        head.reason = Some(reason);
                     }
                 }
-            }
-            Ok(())
-        })
+                end_failed(f, i.framing, c.owed, ended_before);
+                Ok(())
+            },
+        )
     }
 }
 
@@ -998,13 +1123,19 @@ impl Slot for Emit {
     fn call(p: *mut c_void, i: &EmitIn, o: &mut FramerOut) -> Outcome {
         let bytes = raw(i.bytes, i.len);
         let eof = i.end_of_frame != 0;
-        framing(p, i.framing, &i.sink, o, |f, c| {
-            if bytes.is_empty() && !eof {
-                return Ok(());
-            }
-            f.emit_text(i.framing, bytes, eof, i.flags & EMIT_TEXT != 0, c)
-                .map_err(|e| format!("{e:?}"))
-        })
+        framing(
+            p,
+            i.framing,
+            &i.sink,
+            o,
+            !bytes.is_empty() || eof,
+            |f, c| {
+                if bytes.is_empty() && !eof {
+                    return Ok(());
+                }
+                f.emit_text(i.framing, bytes, eof, i.flags & EMIT_TEXT != 0, c)
+            },
+        )
     }
 }
 
@@ -1016,9 +1147,8 @@ impl Slot for Refuse {
     fn call(p: *mut c_void, i: &RefuseIn, o: &mut FramerOut) -> Outcome {
         let bytes = raw(i.bytes, i.len);
         let stream = (i.has_stream != 0).then_some(StreamId(i.stream));
-        framing(p, i.framing, &i.sink, o, |f, c| {
+        framing(p, i.framing, &i.sink, o, false, |f, c| {
             f.refusal_with(i.framing, stream, bytes, i.status, c)
-                .map_err(|e| format!("{e:?}"))
         })
     }
 }
@@ -1029,9 +1159,7 @@ impl Slot for Timer {
     type In = FramingIn;
     type Out = FramerOut;
     fn call(p: *mut c_void, i: &FramingIn, o: &mut FramerOut) -> Outcome {
-        framing(p, i.framing, &i.sink, o, |f, c| {
-            f.tick(i.framing, c).map_err(|e| format!("{e:?}"))
-        })
+        framing(p, i.framing, &i.sink, o, false, |f, c| f.tick(i.framing, c))
     }
 }
 
@@ -1042,7 +1170,7 @@ impl Slot for Finish {
     type Out = FramerOut;
     fn call(p: *mut c_void, i: &FinishIn, o: &mut FramerOut) -> Outcome {
         let reason = reason_of(i.reason);
-        let out = framing(p, i.framing, &i.sink, o, |f, c| {
+        let out = framing(p, i.framing, &i.sink, o, false, |f, c| {
             f.close(i.framing, reason, c);
             c.owed.ended = true;
             Ok(())
@@ -1080,11 +1208,11 @@ impl Slot for Encode {
 
 /// Hand the host what the framing owes it, as far as the sink holds.
 fn fill(owed: &mut Owed, sink: &FramerSink, o: &mut FramerOut) {
-    let w = owed.wire.len().min(sink.wire_cap);
+    let w = owed.wire_owed().len().min(sink.wire_cap);
     // SAFETY: `w <= wire_cap`: the run lands inside the host's wire buffer, which no queue byte
     // overlaps.
-    unsafe { std::ptr::copy_nonoverlapping(owed.wire.as_ptr(), sink.wire, w) };
-    consume_wiped(&mut owed.wire, w);
+    unsafe { std::ptr::copy_nonoverlapping(owed.wire_owed().as_ptr(), sink.wire, w) };
+    consume_wiped(&mut owed.wire, &mut owed.wire_at, w);
     let y = &mut o.yielded;
     y.wire_len = w as u64;
     let mut frame_len = 0_usize;
@@ -1099,28 +1227,40 @@ fn fill(owed: &mut Owed, sink: &FramerSink, o: &mut FramerOut) {
         // carries that piece (the host reads the phrase beside its head's first piece, and drops
         // one that arrives alone). A piece that does not fit this answer keeps its phrase for the
         // next; a piece that goes out with no room or no slot for the phrase takes the head
-        // without it.
-        let with_reason = piece.reason.as_ref().is_some_and(|r| {
+        // without it, and so does a head that nothing else shares the answer with and that no cut
+        // fits beside its phrase (else it would wait for ever).
+        let mut with_reason = piece.reason.as_ref().is_some_and(|r| {
             heads < sink.heads_cap && !sink.heads.is_null() && r.len() < sink.frame_cap - frame_len
         });
-        let reason_len = if with_reason {
+        let mut reason_len = if with_reason {
             piece.reason.as_ref().map_or(0, Vec::len)
         } else {
             0
         };
-        let room = sink.frame_cap - frame_len - reason_len;
+        let mut room = sink.frame_cap - frame_len - reason_len;
+        // A failed end piece is never split (its tail would go out as payload): one that does not
+        // fit waits for the next answer; one that does not fit an empty answer is cut to the room.
+        if piece.failed && piece.bytes.len() - piece.at > room {
+            if frame_len > 0 {
+                break;
+            }
+            piece.bytes.truncate(piece.at + room);
+        }
         // A field block is cut only where the host takes a continuation: at a line's start or
         // inside a value. A name longer than the whole frame buffer is cut anyway (the host
         // refuses it by name) rather than never moving.
-        let take = if piece.fields {
-            match field_cut(&piece.bytes, room, piece.continued) {
-                0 if frame_len + reason_len == 0 => piece.bytes.len().min(room),
-                cut => cut,
-            }
-        } else {
-            piece.bytes.len().min(room)
-        };
-        if take == 0 && !piece.bytes.is_empty() {
+        let rest = &piece.bytes[piece.at..];
+        let mut take = take_of(piece, rest, room, frame_len + reason_len == 0);
+        // A phrase that leaves no room for a cut of the head, in an answer with nothing else in it,
+        // would stall the head for ever (the host re-calls with the same buffer): the head goes
+        // without it.
+        if take == 0 && reason_len > 0 && frame_len == 0 && piece.fields && !rest.is_empty() {
+            with_reason = false;
+            reason_len = 0;
+            room = sink.frame_cap;
+            take = take_of(piece, rest, room, true);
+        }
+        if take == 0 && !rest.is_empty() {
             break;
         }
         // The piece goes out in this answer: its phrase, when it fits, goes ahead of it.
@@ -1145,11 +1285,11 @@ fn fill(owed: &mut Owed, sink: &FramerSink, o: &mut FramerOut) {
             frame_len += reason.len();
             heads += 1;
         }
-        let whole = take == piece.bytes.len();
+        let whole = take == rest.len();
         let (code, status_class) = piece.status.unwrap_or((0, STATUS_NONE));
         // SAFETY: host buffers of the stated capacities; `take <= room`, `n < pieces_cap`.
         unsafe {
-            std::ptr::copy_nonoverlapping(piece.bytes.as_ptr(), sink.frame.add(frame_len), take);
+            std::ptr::copy_nonoverlapping(rest.as_ptr(), sink.frame.add(frame_len), take);
             sink.pieces.add(n).write(FramePiece {
                 stream: piece.stream,
                 offset: frame_len as u64,
@@ -1200,15 +1340,15 @@ fn fill(owed: &mut Owed, sink: &FramerSink, o: &mut FramerOut) {
         } else {
             // The rest of a field block opens mid-line unless what was taken ended one.
             if piece.fields {
-                piece.continued = !piece.bytes[..take].ends_with(b"\n");
+                piece.continued = !rest[..take].ends_with(b"\n");
             }
-            piece.bytes.drain(..take);
+            piece.at += take;
         }
     }
     y.frame_len = frame_len as u64;
     y.pieces_len = n as u32;
     y.heads_len = heads as u32;
-    let more = !owed.wire.is_empty() || !owed.pieces.is_empty();
+    let more = !owed.wire_owed().is_empty() || !owed.pieces.is_empty();
     let mut flags = 0;
     if more {
         flags |= YIELD_MORE;
