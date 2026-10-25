@@ -366,7 +366,7 @@ impl Drop for Owed {
 fn push_wiped(wire: &mut Vec<u8>, at: &mut usize, bytes: &[u8]) {
     if wire.capacity() - wire.len() < bytes.len() {
         let owed = wire.len() - *at;
-        let mut grown = Vec::with_capacity((owed + bytes.len()).max(wire.capacity() * 2));
+        let mut grown = Vec::with_capacity(2 * (owed + bytes.len()));
         grown.extend_from_slice(&wire[*at..]);
         wire.zeroize();
         *wire = grown;

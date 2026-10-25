@@ -267,3 +267,22 @@ fn handing_over_a_large_piece_or_wire_moves_no_remainder() {
     );
     assert!(owed.wire[100..].iter().all(|&b| b == 0xAA));
 }
+
+/// THE WIRE'S CAPACITY FOLLOWS ITS BACKLOG, NOT ITS THROUGHPUT (codeaudit g2 review): a wire that
+/// never fully drains (each push 101 bytes, each hand-over 100) grows by what is owed, not by
+/// doubling the capacity that handed-over bytes still count in. RED before the fix: the capacity
+/// doubled at every growth, far past the backlog.
+#[test]
+fn the_wire_s_capacity_follows_its_backlog_not_its_throughput() {
+    let mut owed = Owed::default();
+    for _ in 0..500 {
+        push_wiped(&mut owed.wire, &mut owed.wire_at, &[0x5A; 101]);
+        consume_wiped(&mut owed.wire, &mut owed.wire_at, 100);
+        let backlog = owed.wire_owed().len();
+        assert!(
+            owed.wire.capacity() <= 2 * (backlog + 101),
+            "capacity {} for a backlog of {backlog}",
+            owed.wire.capacity()
+        );
+    }
+}
