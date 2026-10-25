@@ -19,7 +19,7 @@ use busbar_contract::abi::mechanism::lifecycle::{slot as life, OpenIn, OpenOut};
 use busbar_contract::abi::transport::check::{check_framer, check_framer_fields};
 use busbar_contract::abi::transport::fields::lines;
 use busbar_contract::abi::transport::{
-    slot, BeginIn, EmitIn, FinishIn, FramePiece, FramerOut, FramerSink, IngestIn, Ops,
+    slot, AdoptIn, BeginIn, EmitIn, FinishIn, FramePiece, FramerOut, FramerSink, IngestIn, Ops,
     CLOSE_NORMAL, EMIT_TEXT, PIECE_CONTINUED, PIECE_END, PIECE_END_OF_FRAME, PIECE_FIELDS,
     PIECE_HAS_CODE, PIECE_STREAM_FAILED, PIECE_TEXT, SIDE_ACCEPT, SIDE_DIAL, STATUS_SUCCESS,
     YIELD_ENDED, YIELD_MORE,
@@ -946,4 +946,90 @@ fn a_refused_emit_with_a_backlog_fails_the_op_and_keeps_the_connection() {
     );
     assert!(!accept.ended && !accept.stream_end);
     host.close();
+}
+
+// ── an accepted upgrade that is refused is answered (codeaudit g5 A) ─────────────────────────────
+
+/// An upgrade request, its `Sec-WebSocket-Version` and `Sec-WebSocket-Key` lines as given.
+fn upgrade_request(version: &str, key: &str) -> Vec<u8> {
+    format!(
+        "GET /chat HTTP/1.1\r\nHost: svc.test\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n{key}{version}\r\n"
+    )
+    .into_bytes()
+}
+
+const KEY: &str = "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n";
+const REFUSED_WHY: &[u8] =
+    b"the upgrade request is not a WebSocket opening handshake this end can accept";
+
+/// What the accepted end said after being refused: answered on the wire, the stream ended FAILED
+/// (never whole), the connection ended.
+fn assert_answered(end: &End, status_line: &str) {
+    let wire = String::from_utf8_lossy(&end.wire);
+    assert!(wire.starts_with(status_line), "the wire answers: {wire:?}");
+    assert!(wire.contains("Connection: close\r\n"), "{wire:?}");
+    if status_line.contains("426") {
+        assert!(wire.contains("Sec-WebSocket-Version: 13\r\n"), "{wire:?}");
+    }
+    assert_eq!(
+        end.failures,
+        [REFUSED_WHY.to_vec()],
+        "the stream ended failed"
+    );
+    assert!(!end.stream_end, "never whole");
+    assert!(end.ended, "the connection ended");
+}
+
+/// A REQUEST FOR A VERSION THIS END DOES NOT SPEAK IS ANSWERED 426 with the version it does (RFC
+/// 6455 4.4), and one missing its key 400 (4.2.1); either way the stream ends failed. RED before
+/// the fix: nothing was answered and the ingest failed with no HTTP on the wire.
+#[test]
+fn a_refused_upgrade_request_is_answered() {
+    for (request, status) in [
+        (
+            upgrade_request("Sec-WebSocket-Version: 8\r\n", KEY),
+            "HTTP/1.1 426",
+        ),
+        (
+            upgrade_request("Sec-WebSocket-Version: 13\r\n", ""),
+            "HTTP/1.1 400",
+        ),
+    ] {
+        let mut host = Host::open(linked(), (64 * 1024, 64 * 1024, 8));
+        let mut accept = host.begin(SIDE_ACCEPT, "");
+        host.hear(&mut accept, &request);
+        assert_answered(&accept, status);
+        host.close();
+    }
+}
+
+/// THE SAME REFUSAL THROUGH ADOPT: the request is the connection's leftover; `adopt` answers READY
+/// with the 400/426 on the wire and a failed end piece.
+#[test]
+fn an_adopted_connection_whose_leftover_is_refused_is_answered() {
+    for (request, status) in [
+        (
+            upgrade_request("Sec-WebSocket-Version: 8\r\n", KEY),
+            "HTTP/1.1 426",
+        ),
+        (
+            upgrade_request("Sec-WebSocket-Version: 13\r\n", ""),
+            "HTTP/1.1 400",
+        ),
+    ] {
+        let mut host = Host::open(linked(), (64 * 1024, 64 * 1024, 8));
+        let mut accept = End::default();
+        let mut i: AdoptIn = z();
+        i.side = SIDE_ACCEPT;
+        i.leftover = request.as_ptr();
+        i.leftover_len = request.len();
+        i.sink = host.sink();
+        let mut o: FramerOut = z();
+        let r = call(host.ops.adopt, host.inst, &mut i, &mut o, slot::ADOPT);
+        accept.framing = o.framing;
+        let more = host.take(r, &o, &mut accept);
+        host.again(more, &mut accept);
+        assert_answered(&accept, status);
+        host.close();
+    }
 }
