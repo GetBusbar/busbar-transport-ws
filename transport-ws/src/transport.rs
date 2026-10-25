@@ -1418,8 +1418,8 @@ fn request_url(url: &str) -> Result<String, TransportError> {
 
 impl WsFramer {
     /// Whether the far side FAILED the connection in `state` (a protocol violation, text that is
-    /// not UTF-8, a message over the ceiling), or a refused upgrade's body was cut short by the
-    /// carrier's end: its frames ended failed, not cleanly.
+    /// not UTF-8, a message over the ceiling), an upgrade request this end refused, or a refused
+    /// upgrade's body was cut short by the carrier's end: its frames ended failed, not cleanly.
     #[cfg(test)]
     pub(crate) fn failed(&self, state: u64) -> bool {
         self.failure(state).is_some()
