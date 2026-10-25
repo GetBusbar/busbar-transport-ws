@@ -36,3 +36,6 @@ zeroize = { workspace = true }
 httpdate = { workspace = true }
 # The door's settings blob is JSON (`door::read_settings`).
 serde_json = { workspace = true }
+
+[lints]
+workspace = true

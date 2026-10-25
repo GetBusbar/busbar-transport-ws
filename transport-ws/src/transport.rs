@@ -47,7 +47,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::io::{Read, Write};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::task::Poll;
 
@@ -129,6 +129,9 @@ enum Phase {
         mid: MidHandshake<ClientHandshake<Pipe>>,
         held: Vec<(Vec<u8>, bool)>,
         message: Vec<u8>,
+        /// The message ceiling this framing began under (`0` = none): a refresh after it moves
+        /// only framings begun later.
+        max: usize,
     },
     /// The session: the protocol machine, the pieces of an outbound message not yet marked
     /// complete, and the failure that ended the inbound frames (its close code), if the far side
@@ -212,13 +215,16 @@ pub(crate) struct WsFramer {
     /// ([`WsFramer::open_signed`]).
     parked: Mutex<HashMap<(u32, u32), (u64, Phase)>>,
     next: AtomicU64,
-    max_message_bytes: usize,
+    /// The message ceiling a framing begun now takes (`0` = the library's default and no outbound
+    /// ceiling); a refresh moves it ([`WsFramer::set_max`]), and every framing keeps the one it
+    /// began under.
+    max_message_bytes: AtomicUsize,
 }
 
 impl std::fmt::Debug for WsFramer {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("WsFramer")
-            .field("max_message_bytes", &self.max_message_bytes)
+            .field("max_message_bytes", &self.max())
             .finish_non_exhaustive()
     }
 }
@@ -748,15 +754,27 @@ impl WsFramer {
             reasons: Mutex::new(HashMap::new()),
             parked: Mutex::new(HashMap::new()),
             next: AtomicU64::new(1),
-            max_message_bytes,
+            max_message_bytes: AtomicUsize::new(max_message_bytes),
         }
     }
 
+    /// The message ceiling a framing begun now takes.
+    fn max(&self) -> usize {
+        self.max_message_bytes.load(Ordering::Relaxed)
+    }
+
+    /// A refresh's new ceiling: framings begun after it take it; those already begun keep theirs.
+    pub(crate) fn set_max(&self, max_message_bytes: usize) {
+        self.max_message_bytes
+            .store(max_message_bytes, Ordering::Relaxed);
+    }
+
     fn config(&self) -> Option<WebSocketConfig> {
-        (self.max_message_bytes > 0).then(|| {
+        let max = self.max();
+        (max > 0).then(|| {
             WebSocketConfig::default()
-                .max_message_size(Some(self.max_message_bytes))
-                .max_frame_size(Some(self.max_message_bytes))
+                .max_message_size(Some(max))
+                .max_frame_size(Some(max))
         })
     }
 
@@ -877,12 +895,15 @@ impl WsFramer {
     ) -> Result<(), TransportError> {
         let conn = self.conn(state)?;
         let mut guard = Self::enter(&conn)?;
-        if let Some(Phase::Dialling { held, message, .. }) = guard.as_mut() {
+        if let Some(Phase::Dialling {
+            held, message, max, ..
+        }) = guard.as_mut()
+        {
+            let max = *max;
             // HELD, AND BOUNDED: a message over the ceiling is refused as the open connection
             // would refuse it (a capacity failure), and so is one past the held count, so a dial
             // whose far end never answers cannot grow the framing without end.
-            let over = self.max_message_bytes > 0
-                && message.len().saturating_add(bytes.len()) > self.max_message_bytes;
+            let over = max > 0 && message.len().saturating_add(bytes.len()) > max;
             if over || (end_of_frame && held.len() >= MAX_HELD_MESSAGES) {
                 // The refused message's gathered pieces go with it, as the open path drops them:
                 // none is sent glued to the front of the next message.
@@ -901,8 +922,9 @@ impl WsFramer {
             }
             return Ok(());
         }
-        let max = self.max_message_bytes;
         Self::with_open(guard.as_mut(), out, |ws, message| {
+            // The ceiling this framing began under, which its machine holds (`None` = none).
+            let max = ws.get_config().max_message_size.unwrap_or(0);
             // THE CEILING, OUTBOUND TOO: the machine bounds only what it reads, so a message this
             // end writes is held to the same ceiling here, as a held one is above (a capacity
             // failure), and its gathered pieces are dropped.
@@ -1038,18 +1060,24 @@ impl WsFramer {
         request
             .headers_mut()
             .insert("sec-websocket-key", HeaderValue::from_static(seeded::KEY));
+        let config = self.config();
+        let max = config
+            .as_ref()
+            .and_then(|c| c.max_message_size)
+            .unwrap_or(0);
         match tungstenite::client::client_with_config(
             request,
             Pipe {
                 client: true,
                 ..Pipe::default()
             },
-            self.config(),
+            config,
         ) {
             Err(HandshakeError::Interrupted(mid)) => Ok(Phase::Dialling {
                 mid,
                 held: Vec::new(),
                 message: Vec::new(),
+                max,
             }),
             Ok(_) | Err(HandshakeError::Failure(_)) => Err(TransportError::HandshakeFailed),
         }
@@ -1125,7 +1153,12 @@ impl WsFramer {
                     return Ok((Phase::Refused(Pipe::default()), true, None));
                 }
             },
-            Phase::Dialling { mid, held, message } => match mid.handshake() {
+            Phase::Dialling {
+                mid,
+                held,
+                message,
+                max,
+            } => match mid.handshake() {
                 Ok((mut ws, response)) => {
                     // THE FAR END ANSWERED (HEAD-FIELDS): its switching response is the stream's
                     // head, handed up before anything else, with its status and its field block.
@@ -1145,7 +1178,16 @@ impl WsFramer {
                     Phase::open(ws, message)
                 }
                 Err(HandshakeError::Interrupted(mid)) => {
-                    return Ok((Phase::Dialling { mid, held, message }, false, None))
+                    return Ok((
+                        Phase::Dialling {
+                            mid,
+                            held,
+                            message,
+                            max,
+                        },
+                        false,
+                        None,
+                    ))
                 }
                 // THE FAR END REFUSED THE UPGRADE (HEAD-FIELDS: the head is always the first
                 // fields piece): its answer is handed up as ONE head with its status, its class and
