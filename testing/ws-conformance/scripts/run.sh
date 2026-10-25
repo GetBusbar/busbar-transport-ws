@@ -190,8 +190,9 @@ case "$mode" in
     rc=0
     if [ "$armed" = "true" ]; then
       run_autobahn busbar "$port" subject || rc=$?
-      kill "$pid" 2>/dev/null || true
     fi
+    # Every path out: a subject that started but never printed its port is killed too.
+    if [ -n "${pid:-}" ]; then kill "$pid" 2>/dev/null || true; fi
     [ "$rc" -eq 3 ] && exit 3
     [ "$rc" -eq 0 ] || { echo "RED: docker exited $rc -- the subject run did not complete" >&2; exit "$rc"; }
     mkdir -p "$REPORTS_DIR/subject"
