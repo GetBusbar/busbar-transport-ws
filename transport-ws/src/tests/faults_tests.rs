@@ -514,3 +514,19 @@ fn a_steady_framing_adds_no_allocation_of_its_own_per_message() {
         "an outbound message costs {outbound} allocations; the crossing {crossing} and the library {library_out}"
     );
 }
+
+/// A CREDENTIAL IS VALIDATED IN PLACE (codeaudit r1 g1): checking an auth answer's secret value
+/// copies it nowhere, so no unwiped heap buffer holds it. RED before the fix: building a
+/// `HeaderValue` copied the value into a `Bytes` allocation.
+#[test]
+fn validating_a_credential_value_allocates_nothing() {
+    let secret = b"Bearer sk-0123456789abcdef0123456789abcdef0123456789abcdef".to_vec();
+    COUNT.with(|c| c.set(Some(0)));
+    let ok = crate::transport::header_value_ok(&secret);
+    let bad = crate::transport::header_value_ok(b"a\r\nb");
+    let n = COUNT.with(|c| c.replace(None)).unwrap_or(0);
+    assert!(ok && !bad);
+    assert_eq!(n, 0, "validating a credential allocated {n} times");
+    assert!(!crate::transport::header_value_ok(b"a\x7fb"));
+    assert!(crate::transport::header_value_ok(b"a\tb\xe9"));
+}
