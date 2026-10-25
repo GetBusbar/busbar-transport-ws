@@ -1101,3 +1101,46 @@ fn a_re_called_refuse_hands_over_the_whole_refusal_and_the_close() {
     assert_eq!(accept.wire, expect, "the refusal and the close, whole");
     host.close();
 }
+
+/// NEW INPUT ON A FRAMING A REFUSAL ALREADY CLOSED IS NOT SWALLOWED BY THE DRAIN: an emit with
+/// bytes, while the refusal is still owed, answers `Failed` with the closed text, and the refusal
+/// and its close still drain in full through the `refuse` re-calls. RED before the fix: the emit
+/// answered READY and its data vanished.
+#[test]
+fn an_emit_after_a_refuse_with_a_backlog_fails_and_the_backlog_still_drains() {
+    let mut host = Host::open(linked(), (16, 64 * 1024, 8));
+    let mut dial = host.begin(SIDE_DIAL, "ws://svc.test/stream");
+    let mut accept = host.begin(SIDE_ACCEPT, "");
+    host.carry(&mut dial, &mut accept);
+    accept.wire.clear();
+    let body = [b'r'; 100];
+    let refuse = |host: &mut Host, accept: &mut End| {
+        let mut i: RefuseIn = z();
+        i.framing = accept.framing;
+        i.bytes = body.as_ptr();
+        i.len = body.len();
+        i.sink = host.sink();
+        let mut o: FramerOut = z();
+        let r = call(host.ops.refuse, host.inst, &mut i, &mut o, slot::REFUSE);
+        assert_eq!(r, Outcome::Ready);
+        host.take(r, &o, accept)
+    };
+    let mut more = refuse(&mut host, &mut accept);
+    assert!(more, "the refusal is still owed");
+    let (r, o) = host.emit(&accept, b"new data", 0);
+    assert_eq!(r, Outcome::Failed, "new data on a closed framing fails");
+    // SAFETY: the door's error text, valid until the next call.
+    let why = unsafe { std::slice::from_raw_parts(o.head.error.ptr, o.head.error.len) };
+    assert_eq!(why, b"the connection is closed");
+    let mut calls = 0;
+    while more {
+        calls += 1;
+        assert!(calls < 1000, "a re-call never ran dry");
+        more = refuse(&mut host, &mut accept);
+    }
+    let mut expect = vec![0x82, 100];
+    expect.extend_from_slice(&body);
+    expect.extend_from_slice(&[0x88, 2, 0x03, 0xE8]);
+    assert_eq!(accept.wire, expect, "the backlog drains in full");
+    host.close();
+}
