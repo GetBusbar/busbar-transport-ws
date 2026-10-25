@@ -21,7 +21,8 @@ use busbar_contract::abi::transport::fields::lines;
 use busbar_contract::abi::transport::{
     slot, BeginIn, EmitIn, FinishIn, FramePiece, FramerOut, FramerSink, IngestIn, Ops,
     CLOSE_NORMAL, EMIT_TEXT, PIECE_CONTINUED, PIECE_END, PIECE_END_OF_FRAME, PIECE_FIELDS,
-    PIECE_HAS_CODE, PIECE_TEXT, SIDE_ACCEPT, SIDE_DIAL, STATUS_SUCCESS, YIELD_ENDED, YIELD_MORE,
+    PIECE_HAS_CODE, PIECE_STREAM_FAILED, PIECE_TEXT, SIDE_ACCEPT, SIDE_DIAL, STATUS_SUCCESS,
+    YIELD_ENDED, YIELD_MORE,
 };
 use tungstenite::handshake::derive_accept_key;
 
@@ -56,6 +57,8 @@ struct End {
     text: Vec<bool>,
     /// The stream ended whole (`PIECE_END`).
     stream_end: bool,
+    /// Each piece that ended the stream FAILED (`PIECE_STREAM_FAILED`): its bytes, the reason.
+    failures: Vec<Vec<u8>>,
     ended: bool,
     /// Each field block it heard (`PIECE_FIELDS`), never a message: its bytes, reassembled across
     /// pieces, the code and class its pieces stated (`PIECE_HAS_CODE`), whether it is whole, and
@@ -151,6 +154,10 @@ impl Host {
         for p in &self.pieces[..n] {
             let b = &self.frame[p.offset as usize..(p.offset + p.len) as usize];
             self.log.extend_from_slice(b);
+            if p.flags & PIECE_STREAM_FAILED != 0 {
+                end.failures.push(b.to_vec());
+                continue;
+            }
             // The stream's end is said, and is no frame.
             if p.flags & PIECE_END != 0 {
                 end.stream_end = true;
@@ -856,5 +863,43 @@ fn a_refused_open_says_why() {
         refused_begin(&mut host, "ws://u:p@host/", 0),
         "the target is not a ws:// or wss:// URL"
     );
+    host.close();
+}
+
+// ── a failed stream's end piece says why (codeaudit g5 G) ────────────────────────────────────────
+
+/// An accepted framing whose far end broke the protocol (a reserved opcode), on a host whose frame
+/// buffer holds `frame_cap` bytes: the accepted end, after it has heard the violation.
+fn broken_accept(frame_cap: usize) -> (Host, End) {
+    let mut host = Host::open(linked(), (64 * 1024, frame_cap, 8));
+    let mut dial = host.begin(SIDE_DIAL, "ws://svc.test/stream");
+    let mut accept = host.begin(SIDE_ACCEPT, "");
+    host.carry(&mut dial, &mut accept);
+    host.carry(&mut accept, &mut dial);
+    host.hear(&mut accept, &client_message(0x3, b""));
+    (host, accept)
+}
+
+/// THE FAILED END PIECE CARRIES THE REASON: the bytes of the piece that ends a stream the far end
+/// broke state how it broke it. RED before the fix: the piece was empty.
+#[test]
+fn a_failed_stream_s_end_piece_says_why() {
+    let (host, accept) = broken_accept(64 * 1024);
+    assert_eq!(
+        accept.failures,
+        [b"the far end broke the WebSocket protocol".to_vec()]
+    );
+    assert!(accept.ended && !accept.stream_end);
+    host.close();
+}
+
+/// A FAILED PIECE IS NEVER SPLIT: a frame buffer smaller than its reason hands it as ONE piece,
+/// flagged failed, its reason cut to the room; never as unflagged payload.
+#[test]
+fn a_failed_piece_is_never_handed_as_payload() {
+    let (host, accept) = broken_accept(5);
+    assert!(accept.frames.is_empty(), "no unflagged payload");
+    assert_eq!(accept.failures, [b"the f".to_vec()]);
+    assert!(accept.ended);
     host.close();
 }

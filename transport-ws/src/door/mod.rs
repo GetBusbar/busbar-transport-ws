@@ -247,7 +247,8 @@ struct Piece {
     /// The bytes belong to a text message (`PIECE_TEXT`).
     text: bool,
     /// The stream's end is a FAILURE (`PIECE_STREAM_FAILED`): the far side broke the protocol, sent
-    /// text that is not UTF-8 or a message over the ceiling. Only ever the empty end piece.
+    /// text that is not UTF-8 or a message over the ceiling. Only ever the end piece, whose bytes
+    /// say why; never split.
     failed: bool,
     /// The stream ends WHOLE here (`PIECE_END`): the empty last piece of its frames. An empty
     /// message (`bytes` empty without it) is a message, never the end.
@@ -1063,13 +1064,16 @@ impl Slot for Ingest {
                 }
             }
             // A connection the far side FAILED ends its stream failed, not cleanly: the reader is
-            // told (`PIECE_STREAM_FAILED` on the empty end piece), and the close carries the code.
-            if !ended_before && c.owed.ended && f.failed(i.framing) {
-                if let Some(last) = c.owed.pieces.back_mut() {
-                    if last.end {
-                        last.failed = true;
-                        // A failed stream ends failed, never whole as well.
-                        last.end = false;
+            // told (`PIECE_STREAM_FAILED` on the end piece, whose bytes say why), and the close carries the code.
+            if !ended_before && c.owed.ended {
+                if let Some(why) = f.failure(i.framing) {
+                    if let Some(last) = c.owed.pieces.back_mut() {
+                        if last.end {
+                            last.failed = true;
+                            // A failed stream ends failed, never whole as well, and says why.
+                            last.end = false;
+                            last.bytes.extend_from_slice(why.as_bytes());
+                        }
                     }
                 }
             }
@@ -1201,6 +1205,14 @@ fn fill(owed: &mut Owed, sink: &FramerSink, o: &mut FramerOut) {
         // A field block is cut only where the host takes a continuation: at a line's start or
         // inside a value. A name longer than the whole frame buffer is cut anyway (the host
         // refuses it by name) rather than never moving.
+        // A failed end piece is never split (its tail would go out as payload): one that does not
+        // fit waits for the next answer; one that does not fit an empty answer is cut to the room.
+        if piece.failed && piece.bytes.len() - piece.at > room {
+            if frame_len > 0 {
+                break;
+            }
+            piece.bytes.truncate(piece.at + room);
+        }
         let rest = &piece.bytes[piece.at..];
         let mut take = take_of(piece, rest, room, frame_len + reason_len == 0);
         // A phrase that leaves no room for a cut of the head, in an answer with nothing else in it,
