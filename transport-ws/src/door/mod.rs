@@ -323,6 +323,21 @@ fn field_cut(bytes: &[u8], room: usize, in_value: bool) -> usize {
     best
 }
 
+/// How much of a piece's unhanded `rest` a sink with `room` takes. A field block is cut only where
+/// the host takes a continuation: at a line's start or inside a value. A name longer than the whole
+/// frame buffer (`alone`: nothing else is in the answer) is cut anyway (the host refuses it by
+/// name) rather than never moving.
+fn take_of(piece: &Piece, rest: &[u8], room: usize, alone: bool) -> usize {
+    if piece.fields {
+        match field_cut(rest, room, piece.continued) {
+            0 if alone => rest.len().min(room),
+            cut => cut,
+        }
+    } else {
+        rest.len().min(room)
+    }
+}
+
 /// What one framing owes the host and has not been able to hand it.
 #[derive(Default)]
 struct Owed {
@@ -1132,28 +1147,31 @@ fn fill(owed: &mut Owed, sink: &FramerSink, o: &mut FramerOut) {
         // carries that piece (the host reads the phrase beside its head's first piece, and drops
         // one that arrives alone). A piece that does not fit this answer keeps its phrase for the
         // next; a piece that goes out with no room or no slot for the phrase takes the head
-        // without it.
-        let with_reason = piece.reason.as_ref().is_some_and(|r| {
+        // without it, and so does a head that nothing else shares the answer with and that no cut
+        // fits beside its phrase (else it would wait for ever).
+        let mut with_reason = piece.reason.as_ref().is_some_and(|r| {
             heads < sink.heads_cap && !sink.heads.is_null() && r.len() < sink.frame_cap - frame_len
         });
-        let reason_len = if with_reason {
+        let mut reason_len = if with_reason {
             piece.reason.as_ref().map_or(0, Vec::len)
         } else {
             0
         };
-        let room = sink.frame_cap - frame_len - reason_len;
+        let mut room = sink.frame_cap - frame_len - reason_len;
         // A field block is cut only where the host takes a continuation: at a line's start or
         // inside a value. A name longer than the whole frame buffer is cut anyway (the host
         // refuses it by name) rather than never moving.
         let rest = &piece.bytes[piece.at..];
-        let take = if piece.fields {
-            match field_cut(rest, room, piece.continued) {
-                0 if frame_len + reason_len == 0 => rest.len().min(room),
-                cut => cut,
-            }
-        } else {
-            rest.len().min(room)
-        };
+        let mut take = take_of(piece, rest, room, frame_len + reason_len == 0);
+        // A phrase that leaves no room for a cut of the head, in an answer with nothing else in it,
+        // would stall the head for ever (the host re-calls with the same buffer): the head goes
+        // without it.
+        if take == 0 && reason_len > 0 && frame_len == 0 && piece.fields && !rest.is_empty() {
+            with_reason = false;
+            reason_len = 0;
+            room = sink.frame_cap;
+            take = take_of(piece, rest, room, true);
+        }
         if take == 0 && !rest.is_empty() {
             break;
         }

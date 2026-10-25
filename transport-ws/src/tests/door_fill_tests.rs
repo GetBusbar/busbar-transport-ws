@@ -19,52 +19,64 @@ fn sink(frame: &mut [u8], pieces: &mut [FramePiece], heads: &mut [HeadSlots]) ->
     s
 }
 
-/// A DIALLED HEAD'S REASON GOES ONLY WITH ITS HEAD'S FIRST PIECE (Q128 transport-ws LOW, reader
-/// r52 on 3286006; HEAD-FIELDS): an answer with room for the phrase but not for any of the piece
-/// beside it hands up neither, and the phrase goes out with the piece in the next answer. RED
-/// before the fix: the phrase's slot went alone in the first answer, and the host dropped it.
+/// A DIALLED HEAD'S REASON GOES ONLY WITH ITS HEAD'S FIRST PIECE, AND NEVER STALLS IT (Q128
+/// transport-ws LOW, reader r52 on 3286006; codeaudit g2 MEDIUM; HEAD-FIELDS). The host re-calls
+/// `YIELD_MORE` with the same frame buffer, so an EMPTY answer that waited for room beside the
+/// phrase would wait for ever: there the head goes WITHOUT its phrase, and the phrase never goes
+/// out alone. Where the answer is not empty (another piece took room ahead of the head) the phrase
+/// waits, and the next answer carries both. With room for both, the phrase rides beside the head's
+/// first piece. RED before the fix: the first answer was 0 pieces with the head still waiting.
 #[test]
 fn a_reason_rides_only_beside_its_heads_first_piece() {
+    let head = |reason: &[u8]| {
+        let mut head = Piece::plain(0, b"x-a: 1\r\n".to_vec(), true);
+        head.fields = true;
+        head.reason = Some(reason.to_vec());
+        head
+    };
+    let run = |owed: &mut Owed, cap: usize| {
+        let (mut frame, mut pieces, mut heads) = (
+            vec![0_u8; cap],
+            unsafe { std::mem::zeroed::<[FramePiece; 4]>() },
+            [HeadSlots::default(); 2],
+        );
+        // SAFETY: plain C data; all-zero is valid.
+        let mut o: DoorOut = unsafe { std::mem::zeroed() };
+        fill(owed, &sink(&mut frame, &mut pieces, &mut heads), &mut o);
+        let phrase = (o.yielded.heads_len > 0).then(|| {
+            let r = heads[0].reason;
+            frame[r.offset as usize..(r.offset + r.len) as usize].to_vec()
+        });
+        (o.yielded.pieces_len, o.yielded.heads_len, phrase)
+    };
+
+    // (a) Room for the phrase (12 bytes) and one byte more, in an empty answer: no cut of the field
+    // block fits beside it, so the head goes without it.
     let mut owed = Owed::default();
-    let mut head = Piece::plain(0, b"x-a: 1\r\n".to_vec(), true);
-    head.fields = true;
-    head.reason = Some(b"Unauthorized".to_vec());
-    owed.pieces.push_back(head);
-    // Room for the phrase (12 bytes) and one byte more: no cut of the field block fits beside it.
-    let (mut frame, mut pieces, mut heads) = (
-        [0_u8; 13],
-        unsafe { std::mem::zeroed::<[FramePiece; 4]>() },
-        [HeadSlots::default(); 2],
-    );
-    // SAFETY: plain C data; all-zero is valid.
-    let mut o: DoorOut = unsafe { std::mem::zeroed() };
-    fill(
-        &mut owed,
-        &sink(&mut frame, &mut pieces, &mut heads),
-        &mut o,
-    );
-    assert_eq!((o.yielded.heads_len, o.yielded.pieces_len), (0, 0));
-    assert!(
-        owed.pieces[0].reason.is_some(),
-        "the phrase waits for its piece"
-    );
-    let (mut frame, mut pieces, mut heads) = (
-        [0_u8; 64],
-        unsafe { std::mem::zeroed::<[FramePiece; 4]>() },
-        [HeadSlots::default(); 2],
-    );
-    let mut o: DoorOut = unsafe { std::mem::zeroed() };
-    fill(
-        &mut owed,
-        &sink(&mut frame, &mut pieces, &mut heads),
-        &mut o,
-    );
-    assert_eq!((o.yielded.heads_len, o.yielded.pieces_len), (1, 1));
-    let r = heads[0].reason;
-    assert_eq!(
-        &frame[r.offset as usize..(r.offset + r.len) as usize],
-        b"Unauthorized"
-    );
+    owed.pieces.push_back(head(b"Unauthorized"));
+    let (pieces, heads, _) = run(&mut owed, 13);
+    assert!(pieces >= 1, "the head moves");
+    assert_eq!(heads, 0, "without its phrase, which never goes out alone");
+
+    // (b) Another piece took room ahead of the head: nothing of the head fits beside the phrase in
+    // this answer, so both wait, and the next (empty) answer carries them together.
+    let mut owed = Owed::default();
+    owed.pieces
+        .push_back(Piece::plain(1, b"0123456789".to_vec(), true));
+    owed.pieces.push_back(head(b"Unauthorized"));
+    let (pieces, heads, _) = run(&mut owed, 24);
+    assert_eq!((pieces, heads), (1, 0), "only the first piece went");
+    assert!(owed.pieces[0].reason.is_some(), "the phrase waits");
+    let (pieces, heads, phrase) = run(&mut owed, 24);
+    assert_eq!((pieces, heads), (1, 1));
+    assert_eq!(phrase.as_deref(), Some(&b"Unauthorized"[..]));
+
+    // (c) Room for both: the phrase rides beside the head's first piece.
+    let mut owed = Owed::default();
+    owed.pieces.push_back(head(b"Unauthorized"));
+    let (pieces, heads, phrase) = run(&mut owed, 64);
+    assert_eq!((pieces, heads), (1, 1));
+    assert_eq!(phrase.as_deref(), Some(&b"Unauthorized"[..]));
 }
 
 /// A FRAMING WHOSE OP PANICKED IS GONE ONCE IT IS FINISHED (Q128 transport-ws LOW, reader r52 on
