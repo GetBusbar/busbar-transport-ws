@@ -261,6 +261,7 @@ checks:
     run: |
       exec bash -c "$PLUGIN_CI" plugin-ci linux
   conformance:
+    env_from_run: [MODERNCI_COMMIT, MODERNCI_FROM, MODERNCI_REPO]
     priority: low
     requires: [cc, git, curl, docker, python3-venv]
     run: |
