@@ -41,7 +41,7 @@ mode="${1:---selftest}"
 # THE SUBJECT'S BUILD TREE. The subject crate is not a workspace member and mounts busbar's doors.rs by
 # path, so it is built from a tree written at run time (scripts/subject-manifest.sh) against busbar at
 # $BUSBAR_CHECKOUT (the .busbar-ref pin). $WS_SUBJECT_MANIFEST overrides; the tree is built once.
-TARGET_DIR="${CARGO_TARGET_DIR:-$REPO_ROOT/target}"
+TARGET_DIR="${CARGO_TARGET_DIR:-$REPO_ROOT/target}"; export CARGO_TARGET_DIR="$TARGET_DIR"
 subject_manifest() {
   if [ -z "${WS_SUBJECT_MANIFEST:-}" ]; then
     WS_SUBJECT_MANIFEST="$("$ROOT/scripts/subject-manifest.sh" "$(mktemp -d "${TMPDIR:-/tmp}/ws-subject.XXXXXX")")" || return 1
