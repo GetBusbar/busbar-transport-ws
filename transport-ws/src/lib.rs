@@ -51,6 +51,10 @@ pub mod linked {
 #[path = "tests/framer_tests.rs"]
 mod framer_tests;
 
+#[cfg(test)]
+#[path = "tests/utf8_fail_fast_tests.rs"]
+mod utf8_fail_fast_tests;
+
 // THE FAULT EDGES, with the counting allocator their per-message witness reads (a thread-local
 // count, so the other tests of this binary do not move it). A unit module, so the framer stays
 // the crate's own (its one public entry is its door).

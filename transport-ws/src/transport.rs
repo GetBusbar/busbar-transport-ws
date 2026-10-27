@@ -82,6 +82,114 @@ pub(crate) struct Pipe {
     /// harness's seed (`test-seeded`), which unmasks a dialled end's frames.
     #[cfg_attr(not(feature = "test-seeded"), allow(dead_code))]
     client: bool,
+    /// The open session's text payload as it arrives, judged at the first invalid byte
+    /// ([`TextScan`]); `None` until a session that began at a frame boundary is open.
+    scan: Option<TextScan>,
+}
+
+/// RFC 6455 section 8.1 fails a text message at its first invalid UTF-8 byte, mid-frame (Autobahn
+/// 6.4.3, 6.4.4). The protocol library judges a frame only as it completes, so this reads the bytes
+/// the session ingests: frame headers by the library's own parser, text payload bytes through
+/// `Utf8Error::error_len` (`None` = an incomplete tail, carried to the next bytes; `Some` = invalid).
+/// It only ever fails EARLIER than the library would; anything it cannot follow switches it off and
+/// the library alone judges.
+#[derive(Default)]
+struct TextScan {
+    /// Header bytes of the frame being read (at most 14), and how many.
+    head: [u8; 14],
+    head_len: usize,
+    /// The payload bytes still to come, the mask, and the next payload byte's index.
+    left: u64,
+    mask: Option<[u8; 4]>,
+    at: usize,
+    /// Whether the current frame's payload is text (and its message is).
+    text: bool,
+    /// Whether the current message (across fragments) is text, and the frame is its last.
+    in_text: bool,
+    fin: bool,
+    /// The incomplete UTF-8 sequence ending the text read so far (at most 3 bytes), and its length.
+    tail: [u8; 3],
+    tail_len: usize,
+    /// An invalid byte was read.
+    bad: bool,
+    /// Switched off: a header the scan cannot follow.
+    off: bool,
+}
+
+impl TextScan {
+    fn feed(&mut self, mut bytes: &[u8]) {
+        use tungstenite::protocol::frame::coding::{Data, OpCode};
+        use tungstenite::protocol::frame::FrameHeader;
+        while !(self.bad || self.off) && !bytes.is_empty() {
+            if self.left == 0 {
+                // A header: collect until the library's parser has all of it.
+                self.head[self.head_len] = bytes[0];
+                self.head_len += 1;
+                bytes = &bytes[1..];
+                match FrameHeader::parse(&mut std::io::Cursor::new(&self.head[..self.head_len])) {
+                    Ok(None) => continue,
+                    Ok(Some((header, len))) => {
+                        // A fragmented message's kind is its first fragment's; a control frame
+                        // between fragments carries no text.
+                        match header.opcode {
+                            OpCode::Data(Data::Text) => self.in_text = true,
+                            OpCode::Data(Data::Continue) => {}
+                            _ => {
+                                self.in_text =
+                                    self.in_text && !matches!(header.opcode, OpCode::Data(_))
+                            }
+                        }
+                        self.text = self.in_text && matches!(header.opcode, OpCode::Data(_));
+                        self.fin = header.is_final;
+                        self.left = len;
+                        self.mask = header.mask;
+                        self.at = 0;
+                        self.head_len = 0;
+                    }
+                    Err(_) => self.off = true,
+                }
+            } else {
+                let n = usize::try_from(self.left)
+                    .unwrap_or(usize::MAX)
+                    .min(bytes.len());
+                if self.text {
+                    self.read_text(&bytes[..n]);
+                }
+                self.left -= n as u64;
+                bytes = &bytes[n..];
+            }
+            // A text message that ends inside a sequence is invalid too.
+            if self.left == 0 && self.text && self.fin {
+                self.bad |= self.tail_len != 0;
+                self.in_text = false;
+            }
+        }
+    }
+
+    /// Judge `payload` (masked as the frame is) after the incomplete tail, in stack-sized chunks.
+    fn read_text(&mut self, payload: &[u8]) {
+        for chunk in payload.chunks(64) {
+            let mut buf = [0u8; 67];
+            buf[..self.tail_len].copy_from_slice(&self.tail[..self.tail_len]);
+            let mut n = self.tail_len;
+            for (k, b) in chunk.iter().enumerate() {
+                buf[n] = self.mask.map_or(*b, |m| b ^ m[(self.at + k) % 4]);
+                n += 1;
+            }
+            self.at += chunk.len();
+            match std::str::from_utf8(&buf[..n]) {
+                Ok(_) => self.tail_len = 0,
+                Err(e) if e.error_len().is_none() => {
+                    self.tail_len = n - e.valid_up_to();
+                    self.tail[..self.tail_len].copy_from_slice(&buf[e.valid_up_to()..n]);
+                }
+                Err(_) => {
+                    self.bad = true;
+                    return;
+                }
+            }
+        }
+    }
 }
 
 impl Read for Pipe {
@@ -1304,6 +1412,11 @@ impl WsFramer {
                 },
             }
         }
+        // Text that turned invalid before its frame completed fails the connection now (RFC 6455
+        // section 8.1), as the library fails it when the frame does.
+        if failed.is_none() && ws.get_ref().scan.as_ref().is_some_and(|scan| scan.bad) {
+            *failed = Some(CloseCode::Invalid);
+        }
         if failed.is_some() {
             ended = true;
         }
@@ -1632,6 +1745,11 @@ impl Framer for WsFramer {
         let pipe = phase.pipe();
         pipe.inbound.extend(bytes);
         pipe.ended |= end;
+        let was_open = matches!(phase, Phase::Open { .. });
+        let pipe = phase.pipe();
+        if let Some(scan) = pipe.scan.as_mut().filter(|_| was_open) {
+            scan.feed(bytes);
+        }
         // Only a dialled head is read back off what the handshake saw (its reason phrase, a
         // refusal's body); an accepting handshake keeps no copy.
         if dialling {
@@ -1639,6 +1757,12 @@ impl Framer for WsFramer {
         }
         match Self::drive(phase, out) {
             Ok((mut phase, ended, reason)) => {
+                // A session whose handshake ended exactly at this call's last byte starts at a
+                // frame boundary, so the text scan can follow its frames from the next call on.
+                if !was_open && matches!(phase, Phase::Open { .. }) && bytes.ends_with(b"\r\n\r\n")
+                {
+                    phase.pipe().scan = Some(TextScan::default());
+                }
                 if let Some(reason) = reason {
                     self.reasons
                         .lock()
