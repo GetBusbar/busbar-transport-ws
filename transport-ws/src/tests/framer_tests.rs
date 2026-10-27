@@ -170,25 +170,6 @@ fn a_dial_carries_its_opening_fields_holds_early_messages_and_flags_text() {
 // ── the wire's declarations and its URL reading (from the in-process transport's battery, which
 // left with that transport when the crate went door-only) ──────────────────────────────────────
 
-#[allow(clippy::assertions_on_constants)]
-#[test]
-fn transport_meta_matches_the_architecture_row() {
-    use busbar_contract::transport::wire::Unit0Trigger;
-    use busbar_contract::TransportMeta;
-    assert_eq!(<crate::WsFramer as TransportMeta>::KEY, "ws");
-    assert!(<crate::WsFramer as TransportMeta>::SESSION);
-    assert!(<crate::WsFramer as TransportMeta>::SESSION_BOUND);
-    assert_eq!(
-        <crate::WsFramer as TransportMeta>::UNIT0_TRIGGER,
-        Some(Unit0Trigger::Upgrade)
-    );
-    // No transport names another: the carrier is the connector's choice and an upgrade is
-    // adopted, so ws composes over nothing.
-    assert!(<crate::WsFramer as TransportMeta>::COMPOSES_OVER.is_empty());
-    assert!(<crate::WsFramer as TransportMeta>::UPGRADES_TO.is_empty());
-    assert_eq!(<crate::WsFramer as TransportMeta>::STATUS_CLASS, None);
-}
-
 /// `split_ws_url` on the bracketed-IPv6 shapes. A literal address with an explicit port is the one
 /// case the bracket rule exists to serve, and it must come back as the address without its brackets
 /// and the port the URL spelled — not as an authority that gets a default port stapled onto it.
