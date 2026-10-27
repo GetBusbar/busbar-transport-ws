@@ -91,7 +91,7 @@ impl Host {
     fn with_settings(settings: &[u8]) -> Self {
         let d = busbar_transport_ws::door::door();
         // SAFETY: the door's `'static` table.
-        let ops: &'static Ops = unsafe { &*(*d).ops.cast::<Ops>() };
+        let ops: &'static Ops = unsafe { &*(*d).ops().cast::<Ops>() };
         let mut i: OpenIn = z();
         i.settings = busbar_contract::abi::mechanism::call::Blob {
             ptr: settings.as_ptr(),
@@ -926,7 +926,7 @@ fn validate_refuses_a_non_numeric_ceiling() {
     use busbar_contract::abi::mechanism::lifecycle::ValidateIn;
     let d = busbar_transport_ws::door::door();
     // SAFETY: the door's `'static` table.
-    let ops: &'static Ops = unsafe { &*(*d).ops.cast::<Ops>() };
+    let ops: &'static Ops = unsafe { &*(*d).ops().cast::<Ops>() };
     for (settings, want) in [
         (
             &br#"{"limits.request_body_max_bytes": "lots"}"#[..],
