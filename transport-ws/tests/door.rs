@@ -549,7 +549,7 @@ fn an_upgrade_answered_with_no_field_left_is_an_empty_head() {
 fn linked() -> &'static Ops {
     let d = busbar_transport_ws::door::door();
     // SAFETY: the door's `'static` table.
-    unsafe { &*(*d).ops.cast::<Ops>() }
+    unsafe { &*(*d).ops().cast::<Ops>() }
 }
 
 #[test]
