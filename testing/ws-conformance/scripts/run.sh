@@ -38,6 +38,17 @@ REPORTS_DIR="$ROOT/reports"
 
 mode="${1:---selftest}"
 
+# THE SUBJECT'S BUILD TREE. The subject crate is not a workspace member and mounts busbar's doors.rs by
+# path, so it is built from a tree written at run time (scripts/subject-manifest.sh) against busbar at
+# $BUSBAR_CHECKOUT (the .busbar-ref pin). $WS_SUBJECT_MANIFEST overrides; the tree is built once.
+TARGET_DIR="${CARGO_TARGET_DIR:-$REPO_ROOT/target}"; export CARGO_TARGET_DIR="$TARGET_DIR"
+subject_manifest() {
+  if [ -z "${WS_SUBJECT_MANIFEST:-}" ]; then
+    WS_SUBJECT_MANIFEST="$("$ROOT/scripts/subject-manifest.sh" "$(mktemp -d "${TMPDIR:-/tmp}/ws-subject.XXXXXX")")" || return 1
+  fi
+  echo "$WS_SUBJECT_MANIFEST"
+}
+
 selftest() {
   echo "== parser selftest =="
   node "$PARSER" --selftest
@@ -84,8 +95,8 @@ selftest() {
 }
 
 subject_arm() {
-  if cargo build --manifest-path "$REPO_ROOT/Cargo.toml" -p ws-conformance-subject; then
-    if [ -x "$REPO_ROOT/target/debug/ws-conformance-subject" ]; then
+  if cargo build --manifest-path "$(subject_manifest)" -p ws-conformance-subject; then
+    if [ -x "$TARGET_DIR/debug/ws-conformance-subject" ]; then
       echo "  ok: ws-conformance-subject built (ARMED)"
       return 0
     fi
@@ -129,8 +140,8 @@ case "$mode" in
     # THE KNOWN PEER: ws-conformance-reference (subject/src/reference.rs), a strict RFC 6455 echo
     # server on the standard library alone: no busbar crate and no WebSocket library, so it shares
     # nothing with the framer the subject leg grades. Release, as the subject is built.
-    cargo build --release --manifest-path "$REPO_ROOT/Cargo.toml" -p ws-conformance-subject --bin ws-conformance-reference
-    log="$(mktemp)"; "$REPO_ROOT/target/release/ws-conformance-reference" >"$log" 2>&1 & pid=$!
+    cargo build --release --manifest-path "$(subject_manifest)" -p ws-conformance-subject --bin ws-conformance-reference
+    log="$(mktemp)"; "$TARGET_DIR/release/ws-conformance-reference" >"$log" 2>&1 & pid=$!
     port=""
     for _ in $(seq 1 100); do port="$(sed -n 's/^REFERENCE_PORT=//p' "$log")"; [ -n "$port" ] && break; sleep 0.1; done
     [ -n "$port" ] || { echo "reference echo server never printed REFERENCE_PORT" >&2; cat "$log" >&2; kill "$pid" 2>/dev/null; exit 1; }
@@ -180,8 +191,8 @@ case "$mode" in
     # RELEASE, as busbar ships: the door runs under the dispatcher's watchdog (1 s per crossing), and
     # an unoptimised framer unmasking Autobahn's 16 MiB messages (case 9.1.6) overruns it, which
     # faults the door for every later connection — a statement about a debug build nobody ships.
-    cargo build --release --manifest-path "$REPO_ROOT/Cargo.toml" -p ws-conformance-subject
-    bin="$REPO_ROOT/target/release/ws-conformance-subject"
+    cargo build --release --manifest-path "$(subject_manifest)" -p ws-conformance-subject
+    bin="$TARGET_DIR/release/ws-conformance-subject"
     armed=false
     port=""
     if [ -x "$bin" ]; then
