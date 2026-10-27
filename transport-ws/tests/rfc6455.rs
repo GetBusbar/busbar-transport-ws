@@ -611,12 +611,12 @@ fn a_violation_alone_ends_the_frames_and_closes_with_1002() {
 // ── 4. TEXT THAT IS NOT UTF-8 FAILS THE CONNECTION ───────────────────────────────────────────────
 
 /// Autobahn 6.4.3/6.4.4: one text frame sent in chops, an inner chop making it invalid (F4 90 80
-/// 80 is past U+10FFFF). The protocol library judges the text as the frame completes (THE DESIGN §2
-/// "Libraries": ONE protocol = ONE library, so no in-tree frame parser reads it sooner), Autobahn's
-/// NON-STRICT outcome: the connection fails with 1007 when the frame's last chop arrives, and no
-/// frame of the bad text is handed up.
+/// 80 is past U+10FFFF). RFC 6455 section 8.1: the connection fails with 1007 on the chop that
+/// carries the first invalid byte (F4 then 90), not when the frame completes, and no frame of the
+/// bad text is handed up. (The protocol library alone judges a frame only as it completes, so the
+/// framer reads the text payload as it arrives; see `TextScan`.)
 #[test]
-fn invalid_utf8_inside_one_frame_fails_the_connection_when_the_frame_completes() {
+fn invalid_utf8_inside_one_frame_fails_the_connection_at_the_bad_byte() {
     let part1 = "κόσμε".as_bytes();
     let part2: &[u8] = &[0xf4, 0x90, 0x80, 0x80];
     let part3: &[u8] = b"edited";
@@ -628,23 +628,26 @@ fn invalid_utf8_inside_one_frame_fails_the_connection_when_the_frame_completes()
     let (a, rest) = frame.split_at(header + part1.len());
     let (b, c) = rest.split_at(part2.len());
     let (b1, b2) = b.split_at(2);
-    for (case, chops) in [("6.4.3", vec![a, b, c]), ("6.4.4", vec![a, b1, b2, c])] {
+    // The chop on which the connection must fail: 6.4.3 holds the whole bad sequence, 6.4.4 splits
+    // it after F4 90, whose second byte is already invalid.
+    for (case, chops, fails_at) in [
+        ("6.4.3", vec![a, b, c], 1),
+        ("6.4.4", vec![a, b1, b2, c], 1),
+    ] {
         let mut h = Host::new();
         let f = h.accept();
-        let (last, early) = chops.split_last().expect("chops");
-        for chop in early {
+        for (k, chop) in chops.iter().enumerate() {
             let heard = h.ingest(f, chop);
-            assert!(heard.frames.is_empty(), "{case}: no frame of the text yet");
+            assert!(
+                heard.frames.is_empty(),
+                "{case}: the bad text is never handed up"
+            );
+            assert_eq!(
+                heard.stream_end && heard.ended && heard.failed,
+                k == fails_at,
+                "{case}: chop {k}: the connection fails at the bad byte, not before or after"
+            );
         }
-        let done = h.ingest(f, last);
-        assert!(
-            done.frames.is_empty(),
-            "{case}: the bad text is never handed up"
-        );
-        assert!(
-            done.stream_end && done.ended && done.failed,
-            "{case}: the completed frame fails the connection"
-        );
         let closed = h.finish(f, CLOSE_NORMAL);
         assert_eq!(
             close_code(&server_frames(&closed.wire)),
