@@ -27,7 +27,7 @@
 // `testing/verdict-covers-every-leg.py`'s docstring is about, one level down: the aggregator
 // trusted a leg that "passed" by not running.
 
-import { readFileSync, writeFileSync } from 'node:fs';
+import { readFileSync, writeFileSync, realpathSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 
 const ALLOWED_BEHAVIORS = new Set(['OK', 'INFORMATIONAL']);
@@ -227,6 +227,8 @@ function selftest() {
   return 0;
 }
 
-if (process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1]) {
+// Both sides are real paths: a checkout reached through a symlink (ModernCI's `plugin` link) must still run main,
+// not exit 0 having judged nothing.
+if (process.argv[1] && realpathSync(fileURLToPath(import.meta.url)) === realpathSync(process.argv[1])) {
   process.exit(main(process.argv.slice(2)));
 }
