@@ -1,12 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Busbar Inc and contributors
 
-//! THE FRAMER (TRANSPORT-STACK; #3, #30), as the kind's entry file (`BUSBAR-1.6.0.md` THE DESIGN,
-//! §2: meta, claims, and the kind-named entry): the `ws` framer the door drives (`crate::door`, the
-//! memory-ABI framer door, linked into a busbar build or exported by the sibling
-//! `busbar-transport-ws-plugin` cdylib).
+//! The `ws` framer the door drives (`crate::door`, the memory-ABI framer door, linked into a busbar
+//! build or exported by the sibling `busbar-transport-ws-plugin` cdylib).
 //!
-//! SANS-IO. The framer holds no socket, no waker and no clock: core hands it the bytes the carrier
+//! Sans-IO. The framer holds no socket, no waker and no clock: core hands it the bytes the carrier
 //! read and sends the bytes it answers. Each framing state is the WebSocket protocol machine over an
 //! in-memory [`Pipe`] — what arrived waits in the pipe until the machine consumes it, what the
 //! machine writes collects in the pipe until the call hands it to core — so the handshake and every
@@ -23,8 +21,8 @@
 //!   written before the handshake completes is held and goes out, in order, the moment it does.
 //! * A DIALLED connection's head yields its reason phrase as the far end sent it (HTTP/1), for the
 //!   door's head slots ([`WsFramer::take_reason`]).
-//! * A DIALLED connection's switching-protocols response is the far end's ANSWER (HEAD-FIELDS: a
-//!   transport always hands the response head up as the stream's first fields frame): the moment
+//! * A DIALLED connection's switching-protocols response is the far end's ANSWER (a transport
+//!   always hands the response head up as the stream's first fields frame): the moment
 //!   it completes the handshake it is handed up as ONE frame carrying its status (`101`, a
 //!   success) and its field block ([`head_block`]), ahead of any message, so a far end that has
 //!   answered the upgrade and not yet sent a message has answered. It is the only frame this framer
@@ -37,8 +35,8 @@
 //!   still answer what it was handed, and the close then carries the failure's code (1002 a
 //!   protocol error, 1007 a text payload that is not UTF-8, 1009 a message over the ceiling).
 //!   The protocol machine judges every frame, text UTF-8 included (as each frame completes); this
-//!   framer parses no WebSocket frame of its own (THE DESIGN §2 "Libraries": ONE protocol = ONE
-//!   library, the `tungstenite` family).
+//!   framer parses no WebSocket frame of its own (one protocol, one library: the `tungstenite`
+//!   family).
 //! * The message ceiling is the deployment's body cap, for a whole message and for a single frame.
 //!
 //! The upgrade INTO this framer is [`WsFramer::adopt`]: another framer gave up the stream with the
@@ -377,14 +375,13 @@ fn read_error(e: &WsError) -> TransportError {
 /// The upgrade request's own fields, which the handshake writes itself: an opening field of one of
 /// these names is not copied onto it.
 ///
-/// THE ORDER OF THE DIALLED HEAD, as it is written (tungstenite 0.29 `generate_request`): the
+/// The order of the dialled head, as it is written (tungstenite 0.29 `generate_request`): the
 /// request line, then the protocol machine's handshake lines (`Host` from the dialled URL,
 /// `Connection`, `Upgrade`, `Sec-WebSocket-Version`, `Sec-WebSocket-Key`), then the plane's
 /// opening fields in the request map's own iteration order (`http::HeaderMap`, which does not keep
 /// the order the fields were added in), a repeated name's lines together and in their own order;
 /// the binding's auth fields arrive among the opening fields (the kernel makes the one outbound
-/// auth call before `begin`). 1.5.5 dialled no WebSocket at all, so this head has no 1.5.5 order
-/// to keep, and the handshake lines lead because the machine writes them
+/// auth call before `begin`). The handshake lines lead because the machine writes them
 /// (`framer_tests::the_dialled_heads_order_is_pinned` pins it). An opening field of a handshake
 /// name is the machine's to write, so it is not copied.
 const HANDSHAKE_FIELDS: &[&str] = &[
@@ -401,7 +398,7 @@ fn rides_upgrade(name: &str) -> bool {
     !HANDSHAKE_FIELDS.contains(&lower.as_str()) && !lower.starts_with("sec-websocket-")
 }
 
-/// THE ANSWER'S HEAD as a field block (`busbar_contract::abi::transport::fields`): the switching
+/// The answer's head as a field block (`busbar_contract::abi::transport::fields`): the switching
 /// response's fields as the parsed head holds them (`HeaderMap`: names in the order they first
 /// appear, a repeated name's values together under its first appearance, in their own order), names
 /// lower-case, each value on its own line. Hop-by-hop fields (and every field a `connection` field names) never enter it, nor do
@@ -439,7 +436,7 @@ fn message_of(bytes: Bytes, text: bool) -> Result<Message, WsError> {
     }
 }
 
-/// THE STATUS CLASS of a far end's answer to the upgrade, by its HTTP status.
+/// The status class of a far end's answer to the upgrade, by its HTTP status.
 fn status_class(code: u16) -> WireStatusClass {
     match code {
         200..=299 => WireStatusClass::Success,
@@ -691,8 +688,8 @@ fn answered_body(
     (phase, ended)
 }
 
-/// THE CLOSE CODE A REFUSAL'S NEUTRAL STATUS MAPS TO (the plane seam: a neutral status the transport
-/// maps to its wire; RFC 6455 §7.4.1): the caller's credential refused or a policy, `1008`; too
+/// The close code a refusal's neutral status maps to (a neutral status the transport maps to its
+/// wire; RFC 6455 §7.4.1): the caller's credential refused or a policy, `1008`; too
 /// big, `1009`; throttled or unavailable, `1013` (try again later); another server failure, `1011`;
 /// none stated (`0`) or any other, the orderly `1000`.
 pub(crate) fn close_code_of_status(status: u32) -> CloseCode {
@@ -720,7 +717,7 @@ fn drain(phase: &mut Phase, out: &mut dyn FramerOut) {
     }
 }
 
-/// THE TEST HARNESS'S SEED (`test-seeded`, a dev-dependency feature the published conformance
+/// The test harness's seed (`test-seeded`, a dev-dependency feature the published conformance
 /// suite builds with; never in a shipped build, where the handshake key and every frame's mask stay
 /// random as RFC 6455 section 5.3 requires): a dial's handshake key is fixed, and a dialled end's
 /// frames carry the all-zero mask, so the bytes a scripted dial writes are the same every run.
@@ -923,7 +920,7 @@ impl WsFramer {
         Self::with_open(guard.as_mut(), out, |ws, message| {
             // The ceiling this framing began under, which its machine holds (`None` = none).
             let max = ws.get_config().max_message_size.unwrap_or(0);
-            // THE CEILING, OUTBOUND TOO: the machine bounds only what it reads, so a message this
+            // The ceiling applies outbound too: the machine bounds only what it reads, so a message this
             // end writes is held to the same ceiling here, as a held one is above (a capacity
             // failure), and its gathered pieces are dropped.
             let size = message.len().saturating_add(bytes.len());
@@ -1106,8 +1103,8 @@ impl WsFramer {
             phase => phase,
         };
         let shaking = !matches!(phase, Phase::Open { .. });
-        // THE DIALLED HEAD'S REASON PHRASE (HEAD-FIELDS: the dialled side fills `reason`, as the
-        // far end sent it), read off the status line before the machine takes the head.
+        // The dialled head's reason phrase (the dialled side fills `reason`, as the far end sent
+        // it), read off the status line before the machine takes the head.
         // What the dial's handshake has seen, and whether the carrier ended: a refusal's body is
         // read from here, every byte past the head (the machine reads the wire in chunks and keeps
         // what it read; what it did not read is still here).
@@ -1158,7 +1155,7 @@ impl WsFramer {
                 max,
             } => match mid.handshake() {
                 Ok((mut ws, response)) => {
-                    // THE FAR END ANSWERED (HEAD-FIELDS): its switching response is the stream's
+                    // The far end answered: its switching response is the stream's
                     // head, handed up before anything else, with its status and its field block.
                     // A far end that answered the upgrade and sends nothing more has answered.
                     let block = head_block(response.headers());
@@ -1187,8 +1184,8 @@ impl WsFramer {
                         None,
                     ))
                 }
-                // THE FAR END REFUSED THE UPGRADE (HEAD-FIELDS: the head is always the first
-                // fields piece): its answer is handed up as ONE head with its status, its class and
+                // The far end refused the upgrade (the head is always the first fields piece): its
+                // answer is handed up as ONE head with its status, its class and
                 // its fields, then its body (a far end's error document), and the frames end, so the
                 // breaker reads what it answered and the plane sees what it said. The body is every
                 // byte past the head (what came with it, then what still arrives) up to its declared
@@ -1430,7 +1427,7 @@ impl Default for WsFramer {
     }
 }
 
-/// THE FRAMER'S OPS, as the door calls them (`door`): every op answers at once, and nothing here
+/// The framer's ops, as the door calls them (`door`): every op answers at once, and nothing here
 /// reads a socket or a clock.
 impl WsFramer {
     /// A `ws://` target is reached at its `host:port`; a `wss://` one asks for its bytes to be
