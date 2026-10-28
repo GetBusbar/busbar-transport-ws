@@ -7,8 +7,8 @@
 //! moment it does; a message the emit states text (`EMIT_TEXT`) goes out as a text message, any
 //! other as binary.
 
+use crate::frame::{Framed, FramerOut, HostTime, Side};
 use busbar_contract::transport::wire::WireStatusClass;
-use busbar_contract::transport::{ConnFacts, Framed, Framer, FramerOut, HostTime, Side};
 use tungstenite::handshake::derive_accept_key;
 
 use crate::transport::{reason_phrase, retry_after};
@@ -41,7 +41,6 @@ impl FramerOut for Out {
     fn now(&self) -> HostTime {
         HostTime::default()
     }
-    fn wake_at(&mut self, _: Option<u64>) {}
 }
 
 /// The upgrade request's field `name` (case-insensitive), each value it carries.
@@ -908,7 +907,7 @@ fn nothing_is_kept_after_the_peers_close() {
     let framer = WsFramer::new(0);
     let mut out = Out::default();
     let state = framer
-        .open(Side::Accept, "", &ConnFacts::default(), &mut out)
+        .open(Side::Accept, "", &mut out)
         .expect("an accepted framing opens");
     framer
         .ingest(state, upgrade, false, &mut out)

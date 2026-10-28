@@ -7,9 +7,9 @@
 //! the ingest that carries the first definitely-invalid byte, while a code point split validly
 //! across fragments or chops is still accepted.
 
-use busbar_contract::transport::{
-    CloseReason, ConnFacts, Framed, Framer, FramerOut, HostTime, Side,
-};
+use busbar_contract::transport::wire::CloseReason;
+
+use crate::frame::{Framed, FramerOut, HostTime, Side};
 
 use crate::WsFramer;
 
@@ -37,7 +37,6 @@ impl FramerOut for Out {
     fn now(&self) -> HostTime {
         HostTime::default()
     }
-    fn wake_at(&mut self, _: Option<u64>) {}
 }
 
 /// A masked client frame.
@@ -58,9 +57,7 @@ fn client(fin: bool, opcode: u8, payload: &[u8]) -> Vec<u8> {
 
 fn open(framer: &WsFramer) -> u64 {
     let mut out = Out::default();
-    let state = framer
-        .open(Side::Accept, "", &ConnFacts::default(), &mut out)
-        .expect("opens");
+    let state = framer.open(Side::Accept, "", &mut out).expect("opens");
     framer
         .ingest(state, UPGRADE, false, &mut out)
         .expect("the upgrade is answered");
