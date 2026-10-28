@@ -16,8 +16,15 @@ dir="${1:?usage: subject-manifest.sh <dir>}"
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")/../subject" && pwd)"
 repo="$(cd "$here/../../.." && pwd)"
 B="$(cd "$BUSBAR_CHECKOUT" && pwd)"
-tcp_rev="$(sed -n 's#^busbar-transport-tcp = { git = "https://github.com/GetBusbar/busbar-transport-tcp", rev = "\([0-9a-f]*\)".*#\1#p' "$B/Cargo.toml" | head -1)"
-[ -n "$tcp_rev" ] || { echo "subject-manifest: no busbar-transport-tcp pin in $B/Cargo.toml" >&2; exit 1; }
+# The plugin pins live in the default distribution's manifest (busbar 1.6.0-dev.1 on); before it, in
+# the root manifest.
+tcp_rev=""
+for m in "$B/dist/default/Cargo.toml" "$B/Cargo.toml"; do
+  [ -f "$m" ] || continue
+  tcp_rev="$(sed -n 's#^busbar-transport-tcp = { git = "https://github.com/GetBusbar/busbar-transport-tcp", rev = "\([0-9a-f]*\)".*#\1#p' "$m" | head -1)"
+  [ -n "$tcp_rev" ] && break
+done
+[ -n "$tcp_rev" ] || { echo "subject-manifest: no busbar-transport-tcp pin in $B/dist/default/Cargo.toml or $B/Cargo.toml" >&2; exit 1; }
 mkdir -p "$dir/src"
 cp "$here/src/"*.rs "$dir/src/"
 sed -i.bak "s#\"../../../../crates/busbar/src/root/doors.rs\"#\"$B/crates/busbar/src/root/doors.rs\"#" "$dir/src/main.rs"

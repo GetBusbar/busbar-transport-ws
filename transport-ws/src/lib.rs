@@ -22,6 +22,7 @@
 #![deny(missing_docs)]
 
 mod claims;
+mod frame;
 mod transport;
 // THE ABI BOUNDARY: the door reads and writes the host's C buffers, so it is one of the modules
 // this crate's `#![deny(unsafe_code)]` allows; every block in it states the host buffer it relies on.
@@ -29,22 +30,18 @@ mod transport;
 pub mod door;
 mod meta;
 
-pub(crate) use transport::WsFramer;
-
 /// THE TRANSPORT AXIS ENTRY (#3, #30): what the composition root folds for this wire — its key, the
 /// layers it declares, and its door, which the root builds the wire from (the `transport-door`
 /// axis) and opens on the one connector (the `connector-door` axis). The root names none of them.
 pub mod linked {
-    use busbar_contract::transport::TransportMeta;
-
     pub use crate::door::{door, MACRO_DOOR};
 
     /// The row's registry key.
-    pub const KEY: &str = <crate::WsFramer as TransportMeta>::KEY;
+    pub const KEY: &str = crate::meta::KEY;
     /// The layers this wire declares it can be built over.
-    pub const COMPOSES_OVER: &[&str] = <crate::WsFramer as TransportMeta>::COMPOSES_OVER;
+    pub const COMPOSES_OVER: &[&str] = crate::meta::COMPOSES_OVER;
     /// Whether this wire carries sessions.
-    pub const SESSION: bool = <crate::WsFramer as TransportMeta>::SESSION;
+    pub const SESSION: bool = crate::meta::SESSION;
 }
 
 #[cfg(test)]

@@ -19,8 +19,9 @@ use std::mem::zeroed;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 
 use crate::door::{Begin, Emit, Ingest, Open};
-use crate::WsFramer;
-use busbar_contract::abi::host::service::SCHEME_PLAIN;
+use crate::frame::{Framed, FramerOut, HostTime, Side};
+use crate::meta;
+use crate::transport::WsFramer;
 use busbar_contract::abi::mechanism::call::{AbiStr, Outcome};
 use busbar_contract::abi::mechanism::lifecycle::{OpenIn, OpenOut};
 use busbar_contract::abi::sdk::door::Slot;
@@ -29,8 +30,6 @@ use busbar_contract::abi::transport::{
     BeginIn, Claim, EmitIn, FramePiece, FramerOut as DoorOut, FramerSink, IngestIn, TransportTail,
     SIDE_ACCEPT, UNIT0_UPGRADE, YIELD_MORE,
 };
-use busbar_contract::transport::{ConnFacts, Framed, Framer, FramerOut, HostTime, Side};
-use busbar_contract::TransportMeta;
 use tungstenite::protocol::Role;
 use tungstenite::{Bytes, Message, WebSocket};
 
@@ -69,16 +68,13 @@ fn ws_claims_ws_and_wss() {
 }
 
 /// RED (audit: the admitted claim row contradicts the transport's own declaration): every row the
-/// Statement admits states exactly what `TransportMeta` declares (THE DESIGN §2, "Each fact is
+/// Statement admits states exactly what `meta.rs` declares (THE DESIGN §2, "Each fact is
 /// declared once; anything derivable is derived").
 #[test]
 fn every_claim_row_states_the_declaration() {
-    const N: usize = <WsFramer as TransportMeta>::SELECTOR_FORMS.len();
-    let forms: [u8; N] = form_codes(<WsFramer as TransportMeta>::SELECTOR_FORMS);
-    let facts: Vec<&[u8]> = <WsFramer as TransportMeta>::TRANSPORT_FACTS
-        .iter()
-        .map(|f| f.as_bytes())
-        .collect();
+    const N: usize = meta::SELECTOR_FORMS.len();
+    let forms: [u8; N] = form_codes(meta::SELECTOR_FORMS);
+    let facts: Vec<&[u8]> = meta::TRANSPORT_FACTS.iter().map(|f| f.as_bytes()).collect();
     let (_, rows) = claims();
     assert!(!rows.is_empty());
     for row in rows {
@@ -97,14 +93,10 @@ fn every_claim_row_states_the_declaration() {
                 .collect()
         };
         assert_eq!(stated, facts, "transport facts");
-        assert_eq!(
-            row.session,
-            u8::from(<WsFramer as TransportMeta>::SESSION),
-            "session"
-        );
+        assert_eq!(row.session, u8::from(meta::SESSION), "session");
         assert_eq!(
             row.session_bound,
-            u8::from(<WsFramer as TransportMeta>::SESSION_BOUND),
+            u8::from(meta::SESSION_BOUND),
             "session_bound"
         );
         assert_eq!(
@@ -143,12 +135,8 @@ impl FramerOut for Out {
         self.ended = true;
     }
     fn now(&self) -> HostTime {
-        HostTime {
-            monotonic_nanos: 1,
-            unix_nanos: 1,
-        }
+        HostTime { unix_nanos: 1 }
     }
-    fn wake_at(&mut self, _: Option<u64>) {}
 }
 
 /// A client's binary message `hi`, masked with the all-zero key.
@@ -158,7 +146,7 @@ const HI: &[u8] = &[0x82, 0x82, 0, 0, 0, 0, b'h', b'i'];
 fn accepted(f: &WsFramer) -> u64 {
     let mut out = Out::default();
     let s = f
-        .open(Side::Accept, "", &ConnFacts::default(), &mut out)
+        .open(Side::Accept, "", &mut out)
         .expect("an accepted framing opens");
     f.ingest(s, UPGRADE, false, &mut out)
         .expect("the upgrade is answered");
@@ -170,7 +158,7 @@ fn accepted(f: &WsFramer) -> u64 {
 fn opening(target: &str) -> String {
     let f = WsFramer::new(0);
     let mut out = Out::default();
-    let opened = f.open(Side::Dial, target, &ConnFacts::default(), &mut out);
+    let opened = f.open(Side::Dial, target, &mut out);
     assert!(opened.is_ok(), "a dial to {target} opens: {opened:?}");
     String::from_utf8_lossy(&out.wire).into_owned()
 }
@@ -248,7 +236,7 @@ fn a_panic_in_one_framing_leaves_the_others_working() {
     let f = WsFramer::new(0);
     let a = accepted(&f);
     let b = f
-        .open(Side::Accept, "", &ConnFacts::default(), &mut Out::default())
+        .open(Side::Accept, "", &mut Out::default())
         .expect("a second framing opens");
     let mut failing = Out {
         panics: true,
@@ -288,18 +276,9 @@ struct Counting;
 
 thread_local! {
     static COUNT: Cell<Option<usize>> = const { Cell::new(None) };
-    /// While set: the size from which an allocation counts, and how many have.
-    static BIG: Cell<Option<(usize, usize)>> = const { Cell::new(None) };
 }
 
-fn bump(size: usize) {
-    let _ = BIG.try_with(|b| {
-        if let Some((at, n)) = b.get() {
-            if size >= at {
-                b.set(Some((at, n + 1)));
-            }
-        }
-    });
+fn bump() {
     let _ = COUNT.try_with(|c| {
         if let Some(n) = c.get() {
             c.set(Some(n + 1));
@@ -310,7 +289,7 @@ fn bump(size: usize) {
 // SAFETY: every call is `System`'s, unchanged; the counter only bumps a per-thread cell.
 unsafe impl GlobalAlloc for Counting {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        bump(layout.size());
+        bump();
         // SAFETY: the caller's layout, passed on.
         unsafe { System.alloc(layout) }
     }
@@ -319,7 +298,7 @@ unsafe impl GlobalAlloc for Counting {
         unsafe { System.dealloc(ptr, layout) }
     }
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-        bump(new_size);
+        bump();
         // SAFETY: as allocated above.
         unsafe { System.realloc(ptr, layout, new_size) }
     }
@@ -358,7 +337,6 @@ impl Host {
         };
         let mut b: BeginIn = z();
         b.side = SIDE_ACCEPT;
-        b.scheme = SCHEME_PLAIN;
         b.target = AbiStr {
             ptr: std::ptr::null(),
             len: 0,
@@ -521,44 +499,5 @@ fn a_steady_framing_adds_no_allocation_of_its_own_per_message() {
     assert!(
         outbound <= crossing + library_out + slack,
         "an outbound message costs {outbound} allocations; the crossing {crossing} and the library {library_out}"
-    );
-}
-
-/// A CREDENTIAL IS VALIDATED IN PLACE (codeaudit r1 g1): signing a dial with a 4 KiB header
-/// credential makes only the allocations the request's own buffers need (four, measured: the signed
-/// request and its hand-off to the pipe and the host), and none for validating the value: copying
-/// it into a `HeaderValue` (an unwiped `Bytes`) makes a fifth.
-#[test]
-fn signing_a_dial_copies_a_credential_only_into_the_request() {
-    use crate::transport::{AuthLine, Parking};
-    use std::task::Poll;
-    use zeroize::Zeroizing;
-
-    let secret = vec![b'k'; 4096];
-    let mut once = Some(AuthLine {
-        name: "x-key".into(),
-        value: Zeroizing::new(secret.clone()),
-        query: false,
-    });
-    let mut sign =
-        |_: &crate::transport::UpgradeHead<'_>| Poll::Ready(Ok(once.take().into_iter().collect()));
-    let framer = WsFramer::new(0);
-    let mut out = Out::default();
-    let parking = Parking {
-        ticket: (7, 1),
-        deadline: 1_000,
-        now: 10,
-    };
-    BIG.with(|b| b.set(Some((secret.len(), 0))));
-    let opened = framer.open_signed(parking, "ws://svc.test:9/x", &[], &mut sign, &mut out);
-    let (_, big) = BIG.with(|b| b.replace(None)).unwrap_or((0, 0));
-    assert!(matches!(opened, Poll::Ready(Ok(_))), "the dial opens");
-    assert!(
-        out.wire.windows(secret.len()).any(|w| w == secret),
-        "the credential rides the request"
-    );
-    assert_eq!(
-        big, 4,
-        "{big} allocations of the secret's size or more; the request's own buffers make four"
     );
 }

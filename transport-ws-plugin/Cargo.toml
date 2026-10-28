@@ -23,7 +23,8 @@ busbar-contract = { workspace = true }
 [dev-dependencies]
 # The conformance test loads the linked door and dlopens the built cdylib over the REAL loader:
 # dev-only, never in the shipped artifact. Same pinned rev, so one busbar source resolves.
-busbar-plugin-loader = { workspace = true, features = ["conformance"] }
+busbar-plugin-loader = { workspace = true }
+busbar-test-kit = { workspace = true }
 # The published suite's scripted dial reads fixed bytes: the logic crate's test-only seed (a fixed
 # handshake key, all-zero masks), on for this crate's tests alone, never in the shipped cdylib.
 busbar-transport-ws = { path = "../transport-ws", features = ["test-seeded"] }

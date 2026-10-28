@@ -15,7 +15,6 @@
 use std::mem::zeroed;
 use std::sync::Arc;
 
-use busbar_contract::abi::host::service::SCHEME_PLAIN;
 use busbar_contract::abi::mechanism::call::{AbiStr, Blob, Outcome, BLOB_ABSENT};
 use busbar_contract::abi::mechanism::lifecycle::{slot as life, OpenIn, OpenOut};
 use busbar_contract::abi::mechanism::KindCode;
@@ -176,7 +175,6 @@ impl Host {
         let mut i: BeginIn = z();
         i.head = in_head();
         i.side = side;
-        i.scheme = SCHEME_PLAIN;
         i.target = AbiStr {
             ptr: target.as_ptr(),
             len: target.len(),
@@ -313,7 +311,7 @@ fn the_door_asked_for_as_another_kind_is_refused_both_ways() {
 
 // THE PUBLISHED SUITE (busbar-plugin-loader's `conformance_suite!`): both legs through the one
 // loader, every step at its pinned crossing count, over `conformance.json`.
-busbar_plugin_loader::conformance_suite! {
+busbar_test_kit::conformance_suite! {
     door: busbar_transport_ws_plugin::linked::door,
     cdylib: "busbar_transport_ws_plugin",
     inputs: include_str!("conformance.json"),

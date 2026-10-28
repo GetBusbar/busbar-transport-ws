@@ -25,21 +25,16 @@
 use std::collections::{HashMap, VecDeque};
 use std::ffi::c_void;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
-use std::task::Poll;
 
 use zeroize::Zeroize;
 
-use busbar_contract::abi::auth::{FIELD_QUERY, POINT_HEAD, POINT_HEAD_BODY, POINT_PEER};
-use busbar_contract::abi::host::service::{AuthRef, UnitRef, FLOW_CONTINUE};
 use busbar_contract::abi::mechanism::call::{AbiStr, Blob, InHead, OutHead, Outcome};
 use busbar_contract::abi::mechanism::door::{KindTailHead, Statement};
 use busbar_contract::abi::mechanism::lifecycle::{
     CancelIn, CancelOut, DriveIn, GenIn, OpenIn, OpenOut, RefreshIn, ReleaseIn, TickIn, TickOut,
     ValidateIn,
 };
-use busbar_contract::abi::mechanism::ticket::{CompletionHandle, Ticket};
 use busbar_contract::abi::sdk::door::{abi_str, statement, Slot};
-use busbar_contract::abi::sdk::services::{HeadViewArgs, Services};
 use busbar_contract::abi::sdk::transport::form_codes;
 use busbar_contract::abi::transport::{
     AcceptIn, AcceptOut, AdoptIn, ArrivalIn, ArrivalOut, BeginIn, Claim, ConnIn, ConnOut, DialIn,
@@ -51,23 +46,16 @@ use busbar_contract::abi::transport::{
     PIECE_END_OF_FRAME, PIECE_FIELDS, PIECE_HAS_CODE, PIECE_HAS_RETRY_AFTER, PIECE_STREAM_FAILED,
     PIECE_TEXT, ROLE_FRAMER, SETTING_COUNT, SIDE_ACCEPT, SIDE_DIAL, STATUS_CALLER_FAULT,
     STATUS_FAR_END_FAULT, STATUS_NONE, STATUS_OTHER, STATUS_SUCCESS, UNIT0_UPGRADE, YIELD_ENDED,
-    YIELD_HAS_DEADLINE, YIELD_MORE,
+    YIELD_MORE,
 };
 use busbar_contract::ids::StreamId;
 use busbar_contract::transport::registry::DEFAULT_REQUEST_BODY_MAX_BYTES;
-use busbar_contract::transport::wire::{
-    CloseReason, TransportError, Unit0Trigger, WireStatusClass,
-};
-use busbar_contract::transport::{
-    BytesOut, ConnFacts, Framed, Framer, FramerOut as Out, HostTime, Side,
-};
-use busbar_contract::TransportMeta;
+use busbar_contract::transport::wire::{CloseReason, TransportError, WireStatusClass};
 
-use crate::transport::{AuthLine, Parking, UpgradeHead, WsFramer};
+use crate::frame::{Framed, FramerOut as Out, HostTime, Side};
+use crate::meta;
 
-// This crate's own seal over what the binding's auth answers (`Services::auth_call`): the auth
-// fields joining a dialled head are credential material, held as this crate's own secret.
-busbar_contract::own_seal!(Own);
+use crate::transport::WsFramer;
 
 // ── the statement ────────────────────────────────────────────────────────────────────────────────
 
@@ -80,7 +68,7 @@ const NONE: AbiStr = AbiStr {
 };
 
 /// The transport's own key (`meta.rs`).
-const KEY: &str = <WsFramer as TransportMeta>::KEY;
+const KEY: &str = meta::KEY;
 
 /// The secured form of the scheme: a `wss` target is a `ws` one whose bytes the connector secures
 /// before they leave (THE DESIGN §5: "ws claims `ws` and `wss`").
@@ -107,20 +95,15 @@ const fn strs<const N: usize>(names: &[&'static str]) -> [AbiStr; N] {
     list
 }
 
-const SELECTOR_CODES: [u8; crate::claims::SELECTOR_FORMS.len()] =
-    form_codes(<WsFramer as TransportMeta>::SELECTOR_FORMS);
+const SELECTOR_CODES: [u8; crate::claims::SELECTOR_FORMS.len()] = form_codes(meta::SELECTOR_FORMS);
 const EGRESS_SELECTOR_CODES: [u8; crate::claims::EGRESS_SELECTOR_FORMS.len()] =
-    form_codes(<WsFramer as TransportMeta>::EGRESS_SELECTOR_FORMS);
-const FACT_LIST: [AbiStr; <WsFramer as TransportMeta>::TRANSPORT_FACTS.len()] =
-    strs(<WsFramer as TransportMeta>::TRANSPORT_FACTS);
+    form_codes(meta::EGRESS_SELECTOR_FORMS);
+const FACT_LIST: [AbiStr; meta::TRANSPORT_FACTS.len()] = strs(meta::TRANSPORT_FACTS);
 const FACTS: &[AbiStr] = &FACT_LIST;
 
-/// The trigger code of the declared `UNIT0_TRIGGER`: ws opens a unit at the upgrade, and the host
-/// reads its upgrade lines off this, never off a layer list (busbar ARCHITECT ruling Q128 U7).
-const UNIT0: u8 = match <WsFramer as TransportMeta>::UNIT0_TRIGGER {
-    Some(Unit0Trigger::Upgrade) => UNIT0_UPGRADE,
-    _ => panic!("ws declares its unit opening at the upgrade"),
-};
+/// ws opens a unit at the upgrade, and the host reads its upgrade lines off this, never off a
+/// layer list (busbar ARCHITECT ruling Q128 U7).
+const UNIT0: u8 = UNIT0_UPGRADE;
 
 /// The claim row, RENDERED from the transport's one declaration (`meta.rs`, `claims.rs`; THE
 /// DESIGN §2 "Each fact is declared once; anything derivable is derived"). `ws` and `wss` are one
@@ -130,11 +113,10 @@ const ROW: Claim = Claim {
     egress_selector_forms: bytes_str(&EGRESS_SELECTOR_CODES),
     facts: FACTS.as_ptr(),
     facts_len: FACTS.len(),
-    // The declaration states no status numbering and no status leg (`STATUS_NAMESPACE`,
-    // `STATUS_CLASS`): frames after the upgrade carry none.
+    // No status numbering and no status leg: frames after the upgrade carry none.
     status_namespace: NONE,
-    session: <WsFramer as TransportMeta>::SESSION as u8,
-    session_bound: <WsFramer as TransportMeta>::SESSION_BOUND as u8,
+    session: meta::SESSION as u8,
+    session_bound: meta::SESSION_BOUND as u8,
     unit0_trigger: UNIT0,
     status_at: 0,
     _reserved: 0,
@@ -142,12 +124,6 @@ const ROW: Claim = Claim {
 
 /// Each claimed scheme's row, by index into [`CLAIM_NAMES`].
 const CLAIMS: &[Claim] = &[ROW, ROW];
-
-const _: () = assert!(
-    <WsFramer as TransportMeta>::STATUS_NAMESPACE.is_none()
-        && <WsFramer as TransportMeta>::STATUS_CLASS.is_none(),
-    "the row states no status numbering and no status leg"
-);
 
 /// The message ceiling's declared default, as the Statement states it.
 const DEFAULT_BODY_MAX: &str = "33554432";
@@ -181,8 +157,8 @@ const TAIL: TransportTail = TransportTail {
     },
     role: ROLE_FRAMER,
     framing: FRAMING_STREAM,
-    // No fact: a dialled head is signed by the binding's auth over exactly the bytes sent, with
-    // nothing added after it (ruling 23, `dial_with_auth`), as every framer's is.
+    // No fact: the kernel makes the binding's one outbound auth call before `begin`, and the
+    // handshake writes its own lines (`transport::HANDSHAKE_FIELDS`) after it.
     facts: 0,
     handshake_max_steps: 0,
     frame_piece_size: FRAME_PIECE_SIZE,
@@ -205,25 +181,6 @@ const TAIL: TransportTail = TransportTail {
     settings_len: SETTINGS.len(),
     fault_rows: std::ptr::null(),
     fault_rows_len: 0,
-};
-
-// THE TAIL IS THE DECLARATION'S (THE DESIGN §2: each fact declared once): every literal above is
-// held equal to the framer's `TransportMeta`, so the two can never drift.
-const _: () = {
-    assert!(matches!(
-        <WsFramer as TransportMeta>::FRAMING,
-        busbar_contract::transport::wire::Framing::Stream
-    ));
-    assert!(TAIL.framing == FRAMING_STREAM);
-    assert!(!<WsFramer as TransportMeta>::DECODES_PAYLOAD && TAIL.facts == 0);
-    assert!(<WsFramer as TransportMeta>::COMPOSES_OVER.is_empty() && TAIL.composes_over_len == 0);
-    assert!(<WsFramer as TransportMeta>::UPGRADES_TO.is_empty() && TAIL.upgrades_to_len == 0);
-    assert!(
-        <WsFramer as TransportMeta>::HANDOFF.is_none()
-            && TAIL.handoff_from.len == 0
-            && TAIL.handoff_to.len == 0
-            && TAIL.handoff_binding_fact.len == 0
-    );
 };
 
 /// The door's Statement: the `ws` framer.
@@ -353,7 +310,6 @@ struct Owed {
     /// steady state queues its messages without allocating.
     spare: Vec<Vec<u8>>,
     ended: bool,
-    deadline: Option<u64>,
 }
 
 impl Drop for Owed {
@@ -431,9 +387,6 @@ type OwedSlot = Arc<Mutex<Owed>>;
 pub struct Instance {
     framer: WsFramer,
     owed: Mutex<HashMap<u64, OwedSlot>>,
-    /// The host services `open` was handed (`OpenIn::host`): the binding's auth a dial calls.
-    /// `None`: the host offers none, and a dial whose binding has an auth is refused.
-    services: Option<Services>,
     /// The last refused refresh's text, held so the answer's error names live memory until the
     /// next refused refresh (a refresh runs alone on its instance).
     refused: Mutex<String>,
@@ -483,15 +436,6 @@ impl Out for Collect<'_> {
     }
     fn now(&self) -> HostTime {
         self.now
-    }
-    fn wake_at(&mut self, monotonic_nanos: Option<u64>) {
-        self.owed.deadline = monotonic_nanos;
-    }
-}
-
-impl BytesOut for Collect<'_> {
-    fn put(&mut self, bytes: &[u8]) {
-        push_wiped(&mut self.owed.wire, &mut self.owed.wire_at, bytes);
     }
 }
 
@@ -619,7 +563,6 @@ fn raw<'a>(p: *const u8, n: usize) -> &'a [u8] {
 
 fn time(sink: &FramerSink) -> HostTime {
     HostTime {
-        monotonic_nanos: sink.now_monotonic_ns,
         unix_nanos: sink.now_unix_ns,
     }
 }
@@ -642,23 +585,6 @@ fn reason_of(code: u32) -> CloseReason {
         CLOSE_TRANSPORT_FAILED => CloseReason::TransportFailed,
         CLOSE_CAPACITY_EXHAUSTED => CloseReason::CapacityExhausted,
         _ => CloseReason::Normal,
-    }
-}
-
-/// The connection-security facts an adopted framing reads: the name offered, the protocol agreed
-/// and the claim.
-fn facts_of(p: *const busbar_contract::abi::transport::ConnFacts) -> ConnFacts {
-    if p.is_null() {
-        return ConnFacts::default();
-    }
-    // SAFETY: host-borrowed for the call.
-    let f = unsafe { &*p };
-    let s = |a: &AbiStr| (!a.ptr.is_null()).then(|| String::from_utf8_lossy(text(a)).into_owned());
-    ConnFacts {
-        sni: s(&f.offered_name),
-        alpn: s(&f.agreed_protocol),
-        claim: s(&f.claim),
-        ..ConnFacts::default()
     }
 }
 
@@ -688,12 +614,9 @@ impl Slot for Open {
     fn call(_: *mut c_void, i: &OpenIn, o: &mut OpenOut) -> Outcome {
         match read_settings(&i.settings) {
             Ok(max) => {
-                // SAFETY: host-borrowed for the call; NULL when the host hands no tables.
-                let services = unsafe { i.host.as_ref() }.and_then(Services::of);
                 o.instance = Box::into_raw(Box::new(Instance {
                     framer: WsFramer::new(max),
                     owed: Mutex::new(HashMap::new()),
-                    services,
                     refused: Mutex::new(String::new()),
                 }))
                 .cast();
@@ -755,16 +678,12 @@ impl Slot for Close {
     }
 }
 
-/// `cancel`: the one framer op that pends is a dial's `begin` on its auth call; a cancel of its
-/// ticket releases the dial parked there. Nothing of it went out, so nothing moved.
+/// `cancel`: no framer op pends, so nothing is in flight to cancel and nothing moved.
 pub struct Cancel;
 impl Slot for Cancel {
     type In = CancelIn;
     type Out = CancelOut;
-    fn call(p: *mut c_void, i: &CancelIn, o: &mut CancelOut) -> Outcome {
-        if let Some(inst) = instance(p) {
-            inst.framer.release((i.ticket.slot, i.ticket.generation));
-        }
+    fn call(_: *mut c_void, _: &CancelIn, o: &mut CancelOut) -> Outcome {
         o.disposition = CANCEL_NOTHING_MOVED;
         Outcome::Ready
     }
@@ -1085,10 +1004,10 @@ impl Slot for Begin {
     type In = BeginIn;
     type Out = FramerOut;
     fn call(p: *mut c_void, i: &BeginIn, o: &mut FramerOut) -> Outcome {
-        let Some(inst) = instance(p) else {
+        if instance(p).is_none() {
             o.head.error = abi_str(BEGIN.no_instance);
             return Outcome::Failed;
-        };
+        }
         let Some(side) = side_of(i.side) else {
             o.head.error = abi_str("begin: the side is neither accept nor dial");
             return Outcome::Failed;
@@ -1102,164 +1021,9 @@ impl Slot for Begin {
             return Outcome::Failed;
         }
         let fields = opening_fields(i.fields, i.fields_len);
-        if matches!(side, Side::Dial) && i.points != 0 {
-            return dial_with_auth(p, inst, i, o, &target, &fields);
-        }
         opening(p, &BEGIN, &i.sink, o, |f, c| {
             f.open_with(side, &target, &fields, c)
         })
-    }
-}
-
-/// The auth-call handles a dial's `begin` issues on its ticket: the peer point's, then the head's.
-const SEQ_PEER: u32 = 1;
-/// See [`SEQ_PEER`].
-const SEQ_HEAD: u32 = 2;
-
-/// A DIAL WHOSE BINDING HAS AN AUTH (ruling 23: nothing is added to a head after its auth runs;
-/// `BeginIn::points`/`BeginIn::auth`): at [`POINT_PEER`] the auth is called once, before any head,
-/// and only a continue goes on; at [`POINT_HEAD`] or [`POINT_HEAD_BODY`] (the upgrade carries no
-/// body: an empty one) it is called over the upgrade request exactly as it goes on the wire, and
-/// what it answers joins that request last (`WsFramer::open_signed`). A call that is not ready
-/// answers PENDING and the dial is parked on the op's ticket; the resumed op re-issues the same
-/// handles and reads the stored answers. A point this framer does not serve, a host that serves no
-/// auth call, a stop, or an answer the request cannot carry refuses the dial: an unsigned
-/// request never leaves.
-fn dial_with_auth(
-    p: *mut c_void,
-    inst: &Instance,
-    i: &BeginIn,
-    o: &mut FramerOut,
-    target: &str,
-    fields: &[(String, Vec<u8>)],
-) -> Outcome {
-    let refuse = |o: &mut FramerOut, why: &'static str| {
-        o.head.error = abi_str(why);
-        Outcome::Failed
-    };
-    if i.points & !(POINT_PEER | POINT_HEAD | POINT_HEAD_BODY) != 0 {
-        return refuse(
-            o,
-            "begin: the binding's auth needs a point this framer does not serve",
-        );
-    }
-    let Some(services) = inst.services.as_ref() else {
-        return refuse(
-            o,
-            "begin: the binding has an auth and the host serves no auth call",
-        );
-    };
-    let ticket: Ticket = i.head.ticket;
-    let handle = |seq| CompletionHandle {
-        ticket,
-        seq,
-        _reserved: 0,
-    };
-    let auth: AuthRef = i.auth;
-    if i.points & POINT_PEER != 0 {
-        let peer = services.auth_call::<Own>(
-            handle(SEQ_PEER),
-            auth,
-            UnitRef::NONE,
-            POINT_PEER,
-            0,
-            0,
-            &HeadViewArgs::default(),
-            None,
-        );
-        match peer {
-            Poll::Pending => return Outcome::Pending,
-            Poll::Ready(Ok(called)) if called.flow == FLOW_CONTINUE => {}
-            Poll::Ready(Ok(_)) => {
-                return refuse(o, "begin: the binding's auth stopped the connection")
-            }
-            Poll::Ready(Err(_)) => return refuse(o, "begin: the host's auth call failed"),
-        }
-    }
-    let (point, body): (u32, Option<&[u8]>) = if i.points & POINT_HEAD_BODY != 0 {
-        (POINT_HEAD_BODY, Some(&[]))
-    } else if i.points & POINT_HEAD != 0 {
-        (POINT_HEAD, None)
-    } else {
-        // Only the peer point: the head goes out as the plane's.
-        return opening(p, &BEGIN, &i.sink, o, |f, c| {
-            f.open_with(Side::Dial, target, fields, c)
-        });
-    };
-    // What the head point's auth did, said by the closure that calls it.
-    let mut why: Option<&'static str> = None;
-    let mut signed = false;
-    let mut sign = |head: &UpgradeHead<'_>| {
-        let view = HeadViewArgs {
-            method: "GET",
-            target: head.target,
-            authority: head.authority,
-            query: head.query,
-            fields: head.fields,
-            scheme: i.scheme,
-        };
-        match services.auth_call::<Own>(
-            handle(SEQ_HEAD),
-            auth,
-            UnitRef::NONE,
-            point,
-            0,
-            0,
-            &view,
-            body,
-        ) {
-            Poll::Pending => Poll::Pending,
-            Poll::Ready(Ok(called)) if called.flow == FLOW_CONTINUE => {
-                signed = true;
-                Poll::Ready(Ok(called
-                    .fields
-                    .into_iter()
-                    .map(|f| AuthLine {
-                        query: f.flags & FIELD_QUERY != 0,
-                        value: zeroize::Zeroizing::new(f.value.expose_own(&Own::here()).clone()),
-                        name: f.name,
-                    })
-                    .collect()))
-            }
-            Poll::Ready(Ok(_)) => {
-                why = Some("begin: the binding's auth stopped the dial");
-                Poll::Ready(Err(TransportError::HandshakeFailed))
-            }
-            Poll::Ready(Err(_)) => {
-                why = Some("begin: the host's auth call failed");
-                Poll::Ready(Err(TransportError::HandshakeFailed))
-            }
-        }
-    };
-    let parking = Parking {
-        ticket: (ticket.slot, ticket.generation),
-        deadline: i.head.deadline_ns,
-        now: i.sink.now_monotonic_ns,
-    };
-    let mut owed = Owed::default();
-    let mut c = Collect {
-        owed: &mut owed,
-        now: time(&i.sink),
-    };
-    match inst
-        .framer
-        .open_signed(parking, target, fields, &mut sign, &mut c)
-    {
-        Poll::Pending => Outcome::Pending,
-        Poll::Ready(Ok(token)) => {
-            o.framing = token;
-            fill(&mut owed, &i.sink, o);
-            inst.queues().insert(token, Arc::new(Mutex::new(owed)));
-            Outcome::Ready
-        }
-        Poll::Ready(Err(e)) => refuse(
-            o,
-            why.unwrap_or(if signed {
-                "begin: the binding's auth answered a line the upgrade cannot carry"
-            } else {
-                (BEGIN.why)(&e)
-            }),
-        ),
     }
 }
 
@@ -1273,11 +1037,8 @@ impl Slot for Adopt {
             o.head.error = abi_str("adopt: the side is neither accept nor dial");
             return Outcome::Failed;
         };
-        let facts = facts_of(i.facts);
         let leftover = raw(i.leftover, i.leftover_len);
-        opening(p, &ADOPT, &i.sink, o, |f, c| {
-            f.adopt(side, &facts, leftover, c)
-        })
+        opening(p, &ADOPT, &i.sink, o, |f, c| f.adopt(side, leftover, c))
     }
 }
 
@@ -1557,10 +1318,6 @@ fn fill(owed: &mut Owed, sink: &FramerSink, o: &mut FramerOut) {
         flags |= YIELD_MORE;
     } else if owed.ended {
         flags |= YIELD_ENDED;
-    }
-    if let Some(at) = owed.deadline {
-        flags |= YIELD_HAS_DEADLINE;
-        y.next_deadline_ns = at;
     }
     y.flags = flags;
 }
