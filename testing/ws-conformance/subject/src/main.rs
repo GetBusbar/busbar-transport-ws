@@ -38,8 +38,10 @@ mod loader {
 /// A door, admitted through the one dispatcher under its row's name and opened.
 fn open(key: &str, door: busbar_contract::abi::mechanism::door::DoorFn) -> Arc<dyn FramerDoor> {
     use loader::dispatch::{kinds::transport::Transport as TransportKind, load_linked, LinkedRow};
+    let bind = doors::row_bind(key)
+        .unwrap_or_else(|e| panic!("ws-conformance-subject: the `{key}` row has no bind: {e}"));
     let plugin = LinkedRow::of(door)
-        .and_then(|row| load_linked::<TransportKind>(&row, doors::row_bind(key)))
+        .and_then(|row| load_linked::<TransportKind>(&row, bind))
         .unwrap_or_else(|e| panic!("ws-conformance-subject: the `{key}` door is refused: {e}"));
     Arc::new(
         doors::Dispatched::open(

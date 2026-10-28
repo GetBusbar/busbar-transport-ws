@@ -19,7 +19,6 @@
 use std::ffi::c_void;
 use std::mem::{size_of, zeroed};
 
-use busbar_contract::abi::host::service::SCHEME_PLAIN;
 use busbar_contract::abi::mechanism::call::{AbiStr, InHead, Op, OutHead, Outcome};
 use busbar_contract::abi::mechanism::lifecycle::{slot as life, OpenIn, OpenOut};
 use busbar_contract::abi::transport::check::check_framer;
@@ -91,7 +90,7 @@ impl Host {
     fn with_settings(settings: &[u8]) -> Self {
         let d = busbar_transport_ws::door::door();
         // SAFETY: the door's `'static` table.
-        let ops: &'static Ops = unsafe { &*(*d).ops.cast::<Ops>() };
+        let ops: &'static Ops = unsafe { &*(*d).ops().cast::<Ops>() };
         let mut i: OpenIn = z();
         i.settings = busbar_contract::abi::mechanism::call::Blob {
             ptr: settings.as_ptr(),
@@ -181,7 +180,6 @@ impl Host {
     fn accept(&mut self) -> u64 {
         let mut i: BeginIn = z();
         i.side = SIDE_ACCEPT;
-        i.scheme = SCHEME_PLAIN;
         i.target = AbiStr {
             ptr: [].as_ptr(),
             len: 0,
@@ -926,7 +924,7 @@ fn validate_refuses_a_non_numeric_ceiling() {
     use busbar_contract::abi::mechanism::lifecycle::ValidateIn;
     let d = busbar_transport_ws::door::door();
     // SAFETY: the door's `'static` table.
-    let ops: &'static Ops = unsafe { &*(*d).ops.cast::<Ops>() };
+    let ops: &'static Ops = unsafe { &*(*d).ops().cast::<Ops>() };
     for (settings, want) in [
         (
             &br#"{"limits.request_body_max_bytes": "lots"}"#[..],
