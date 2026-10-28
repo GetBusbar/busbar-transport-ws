@@ -91,15 +91,3 @@ pub(crate) trait FramerOut {
     /// The host's time at this call.
     fn now(&self) -> HostTime;
 }
-
-/// Where the framer puts the bytes a rendering produced.
-pub(crate) trait BytesOut {
-    /// Bytes, in order.
-    fn put(&mut self, bytes: &[u8]);
-}
-
-impl BytesOut for Vec<u8> {
-    fn put(&mut self, bytes: &[u8]) {
-        self.extend_from_slice(bytes);
-    }
-}

@@ -30,8 +30,6 @@ mod transport;
 pub mod door;
 mod meta;
 
-pub(crate) use transport::WsFramer;
-
 /// THE TRANSPORT AXIS ENTRY (#3, #30): what the composition root folds for this wire — its key, the
 /// layers it declares, and its door, which the root builds the wire from (the `transport-door`
 /// axis) and opens on the one connector (the `connector-door` axis). The root names none of them.

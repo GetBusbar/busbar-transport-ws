@@ -52,7 +52,7 @@ use busbar_contract::ids::StreamId;
 use busbar_contract::transport::registry::DEFAULT_REQUEST_BODY_MAX_BYTES;
 use busbar_contract::transport::wire::{CloseReason, TransportError, WireStatusClass};
 
-use crate::frame::{BytesOut, Framed, FramerOut as Out, HostTime, Side};
+use crate::frame::{Framed, FramerOut as Out, HostTime, Side};
 use crate::meta;
 
 use crate::transport::WsFramer;
@@ -436,12 +436,6 @@ impl Out for Collect<'_> {
     }
     fn now(&self) -> HostTime {
         self.now
-    }
-}
-
-impl BytesOut for Collect<'_> {
-    fn put(&mut self, bytes: &[u8]) {
-        push_wiped(&mut self.owed.wire, &mut self.owed.wire_at, bytes);
     }
 }
 

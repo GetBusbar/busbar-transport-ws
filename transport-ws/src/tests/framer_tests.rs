@@ -11,8 +11,8 @@ use crate::frame::{Framed, FramerOut, HostTime, Side};
 use busbar_contract::transport::wire::WireStatusClass;
 use tungstenite::handshake::derive_accept_key;
 
+use crate::transport::WsFramer;
 use crate::transport::{reason_phrase, retry_after};
-use crate::WsFramer;
 use tungstenite::http::{HeaderMap, HeaderValue};
 
 /// What one framer call produced.
