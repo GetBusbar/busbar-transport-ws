@@ -88,7 +88,6 @@ fn a_panicked_framing_is_forgotten_by_the_framer_at_its_finish() {
     let inst = Instance {
         framer: WsFramer::new(0),
         owed: Mutex::new(HashMap::new()),
-        services: None,
         refused: Mutex::new(String::new()),
     };
     let mut sink_out = Owed::default();
@@ -122,51 +121,6 @@ fn a_panicked_framing_is_forgotten_by_the_framer_at_its_finish() {
         "the door's queue is gone"
     );
     assert!(!inst.framer.holds(state), "the framer's state is gone too");
-}
-
-/// THE HOST'S CANCEL RELEASES A DIAL PARKED ON ITS AUTH (Q128 transport-ws LOW, reader r162 on
-/// 0769fe6): a `begin` that answered PENDING on its auth call holds its built dial under its
-/// ticket; the host's cancel of that ticket drops it (nothing went out, so nothing moved), whether
-/// or not the op had a deadline. RED before the fix: cancel ignored the ticket, and the dial stayed
-/// parked for the instance's life.
-#[test]
-fn a_cancel_releases_the_dial_parked_on_its_ticket() {
-    let inst = Instance {
-        framer: WsFramer::new(0),
-        owed: Mutex::new(HashMap::new()),
-        services: None,
-        refused: Mutex::new(String::new()),
-    };
-    let parking = crate::transport::Parking {
-        ticket: (3, 9),
-        deadline: 0,
-        now: 0,
-    };
-    let mut sink_out = Owed::default();
-    let mut c = Collect {
-        owed: &mut sink_out,
-        now: HostTime {
-            monotonic_nanos: 0,
-            unix_nanos: 0,
-        },
-    };
-    let mut pending = |_: &crate::transport::UpgradeHead<'_>| Poll::Pending;
-    assert!(inst
-        .framer
-        .open_signed(parking, "ws://127.0.0.1:9/x", &[], &mut pending, &mut c)
-        .is_pending());
-    assert_eq!(inst.framer.parked(), 1);
-    // SAFETY: plain C data; all-zero is valid.
-    let mut i: CancelIn = unsafe { std::mem::zeroed() };
-    i.ticket = Ticket {
-        slot: 3,
-        generation: 9,
-    };
-    let mut o: CancelOut = unsafe { std::mem::zeroed() };
-    let p = std::ptr::from_ref(&inst).cast_mut().cast::<c_void>();
-    assert_eq!(Cancel::call(p, &i, &mut o), Outcome::Ready);
-    assert_eq!(o.disposition, CANCEL_NOTHING_MOVED, "nothing went out");
-    assert_eq!(inst.framer.parked(), 0, "the parked dial is released");
 }
 
 /// Hand `owed` over through a sink of the given caps, one fill at a time, until it is dry: every

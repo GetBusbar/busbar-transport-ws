@@ -13,7 +13,6 @@
 use std::ffi::c_void;
 use std::mem::{size_of, zeroed};
 
-use busbar_contract::abi::host::service::SCHEME_PLAIN;
 use busbar_contract::abi::mechanism::call::{AbiStr, InHead, Op, OutHead, Outcome};
 use busbar_contract::abi::mechanism::lifecycle::{slot as life, OpenIn, OpenOut};
 use busbar_contract::abi::transport::check::{check_framer, check_framer_fields};
@@ -207,7 +206,6 @@ impl Host {
         let mut end = End::default();
         let mut i: BeginIn = z();
         i.side = side;
-        i.scheme = SCHEME_PLAIN;
         i.target = AbiStr {
             ptr: target.as_ptr(),
             len: target.len(),
@@ -608,7 +606,6 @@ fn begin_refuses_a_target_that_is_not_text() {
     let target: &'static [u8] = b"ws://svc.test/\xff\xfe";
     let mut i: BeginIn = z();
     i.side = SIDE_DIAL;
-    i.scheme = SCHEME_PLAIN;
     i.target = AbiStr {
         ptr: target.as_ptr(),
         len: target.len(),
@@ -721,117 +718,14 @@ fn a_zero_message_ceiling_is_refused_by_validate_and_open() {
 
 // ── a refused open says why (codeaudit g5 H) ─────────────────────────────────────────────────────
 
-/// A host that serves `auth_call` and nothing else. Its `ctx.handle` says what the auth does.
-mod auth_host {
-    use super::*;
-    use busbar_contract::abi::auth::{FieldSpan, POINT_PEER};
-    use busbar_contract::abi::host::service::{
-        AuthAnswer, AuthCallIn, HostSlots, ServiceFn, ServiceOut, UnitRef, FLOW_CONTINUE,
-        FLOW_STOP, SERVICES,
-    };
-    use busbar_contract::abi::mechanism::call::{RawOutcome, Span};
-    use busbar_contract::abi::mechanism::ticket::{HostCtx, HostTables};
-
-    /// The auth call fails (the host declines it).
-    pub const FAILS: u64 = 1;
-    /// The auth answers stop.
-    pub const STOPS: u64 = 2;
-    /// The auth answers continue with a line the upgrade cannot carry (`upgrade`).
-    pub const BAD_LINE: u64 = 3;
-
-    extern "C" fn auth_call(
-        ctx: HostCtx,
-        input: *const c_void,
-        out: *mut ServiceOut,
-    ) -> RawOutcome {
-        // SAFETY: the door passes an `AuthCallIn` and a `ServiceOut` of the contract's sizes.
-        let (i, out) = unsafe { (&*input.cast::<AuthCallIn>(), &mut *out) };
-        out.size = size_of::<ServiceOut>() as u32;
-        if ctx.handle == FAILS {
-            out.outcome = RawOutcome::of(Outcome::Failed);
-            return RawOutcome::of(Outcome::Failed);
-        }
-        let flow = if ctx.handle == STOPS {
-            FLOW_STOP
-        } else {
-            FLOW_CONTINUE
-        };
-        let peer = i.point == POINT_PEER;
-        // SAFETY: the caller's own answer slot, buffer and spans.
-        unsafe {
-            *i.answer = AuthAnswer {
-                size: size_of::<AuthAnswer>() as u32,
-                flow,
-                unit: if peer {
-                    UnitRef::NONE
-                } else {
-                    UnitRef { id: 1, mac: 1 }
-                },
-            };
-            if ctx.handle == BAD_LINE && !peer {
-                let text = b"upgradewebsocket";
-                std::ptr::copy_nonoverlapping(text.as_ptr(), i.buf, text.len());
-                *i.spans = FieldSpan {
-                    name: Span { offset: 0, len: 7 },
-                    value: Span { offset: 7, len: 9 },
-                    flags: 0,
-                    _reserved: 0,
-                };
-                out.len = text.len() as u64;
-                out.items = 1;
-            }
-        }
-        out.outcome = RawOutcome::of(Outcome::Ready);
-        RawOutcome::of(Outcome::Ready)
-    }
-
-    /// An instance opened on this host, behaving as `what` says.
-    pub fn open(what: u64) -> Host {
-        let mut slots: HostSlots = z();
-        slots.size = size_of::<HostSlots>() as u32;
-        slots.slots = SERVICES;
-        slots.auth_call = Some(auth_call as ServiceFn);
-        // The tables outlive the instance: leaked, as a host's are static.
-        let slots: &'static HostSlots = Box::leak(Box::new(slots));
-        let mut tables: HostTables = z();
-        tables.size = size_of::<HostTables>() as u32;
-        tables.ctx = HostCtx { handle: what };
-        tables.services = slots;
-        let tables: &'static HostTables = Box::leak(Box::new(tables));
-        let l = linked();
-        let mut i: OpenIn = z();
-        i.host = tables;
-        let mut o: OpenOut = z();
-        let r = call(
-            l.head.open,
-            std::ptr::null_mut(),
-            &mut i,
-            &mut o,
-            life::OPEN,
-        );
-        assert_eq!(r, Outcome::Ready);
-        Host {
-            ops: l,
-            inst: o.instance,
-            caps: (64 * 1024, 64 * 1024, 64),
-            wire: vec![0; 64 * 1024],
-            frame: vec![0; 64 * 1024],
-            pieces: vec![z(); 64],
-            log: Vec::new(),
-        }
-    }
-}
-
-/// `begin` on `target`, the binding's auth at `points`; the refusal's text.
-fn refused_begin(host: &mut Host, target: &'static str, points: u32) -> String {
+/// `begin` dialling `target`; the refusal's text.
+fn refused_begin(host: &mut Host, target: &'static str) -> String {
     let mut i: BeginIn = z();
     i.side = SIDE_DIAL;
-    i.scheme = SCHEME_PLAIN;
     i.target = AbiStr {
         ptr: target.as_ptr(),
         len: target.len(),
     };
-    i.points = points;
     i.sink = host.sink();
     let mut o: FramerOut = z();
     let r = call(host.ops.begin, host.inst, &mut i, &mut o, slot::BEGIN);
@@ -843,48 +737,12 @@ fn refused_begin(host: &mut Host, target: &'static str, points: u32) -> String {
     .expect("the reason is text")
 }
 
-/// EACH REFUSAL SAYS ITS OWN CAUSE: the peer point's and the head point's auth outcomes, and an
-/// address the target cannot be dialled at, are told apart. RED before the fix: the head point
-/// said one text for all three, the peer point one for a failure and a stop, and an address
-/// said "the framing could not be opened".
+/// A refused open says its own cause: a target carrying userinfo is refused in those words.
 #[test]
 fn a_refused_open_says_why() {
-    use busbar_contract::abi::auth::{POINT_HEAD, POINT_PEER};
-    let cases: [(u64, u32, &str); 5] = [
-        (
-            auth_host::FAILS,
-            POINT_PEER,
-            "begin: the host's auth call failed",
-        ),
-        (
-            auth_host::STOPS,
-            POINT_PEER,
-            "begin: the binding's auth stopped the connection",
-        ),
-        (
-            auth_host::FAILS,
-            POINT_HEAD,
-            "begin: the host's auth call failed",
-        ),
-        (
-            auth_host::STOPS,
-            POINT_HEAD,
-            "begin: the binding's auth stopped the dial",
-        ),
-        (
-            auth_host::BAD_LINE,
-            POINT_HEAD,
-            "begin: the binding's auth answered a line the upgrade cannot carry",
-        ),
-    ];
-    for (what, point, text) in cases {
-        let mut host = auth_host::open(what);
-        assert_eq!(refused_begin(&mut host, "ws://svc.test/", point), text);
-        host.close();
-    }
-    let mut host = auth_host::open(0);
+    let mut host = Host::open(linked(), (64 * 1024, 64 * 1024, 64));
     assert_eq!(
-        refused_begin(&mut host, "ws://u:p@host/", 0),
+        refused_begin(&mut host, "ws://u:p@host/"),
         "begin: the target carries userinfo; credentials never ride a URL"
     );
     host.close();
