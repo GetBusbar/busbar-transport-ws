@@ -21,7 +21,7 @@ use std::panic::{catch_unwind, AssertUnwindSafe};
 use crate::door::{Begin, Emit, Ingest, Open};
 use crate::frame::{Framed, FramerOut, HostTime, Side};
 use crate::meta;
-use crate::WsFramer;
+use crate::transport::WsFramer;
 use busbar_contract::abi::mechanism::call::{AbiStr, Outcome};
 use busbar_contract::abi::mechanism::lifecycle::{OpenIn, OpenOut};
 use busbar_contract::abi::sdk::door::Slot;

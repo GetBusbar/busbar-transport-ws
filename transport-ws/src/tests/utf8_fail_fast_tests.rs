@@ -11,7 +11,7 @@ use busbar_contract::transport::wire::CloseReason;
 
 use crate::frame::{Framed, FramerOut, HostTime, Side};
 
-use crate::WsFramer;
+use crate::transport::WsFramer;
 
 const UPGRADE: &[u8] = b"GET /echo HTTP/1.1\r\nHost: svc.test\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n";
 const TEXT: u8 = 0x1;

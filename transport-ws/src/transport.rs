@@ -43,7 +43,7 @@
 //!
 //! The upgrade INTO this framer is [`WsFramer::adopt`]: another framer gave up the stream with the
 //! bytes it held (the upgrade request itself), and this one answers it. Nothing upgrades out of a
-//! WebSocket, so [`WsFramer::detach`] refuses.
+//! WebSocket, so the door's `detach` refuses.
 
 use std::collections::{HashMap, VecDeque};
 use std::io::{Read, Write};
@@ -52,9 +52,9 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use busbar_contract::abi::transport::fields::{hop_by_hop, LINE_END, SEPARATOR};
 use busbar_contract::ids::StreamId;
-use busbar_contract::transport::wire::{CloseReason, Encode, TransportError, WireStatusClass};
+use busbar_contract::transport::wire::{CloseReason, TransportError, WireStatusClass};
 
-use crate::frame::{BytesOut, Framed, FramerOut, Located, Side};
+use crate::frame::{Framed, FramerOut, Located, Side};
 use tungstenite::client::IntoClientRequest;
 use tungstenite::error::ProtocolError;
 use tungstenite::handshake::client::ClientHandshake;
@@ -801,7 +801,7 @@ impl WsFramer {
     ///
     /// # Errors
     ///
-    /// As [`WsFramer::refusal`].
+    /// The state is closed.
     pub(crate) fn refusal_with(
         &self,
         state: u64,
@@ -1520,30 +1520,6 @@ impl WsFramer {
         self.emit_text(state, bytes, end_of_frame, text, out)
     }
 
-    /// A WebSocket message is its payload: the envelope belonged to the upgrade request, which is
-    /// long over by the time a message is written.
-    pub(crate) fn encode_envelope(
-        &self,
-        _fields: &[(&str, &[u8])],
-        body: &[u8],
-        out: &mut dyn BytesOut,
-    ) -> Result<(), Encode> {
-        out.put(body);
-        Ok(())
-    }
-
-    /// A WebSocket connection carries one message stream: the refusal is one message, and the
-    /// connection closes after it, with the orderly code.
-    pub(crate) fn refusal(
-        &self,
-        state: u64,
-        stream: Option<StreamId>,
-        bytes: &[u8],
-        out: &mut dyn FramerOut,
-    ) -> Result<(), TransportError> {
-        self.refusal_with(state, stream, bytes, 0, out)
-    }
-
     pub(crate) fn close(&self, state: u64, reason: CloseReason, out: &mut dyn FramerOut) {
         self.close_with(state, close_code_for(reason), out);
     }
@@ -1556,16 +1532,6 @@ impl WsFramer {
         } else {
             Err(TransportError::Closed)
         }
-    }
-
-    /// Nothing upgrades in-band out of a WebSocket (RFC 6455 defines no upgrade out of an
-    /// established connection), so there is no stream to hand on: refusing is the protocol's answer.
-    pub(crate) fn detach(
-        &self,
-        _state: u64,
-        _out: &mut dyn BytesOut,
-    ) -> Result<(), TransportError> {
-        Err(TransportError::HandoffMismatch)
     }
 
     /// The upgrade into this framer: the stream another framer gave up, with the bytes it held —
