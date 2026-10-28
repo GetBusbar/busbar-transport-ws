@@ -57,9 +57,7 @@ use crate::meta;
 
 use crate::transport::WsFramer;
 
-// ── the statement ────────────────────────────────────────────────────────────────────────────────
-
-/// The setting this transport reads, at its 1.5.5 path: the message ceiling.
+/// The setting this transport reads: the message ceiling.
 pub const BODY_MAX_BYTES: &str = "limits.request_body_max_bytes";
 
 const NONE: AbiStr = AbiStr {
@@ -71,7 +69,7 @@ const NONE: AbiStr = AbiStr {
 const KEY: &str = meta::KEY;
 
 /// The secured form of the scheme: a `wss` target is a `ws` one whose bytes the connector secures
-/// before they leave (THE DESIGN §5: "ws claims `ws` and `wss`").
+/// before they leave (`ws` claims `ws` and `wss`).
 pub const SECURE_KEY: &str = "wss";
 
 /// The schemes `ws` claims, by name: the Statement's `claims`, the one place they are stated.
@@ -102,12 +100,11 @@ const FACT_LIST: [AbiStr; meta::TRANSPORT_FACTS.len()] = strs(meta::TRANSPORT_FA
 const FACTS: &[AbiStr] = &FACT_LIST;
 
 /// ws opens a unit at the upgrade, and the host reads its upgrade lines off this, never off a
-/// layer list (busbar ARCHITECT ruling Q128 U7).
+/// layer list.
 const UNIT0: u8 = UNIT0_UPGRADE;
 
-/// The claim row, RENDERED from the transport's one declaration (`meta.rs`, `claims.rs`; THE
-/// DESIGN §2 "Each fact is declared once; anything derivable is derived"). `ws` and `wss` are one
-/// wire, so both claims carry it.
+/// The claim row, rendered from the transport's one declaration (`meta.rs`, `claims.rs`). `ws` and
+/// `wss` are one wire, so both claims carry it.
 const ROW: Claim = Claim {
     selector_forms: bytes_str(&SELECTOR_CODES),
     egress_selector_forms: bytes_str(&EGRESS_SELECTOR_CODES),
@@ -190,8 +187,6 @@ pub const STATEMENT: Statement = Statement {
     claims_len: CLAIM_NAMES.len(),
     ..statement(KEY, env!("CARGO_PKG_VERSION"), 64)
 };
-
-// ── the instance ─────────────────────────────────────────────────────────────────────────────────
 
 /// One frame piece waiting for the host.
 struct Piece {
@@ -588,8 +583,6 @@ fn reason_of(code: u32) -> CloseReason {
     }
 }
 
-// ── the lifecycle ────────────────────────────────────────────────────────────────────────────────
-
 /// `validate`.
 pub struct Validate;
 impl Slot for Validate {
@@ -734,8 +727,6 @@ not_served!(Flush, ConnIn, OutHead, "flush", |o| o);
 not_served!(Shut, ShutIn, OutHead, "shut", |o| o);
 not_served!(Arrival, ArrivalIn, ArrivalOut, "arrival", |o| o.head);
 not_served!(Detach, FramingIn, FramerOut, "detach", |o| o.head);
-
-// ── the framer ───────────────────────────────────────────────────────────────────────────────────
 
 /// `locate`.
 pub struct Locate;
@@ -1064,7 +1055,7 @@ impl Slot for Ingest {
                 }
                 let ended_before = c.owed.ended;
                 f.ingest(i.framing, bytes, end, c)?;
-                // THE DIALLED HEAD'S REASON PHRASE rides the head piece this call queued.
+                // The dialled head's reason phrase rides the head piece this call queued.
                 if let Some(reason) = f.take_reason(i.framing) {
                     if let Some(head) = c.owed.pieces.iter_mut().rev().find(|p| p.fields) {
                         head.reason = Some(reason);
@@ -1186,7 +1177,7 @@ fn fill(owed: &mut Owed, sink: &FramerSink, o: &mut FramerOut) {
         let Some(piece) = owed.pieces.front_mut() else {
             break;
         };
-        // THE HEAD'S SLOTS (HEAD-FIELDS: the dialled side fills `reason`, HTTP/1 as sent): written
+        // The head's slots (the dialled side fills `reason`, HTTP/1 as sent): written
         // into the frame buffer ahead of the head's first piece, and ONLY in the answer that also
         // carries that piece (the host reads the phrase beside its head's first piece, and drops
         // one that arrives alone). A piece that does not fit this answer keeps its phrase for the
