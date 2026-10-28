@@ -93,10 +93,7 @@ fn a_panicked_framing_is_forgotten_by_the_framer_at_its_finish() {
     let mut sink_out = Owed::default();
     let mut c = Collect {
         owed: &mut sink_out,
-        now: HostTime {
-            monotonic_nanos: 0,
-            unix_nanos: 0,
-        },
+        now: HostTime { unix_nanos: 0 },
     };
     let state = inst
         .framer

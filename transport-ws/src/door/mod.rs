@@ -46,17 +46,14 @@ use busbar_contract::abi::transport::{
     PIECE_END_OF_FRAME, PIECE_FIELDS, PIECE_HAS_CODE, PIECE_HAS_RETRY_AFTER, PIECE_STREAM_FAILED,
     PIECE_TEXT, ROLE_FRAMER, SETTING_COUNT, SIDE_ACCEPT, SIDE_DIAL, STATUS_CALLER_FAULT,
     STATUS_FAR_END_FAULT, STATUS_NONE, STATUS_OTHER, STATUS_SUCCESS, UNIT0_UPGRADE, YIELD_ENDED,
-    YIELD_HAS_DEADLINE, YIELD_MORE,
+    YIELD_MORE,
 };
 use busbar_contract::ids::StreamId;
 use busbar_contract::transport::registry::DEFAULT_REQUEST_BODY_MAX_BYTES;
-use busbar_contract::transport::wire::{
-    CloseReason, TransportError, Unit0Trigger, WireStatusClass,
-};
-use busbar_contract::transport::{
-    BytesOut, ConnFacts, Framed, Framer, FramerOut as Out, HostTime, Side,
-};
-use busbar_contract::TransportMeta;
+use busbar_contract::transport::wire::{CloseReason, TransportError, WireStatusClass};
+
+use crate::frame::{BytesOut, Framed, FramerOut as Out, HostTime, Side};
+use crate::meta;
 
 use crate::transport::WsFramer;
 
@@ -71,7 +68,7 @@ const NONE: AbiStr = AbiStr {
 };
 
 /// The transport's own key (`meta.rs`).
-const KEY: &str = <WsFramer as TransportMeta>::KEY;
+const KEY: &str = meta::KEY;
 
 /// The secured form of the scheme: a `wss` target is a `ws` one whose bytes the connector secures
 /// before they leave (THE DESIGN §5: "ws claims `ws` and `wss`").
@@ -98,20 +95,15 @@ const fn strs<const N: usize>(names: &[&'static str]) -> [AbiStr; N] {
     list
 }
 
-const SELECTOR_CODES: [u8; crate::claims::SELECTOR_FORMS.len()] =
-    form_codes(<WsFramer as TransportMeta>::SELECTOR_FORMS);
+const SELECTOR_CODES: [u8; crate::claims::SELECTOR_FORMS.len()] = form_codes(meta::SELECTOR_FORMS);
 const EGRESS_SELECTOR_CODES: [u8; crate::claims::EGRESS_SELECTOR_FORMS.len()] =
-    form_codes(<WsFramer as TransportMeta>::EGRESS_SELECTOR_FORMS);
-const FACT_LIST: [AbiStr; <WsFramer as TransportMeta>::TRANSPORT_FACTS.len()] =
-    strs(<WsFramer as TransportMeta>::TRANSPORT_FACTS);
+    form_codes(meta::EGRESS_SELECTOR_FORMS);
+const FACT_LIST: [AbiStr; meta::TRANSPORT_FACTS.len()] = strs(meta::TRANSPORT_FACTS);
 const FACTS: &[AbiStr] = &FACT_LIST;
 
-/// The trigger code of the declared `UNIT0_TRIGGER`: ws opens a unit at the upgrade, and the host
-/// reads its upgrade lines off this, never off a layer list (busbar ARCHITECT ruling Q128 U7).
-const UNIT0: u8 = match <WsFramer as TransportMeta>::UNIT0_TRIGGER {
-    Some(Unit0Trigger::Upgrade) => UNIT0_UPGRADE,
-    _ => panic!("ws declares its unit opening at the upgrade"),
-};
+/// ws opens a unit at the upgrade, and the host reads its upgrade lines off this, never off a
+/// layer list (busbar ARCHITECT ruling Q128 U7).
+const UNIT0: u8 = UNIT0_UPGRADE;
 
 /// The claim row, RENDERED from the transport's one declaration (`meta.rs`, `claims.rs`; THE
 /// DESIGN §2 "Each fact is declared once; anything derivable is derived"). `ws` and `wss` are one
@@ -121,11 +113,10 @@ const ROW: Claim = Claim {
     egress_selector_forms: bytes_str(&EGRESS_SELECTOR_CODES),
     facts: FACTS.as_ptr(),
     facts_len: FACTS.len(),
-    // The declaration states no status numbering and no status leg (`STATUS_NAMESPACE`,
-    // `STATUS_CLASS`): frames after the upgrade carry none.
+    // No status numbering and no status leg: frames after the upgrade carry none.
     status_namespace: NONE,
-    session: <WsFramer as TransportMeta>::SESSION as u8,
-    session_bound: <WsFramer as TransportMeta>::SESSION_BOUND as u8,
+    session: meta::SESSION as u8,
+    session_bound: meta::SESSION_BOUND as u8,
     unit0_trigger: UNIT0,
     status_at: 0,
     _reserved: 0,
@@ -133,12 +124,6 @@ const ROW: Claim = Claim {
 
 /// Each claimed scheme's row, by index into [`CLAIM_NAMES`].
 const CLAIMS: &[Claim] = &[ROW, ROW];
-
-const _: () = assert!(
-    <WsFramer as TransportMeta>::STATUS_NAMESPACE.is_none()
-        && <WsFramer as TransportMeta>::STATUS_CLASS.is_none(),
-    "the row states no status numbering and no status leg"
-);
 
 /// The message ceiling's declared default, as the Statement states it.
 const DEFAULT_BODY_MAX: &str = "33554432";
@@ -196,25 +181,6 @@ const TAIL: TransportTail = TransportTail {
     settings_len: SETTINGS.len(),
     fault_rows: std::ptr::null(),
     fault_rows_len: 0,
-};
-
-// THE TAIL IS THE DECLARATION'S (THE DESIGN §2: each fact declared once): every literal above is
-// held equal to the framer's `TransportMeta`, so the two can never drift.
-const _: () = {
-    assert!(matches!(
-        <WsFramer as TransportMeta>::FRAMING,
-        busbar_contract::transport::wire::Framing::Stream
-    ));
-    assert!(TAIL.framing == FRAMING_STREAM);
-    assert!(!<WsFramer as TransportMeta>::DECODES_PAYLOAD && TAIL.facts == 0);
-    assert!(<WsFramer as TransportMeta>::COMPOSES_OVER.is_empty() && TAIL.composes_over_len == 0);
-    assert!(<WsFramer as TransportMeta>::UPGRADES_TO.is_empty() && TAIL.upgrades_to_len == 0);
-    assert!(
-        <WsFramer as TransportMeta>::HANDOFF.is_none()
-            && TAIL.handoff_from.len == 0
-            && TAIL.handoff_to.len == 0
-            && TAIL.handoff_binding_fact.len == 0
-    );
 };
 
 /// The door's Statement: the `ws` framer.
@@ -344,7 +310,6 @@ struct Owed {
     /// steady state queues its messages without allocating.
     spare: Vec<Vec<u8>>,
     ended: bool,
-    deadline: Option<u64>,
 }
 
 impl Drop for Owed {
@@ -471,9 +436,6 @@ impl Out for Collect<'_> {
     }
     fn now(&self) -> HostTime {
         self.now
-    }
-    fn wake_at(&mut self, monotonic_nanos: Option<u64>) {
-        self.owed.deadline = monotonic_nanos;
     }
 }
 
@@ -607,7 +569,6 @@ fn raw<'a>(p: *const u8, n: usize) -> &'a [u8] {
 
 fn time(sink: &FramerSink) -> HostTime {
     HostTime {
-        monotonic_nanos: sink.now_monotonic_ns,
         unix_nanos: sink.now_unix_ns,
     }
 }
@@ -630,23 +591,6 @@ fn reason_of(code: u32) -> CloseReason {
         CLOSE_TRANSPORT_FAILED => CloseReason::TransportFailed,
         CLOSE_CAPACITY_EXHAUSTED => CloseReason::CapacityExhausted,
         _ => CloseReason::Normal,
-    }
-}
-
-/// The connection-security facts an adopted framing reads: the name offered, the protocol agreed
-/// and the claim.
-fn facts_of(p: *const busbar_contract::abi::transport::ConnFacts) -> ConnFacts {
-    if p.is_null() {
-        return ConnFacts::default();
-    }
-    // SAFETY: host-borrowed for the call.
-    let f = unsafe { &*p };
-    let s = |a: &AbiStr| (!a.ptr.is_null()).then(|| String::from_utf8_lossy(text(a)).into_owned());
-    ConnFacts {
-        sni: s(&f.offered_name),
-        alpn: s(&f.agreed_protocol),
-        claim: s(&f.claim),
-        ..ConnFacts::default()
     }
 }
 
@@ -1099,11 +1043,8 @@ impl Slot for Adopt {
             o.head.error = abi_str("adopt: the side is neither accept nor dial");
             return Outcome::Failed;
         };
-        let facts = facts_of(i.facts);
         let leftover = raw(i.leftover, i.leftover_len);
-        opening(p, &ADOPT, &i.sink, o, |f, c| {
-            f.adopt(side, &facts, leftover, c)
-        })
+        opening(p, &ADOPT, &i.sink, o, |f, c| f.adopt(side, leftover, c))
     }
 }
 
@@ -1383,10 +1324,6 @@ fn fill(owed: &mut Owed, sink: &FramerSink, o: &mut FramerOut) {
         flags |= YIELD_MORE;
     } else if owed.ended {
         flags |= YIELD_ENDED;
-    }
-    if let Some(at) = owed.deadline {
-        flags |= YIELD_HAS_DEADLINE;
-        y.next_deadline_ns = at;
     }
     y.flags = flags;
 }

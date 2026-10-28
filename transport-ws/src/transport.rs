@@ -2,9 +2,9 @@
 // Copyright (C) 2026 Busbar Inc and contributors
 
 //! THE FRAMER (TRANSPORT-STACK; #3, #30), as the kind's entry file (`BUSBAR-1.6.0.md` THE DESIGN,
-//! §2: meta, claims, and the kind-named entry): `ws` as the contract's [`Framer`], the one
-//! implementation the door drives (`crate::door`), linked into a busbar build or exported by the
-//! sibling `busbar-transport-ws-plugin` cdylib.
+//! §2: meta, claims, and the kind-named entry): the `ws` framer the door drives (`crate::door`, the
+//! memory-ABI framer door, linked into a busbar build or exported by the sibling
+//! `busbar-transport-ws-plugin` cdylib).
 //!
 //! SANS-IO. The framer holds no socket, no waker and no clock: core hands it the bytes the carrier
 //! read and sends the bytes it answers. Each framing state is the WebSocket protocol machine over an
@@ -41,9 +41,9 @@
 //!   library, the `tungstenite` family).
 //! * The message ceiling is the deployment's body cap, for a whole message and for a single frame.
 //!
-//! The upgrade INTO this framer is [`Framer::adopt`]: another framer gave up the stream with the
+//! The upgrade INTO this framer is [`WsFramer::adopt`]: another framer gave up the stream with the
 //! bytes it held (the upgrade request itself), and this one answers it. Nothing upgrades out of a
-//! WebSocket, so [`Framer::detach`] refuses.
+//! WebSocket, so [`WsFramer::detach`] refuses.
 
 use std::collections::{HashMap, VecDeque};
 use std::io::{Read, Write};
@@ -53,8 +53,8 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use busbar_contract::abi::transport::fields::{hop_by_hop, LINE_END, SEPARATOR};
 use busbar_contract::ids::StreamId;
 use busbar_contract::transport::wire::{CloseReason, Encode, TransportError, WireStatusClass};
-use busbar_contract::transport::{BytesOut, ConnFacts, Framed, Framer, FramerOut, Located, Side};
-use busbar_contract::{AbiVersion, Kind, Plugin};
+
+use crate::frame::{BytesOut, Framed, FramerOut, Located, Side};
 use tungstenite::client::IntoClientRequest;
 use tungstenite::error::ProtocolError;
 use tungstenite::handshake::client::ClientHandshake;
@@ -801,7 +801,7 @@ impl WsFramer {
     ///
     /// # Errors
     ///
-    /// As [`Framer::refusal`].
+    /// As [`WsFramer::refusal`].
     pub(crate) fn refusal_with(
         &self,
         state: u64,
@@ -858,7 +858,7 @@ impl WsFramer {
         })
     }
 
-    /// [`Framer::open`], a dialled connection's upgrade request carrying `fields` (the dial's
+    /// [`WsFramer::open`], a dialled connection's upgrade request carrying `fields` (the dial's
     /// opening head fields, `BeginIn::fields`).
     ///
     /// # Errors
@@ -875,7 +875,7 @@ impl WsFramer {
         Ok(self.hold(phase))
     }
 
-    /// [`Framer::emit`]: with `text` (the emit's `EMIT_TEXT`) the message goes out as a text
+    /// [`WsFramer::emit`]: with `text` (the emit's `EMIT_TEXT`) the message goes out as a text
     /// message, under the TEXT opcode, which promises UTF-8 (RFC 6455 §8.1): bytes that are not fail
     /// the write rather than go out under a promise they break. On a dialled connection whose
     /// handshake has not completed, the message is held and goes out the moment it does.
@@ -1430,22 +1430,12 @@ impl Default for WsFramer {
     }
 }
 
-impl Plugin for WsFramer {
-    fn key(&self) -> &'static str {
-        crate::linked::KEY
-    }
-    fn kind(&self) -> Kind {
-        Kind::Transport
-    }
-    fn abi(&self) -> AbiVersion {
-        busbar_contract::transport::TRANSPORT_ABI
-    }
-}
-
-impl Framer for WsFramer {
+/// THE FRAMER'S OPS, as the door calls them (`door`): every op answers at once, and nothing here
+/// reads a socket or a clock.
+impl WsFramer {
     /// A `ws://` target is reached at its `host:port`; a `wss://` one asks for its bytes to be
     /// secured before they leave, and names the host its certificate is checked against.
-    fn locate(&self, target: &str) -> Result<Located, TransportError> {
+    pub(crate) fn locate(&self, target: &str) -> Result<Located, TransportError> {
         let (secure, host, port, _path) = split_ws_url(target)?;
         Ok(Located {
             authority: format!("{}:{port}", authority_host(&host)),
@@ -1454,17 +1444,16 @@ impl Framer for WsFramer {
         })
     }
 
-    fn open(
+    pub(crate) fn open(
         &self,
         side: Side,
         target: &str,
-        _facts: &ConnFacts,
         out: &mut dyn FramerOut,
     ) -> Result<u64, TransportError> {
         self.open_with(side, target, &[], out)
     }
 
-    fn ingest(
+    pub(crate) fn ingest(
         &self,
         state: u64,
         bytes: &[u8],
@@ -1519,7 +1508,7 @@ impl Framer for WsFramer {
         }
     }
 
-    fn emit(
+    pub(crate) fn emit(
         &self,
         state: u64,
         _stream: StreamId,
@@ -1533,7 +1522,7 @@ impl Framer for WsFramer {
 
     /// A WebSocket message is its payload: the envelope belonged to the upgrade request, which is
     /// long over by the time a message is written.
-    fn encode_envelope(
+    pub(crate) fn encode_envelope(
         &self,
         _fields: &[(&str, &[u8])],
         body: &[u8],
@@ -1545,7 +1534,7 @@ impl Framer for WsFramer {
 
     /// A WebSocket connection carries one message stream: the refusal is one message, and the
     /// connection closes after it, with the orderly code.
-    fn refusal(
+    pub(crate) fn refusal(
         &self,
         state: u64,
         stream: Option<StreamId>,
@@ -1555,13 +1544,13 @@ impl Framer for WsFramer {
         self.refusal_with(state, stream, bytes, 0, out)
     }
 
-    fn close(&self, state: u64, reason: CloseReason, out: &mut dyn FramerOut) {
+    pub(crate) fn close(&self, state: u64, reason: CloseReason, out: &mut dyn FramerOut) {
         self.close_with(state, close_code_for(reason), out);
     }
 
     /// A WebSocket state keeps no deadline of its own (it never states one), so a tick finds nothing
     /// due; an unknown state is closed.
-    fn tick(&self, state: u64, _out: &mut dyn FramerOut) -> Result<(), TransportError> {
+    pub(crate) fn tick(&self, state: u64, _out: &mut dyn FramerOut) -> Result<(), TransportError> {
         if self.map().contains_key(&state) {
             Ok(())
         } else {
@@ -1571,20 +1560,23 @@ impl Framer for WsFramer {
 
     /// Nothing upgrades in-band out of a WebSocket (RFC 6455 defines no upgrade out of an
     /// established connection), so there is no stream to hand on: refusing is the protocol's answer.
-    fn detach(&self, _state: u64, _out: &mut dyn BytesOut) -> Result<(), TransportError> {
+    pub(crate) fn detach(
+        &self,
+        _state: u64,
+        _out: &mut dyn BytesOut,
+    ) -> Result<(), TransportError> {
         Err(TransportError::HandoffMismatch)
     }
 
     /// The upgrade into this framer: the stream another framer gave up, with the bytes it held —
     /// the upgrade request itself, on the accepting side — which this one answers.
-    fn adopt(
+    pub(crate) fn adopt(
         &self,
         side: Side,
-        facts: &ConnFacts,
         leftover: &[u8],
         out: &mut dyn FramerOut,
     ) -> Result<u64, TransportError> {
-        let state = self.open(side, "", facts, out)?;
+        let state = self.open(side, "", out)?;
         self.ingest(state, leftover, false, out)?;
         Ok(state)
     }

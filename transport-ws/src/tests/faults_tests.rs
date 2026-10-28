@@ -19,6 +19,8 @@ use std::mem::zeroed;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 
 use crate::door::{Begin, Emit, Ingest, Open};
+use crate::frame::{Framed, FramerOut, HostTime, Side};
+use crate::meta;
 use crate::WsFramer;
 use busbar_contract::abi::mechanism::call::{AbiStr, Outcome};
 use busbar_contract::abi::mechanism::lifecycle::{OpenIn, OpenOut};
@@ -28,8 +30,6 @@ use busbar_contract::abi::transport::{
     BeginIn, Claim, EmitIn, FramePiece, FramerOut as DoorOut, FramerSink, IngestIn, TransportTail,
     SIDE_ACCEPT, UNIT0_UPGRADE, YIELD_MORE,
 };
-use busbar_contract::transport::{ConnFacts, Framed, Framer, FramerOut, HostTime, Side};
-use busbar_contract::TransportMeta;
 use tungstenite::protocol::Role;
 use tungstenite::{Bytes, Message, WebSocket};
 
@@ -68,16 +68,13 @@ fn ws_claims_ws_and_wss() {
 }
 
 /// RED (audit: the admitted claim row contradicts the transport's own declaration): every row the
-/// Statement admits states exactly what `TransportMeta` declares (THE DESIGN §2, "Each fact is
+/// Statement admits states exactly what `meta.rs` declares (THE DESIGN §2, "Each fact is
 /// declared once; anything derivable is derived").
 #[test]
 fn every_claim_row_states_the_declaration() {
-    const N: usize = <WsFramer as TransportMeta>::SELECTOR_FORMS.len();
-    let forms: [u8; N] = form_codes(<WsFramer as TransportMeta>::SELECTOR_FORMS);
-    let facts: Vec<&[u8]> = <WsFramer as TransportMeta>::TRANSPORT_FACTS
-        .iter()
-        .map(|f| f.as_bytes())
-        .collect();
+    const N: usize = meta::SELECTOR_FORMS.len();
+    let forms: [u8; N] = form_codes(meta::SELECTOR_FORMS);
+    let facts: Vec<&[u8]> = meta::TRANSPORT_FACTS.iter().map(|f| f.as_bytes()).collect();
     let (_, rows) = claims();
     assert!(!rows.is_empty());
     for row in rows {
@@ -96,14 +93,10 @@ fn every_claim_row_states_the_declaration() {
                 .collect()
         };
         assert_eq!(stated, facts, "transport facts");
-        assert_eq!(
-            row.session,
-            u8::from(<WsFramer as TransportMeta>::SESSION),
-            "session"
-        );
+        assert_eq!(row.session, u8::from(meta::SESSION), "session");
         assert_eq!(
             row.session_bound,
-            u8::from(<WsFramer as TransportMeta>::SESSION_BOUND),
+            u8::from(meta::SESSION_BOUND),
             "session_bound"
         );
         assert_eq!(
@@ -142,12 +135,8 @@ impl FramerOut for Out {
         self.ended = true;
     }
     fn now(&self) -> HostTime {
-        HostTime {
-            monotonic_nanos: 1,
-            unix_nanos: 1,
-        }
+        HostTime { unix_nanos: 1 }
     }
-    fn wake_at(&mut self, _: Option<u64>) {}
 }
 
 /// A client's binary message `hi`, masked with the all-zero key.
@@ -157,7 +146,7 @@ const HI: &[u8] = &[0x82, 0x82, 0, 0, 0, 0, b'h', b'i'];
 fn accepted(f: &WsFramer) -> u64 {
     let mut out = Out::default();
     let s = f
-        .open(Side::Accept, "", &ConnFacts::default(), &mut out)
+        .open(Side::Accept, "", &mut out)
         .expect("an accepted framing opens");
     f.ingest(s, UPGRADE, false, &mut out)
         .expect("the upgrade is answered");
@@ -169,7 +158,7 @@ fn accepted(f: &WsFramer) -> u64 {
 fn opening(target: &str) -> String {
     let f = WsFramer::new(0);
     let mut out = Out::default();
-    let opened = f.open(Side::Dial, target, &ConnFacts::default(), &mut out);
+    let opened = f.open(Side::Dial, target, &mut out);
     assert!(opened.is_ok(), "a dial to {target} opens: {opened:?}");
     String::from_utf8_lossy(&out.wire).into_owned()
 }
@@ -247,7 +236,7 @@ fn a_panic_in_one_framing_leaves_the_others_working() {
     let f = WsFramer::new(0);
     let a = accepted(&f);
     let b = f
-        .open(Side::Accept, "", &ConnFacts::default(), &mut Out::default())
+        .open(Side::Accept, "", &mut Out::default())
         .expect("a second framing opens");
     let mut failing = Out {
         panics: true,
