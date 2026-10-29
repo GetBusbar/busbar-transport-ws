@@ -206,6 +206,7 @@ impl Host {
         let mut end = End::default();
         let mut i: BeginIn = z();
         i.side = side;
+        i.scheme = busbar_contract::abi::host::service::SCHEME_PLAIN;
         i.target = AbiStr {
             ptr: target.as_ptr(),
             len: target.len(),
@@ -606,6 +607,7 @@ fn begin_refuses_a_target_that_is_not_text() {
     let target: &'static [u8] = b"ws://svc.test/\xff\xfe";
     let mut i: BeginIn = z();
     i.side = SIDE_DIAL;
+    i.scheme = busbar_contract::abi::host::service::SCHEME_PLAIN;
     i.target = AbiStr {
         ptr: target.as_ptr(),
         len: target.len(),
@@ -722,6 +724,7 @@ fn a_zero_message_ceiling_is_refused_by_validate_and_open() {
 fn refused_begin(host: &mut Host, target: &'static str) -> String {
     let mut i: BeginIn = z();
     i.side = SIDE_DIAL;
+    i.scheme = busbar_contract::abi::host::service::SCHEME_PLAIN;
     i.target = AbiStr {
         ptr: target.as_ptr(),
         len: target.len(),
