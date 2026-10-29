@@ -337,6 +337,7 @@ impl Host {
         };
         let mut b: BeginIn = z();
         b.side = SIDE_ACCEPT;
+        b.scheme = busbar_contract::abi::host::service::SCHEME_PLAIN;
         b.target = AbiStr {
             ptr: std::ptr::null(),
             len: 0,

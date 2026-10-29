@@ -180,6 +180,7 @@ impl Host {
     fn accept(&mut self) -> u64 {
         let mut i: BeginIn = z();
         i.side = SIDE_ACCEPT;
+        i.scheme = busbar_contract::abi::host::service::SCHEME_PLAIN;
         i.target = AbiStr {
             ptr: [].as_ptr(),
             len: 0,
