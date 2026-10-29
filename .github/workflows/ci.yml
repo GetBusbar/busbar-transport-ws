@@ -29,12 +29,12 @@ permissions:
 
 jobs:
   ci:
-    uses: GetBusbar/busbar/.github/workflows/plugin-ci.yml@91af6001dad844b8a441e41c397034a874ccb52f
+    uses: GetBusbar/busbar/.github/workflows/plugin-ci.yml@e171ea95260a76ba3cd7156dab480fe4cae60747
     with:
       service: none
       busbar_checkout: true
       macos_test: "cargo test --workspace --locked"
-      extra_test: "set -euo pipefail\nB=\"$GITHUB_WORKSPACE/busbar\"\nmkdir -p \"$B/.cargo\"\nprintf '\\n[patch.\"https://github.com/GetBusbar/busbar-transport-ws\"]\\nbusbar-transport-ws = { path = \"%s/transport-ws\" }\\n' \"$PWD\" >> \"$B/.cargo/config.toml\"\nbash \"$B/testing/ws-conformance/scripts/run.sh\" --subject"
+      extra_test: "set -euo pipefail\nbash testing/ws-conformance/scripts/run.sh --subject"
       plugin_crate: busbar-transport-ws-plugin
       plugin_kind: transport
       plugin_alias: ws
