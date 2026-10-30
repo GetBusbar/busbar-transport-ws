@@ -926,3 +926,20 @@ fn nothing_is_kept_after_the_peers_close() {
         assert_eq!(framer.inbound_len(state), Some(0), "nobody's bytes");
     }
 }
+
+/// AN UPGRADE ANSWERED WITH ANOTHER 2XX IS NO SUCCESS (codeaudit e916fda WS-5; RFC 6455 section
+/// 4.1: any status but `101` fails the handshake): a far end that answers `200` (a plain web server,
+/// an SPA fallback) never upgraded, so its head states no success to the breaker or the plane; it
+/// is a refused upgrade outside the three classes. RED before the fix: `200` was stated `Success`.
+#[test]
+fn an_upgrade_answered_with_another_2xx_is_no_success() {
+    for code in [200, 204, 206] {
+        let wire = format!("HTTP/1.1 {code} OK\r\nContent-Length: 0\r\n\r\n");
+        let (_, _, heard) = refused_with(wire.as_bytes(), false);
+        assert_eq!(
+            heard.statuses[0],
+            Some((code, Some(WireStatusClass::Other))),
+            "{code}"
+        );
+    }
+}
