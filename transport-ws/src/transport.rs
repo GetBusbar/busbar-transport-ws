@@ -1637,13 +1637,22 @@ impl WsFramer {
     }
 
     /// The upgrade into this framer: the stream another framer gave up, with the bytes it held —
-    /// the upgrade request itself, on the accepting side — which this one answers.
+    /// the upgrade request itself, on the accepting side — which this one answers. A dialling end
+    /// has no target to dial and no request to answer: what it is handed is no stream this end can
+    /// adopt.
+    ///
+    /// # Errors
+    ///
+    /// The side is the dialling one ([`TransportError::HandoffMismatch`]), or the leftover failed.
     pub(crate) fn adopt(
         &self,
         side: Side,
         leftover: &[u8],
         out: &mut dyn FramerOut,
     ) -> Result<u64, TransportError> {
+        if side == Side::Dial {
+            return Err(TransportError::HandoffMismatch);
+        }
         let state = self.open(side, "", out)?;
         self.ingest(state, leftover, false, out)?;
         Ok(state)
