@@ -240,7 +240,10 @@ fn a_carrier_end_without_a_close_ends_the_stream_failed() {
     let mut out = Out::default();
     let r = f.ingest(s, &[0x02, 0x82, 0, 0, 0, 0, b'h', b'i'], true, &mut out);
     assert!(r.is_ok(), "{r:?}");
-    assert!(out.ended && out.frames.is_empty(), "no partial message is handed up");
+    assert!(
+        out.ended && out.frames.is_empty(),
+        "no partial message is handed up"
+    );
     assert_eq!(f.failure(s), Some(WHY));
 }
 
@@ -545,7 +548,11 @@ fn a_dribbled_answer_head_is_not_copied_per_call() {
     let mut dial = (f, s, true);
     let head = b"HTTP/1.1 101 Switching Protocols\r\nX-Pad: ";
     let per = per_call(&mut dial, &mut |(f, s, first)| {
-        let chunk: &[u8] = if std::mem::take(first) { head } else { &[b'a'; 130] };
+        let chunk: &[u8] = if std::mem::take(first) {
+            head
+        } else {
+            &[b'a'; 130]
+        };
         f.ingest(*s, chunk, false, &mut Out::default())
             .expect("the head is not whole yet");
     });
