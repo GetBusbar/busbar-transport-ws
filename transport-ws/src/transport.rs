@@ -466,10 +466,12 @@ fn message_of(bytes: Bytes, text: bool) -> Result<Message, WsError> {
     }
 }
 
-/// The status class of a far end's answer to the upgrade, by its HTTP status.
+/// The status class of a far end's REFUSAL of the upgrade, by its HTTP status. Only `101` completes
+/// the handshake (RFC 6455 section 4.1), and it never reaches here: any other answer, a `2xx`
+/// included, is a refused upgrade, never a success. A status outside the caller's and the far
+/// end's fault bands is `Other`.
 fn status_class(code: u16) -> WireStatusClass {
     match code {
-        200..=299 => WireStatusClass::Success,
         400..=499 => WireStatusClass::CallerFault,
         500..=599 => WireStatusClass::FarEndFault,
         _ => WireStatusClass::Other,
