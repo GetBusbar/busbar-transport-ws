@@ -42,11 +42,11 @@ use busbar_contract::abi::transport::{
     IngestIn, IoOut, ListenIn, ListenOut, LocateIn, LocateOut, Ops, ReadIn, RefuseIn, SettingDecl,
     ShutIn, TransportTail, WriteIn, CANCEL_NOTHING_MOVED, CLOSE_CAPACITY_EXHAUSTED, CLOSE_DRAIN,
     CLOSE_PEER_CLOSED, CLOSE_POISONED, CLOSE_REVOKED, CLOSE_TIMEOUT, CLOSE_TRANSPORT_FAILED,
-    EMIT_TEXT, FAULT_NONE, FRAME_PIECE_SIZE, FRAMING_STREAM, PIECE_CONTINUED, PIECE_END,
-    PIECE_END_OF_FRAME, PIECE_FIELDS, PIECE_HAS_CODE, PIECE_HAS_RETRY_AFTER, PIECE_STREAM_FAILED,
-    PIECE_TEXT, ROLE_FRAMER, SETTING_COUNT, SIDE_ACCEPT, SIDE_DIAL, STATUS_CALLER_FAULT,
-    STATUS_FAR_END_FAULT, STATUS_NONE, STATUS_OTHER, STATUS_SUCCESS, UNIT0_UPGRADE, YIELD_ENDED,
-    YIELD_MORE,
+    EMIT_TEXT, FACT_ACCEPTS, FACT_ADOPTS, FACT_DIALS, FAULT_NONE, FRAME_PIECE_SIZE, FRAMING_STREAM,
+    PIECE_CONTINUED, PIECE_END, PIECE_END_OF_FRAME, PIECE_FIELDS, PIECE_HAS_CODE,
+    PIECE_HAS_RETRY_AFTER, PIECE_STREAM_FAILED, PIECE_TEXT, ROLE_FRAMER, SETTING_COUNT,
+    SIDE_ACCEPT, SIDE_DIAL, STATUS_CALLER_FAULT, STATUS_FAR_END_FAULT, STATUS_NONE, STATUS_OTHER,
+    STATUS_SUCCESS, UNIT0_UPGRADE, YIELD_ENDED, YIELD_MORE,
 };
 use busbar_contract::ids::StreamId;
 use busbar_contract::transport::registry::DEFAULT_REQUEST_BODY_MAX_BYTES;
@@ -110,15 +110,19 @@ const SETTINGS: &[SettingDecl] = &[SettingDecl {
     default: abi_str(DEFAULT_BODY_MAX),
 }];
 
-/// No fact: the kernel makes the binding's one outbound auth call before `begin`, and the handshake
-/// writes its own lines after it. No transport names another: the carrier is the connector's
-/// choice, and an upgrade reaches this framer by `adopt`, never by composition.
+/// The op facts are the ops the door serves: the framer begins on the accepting side and on the
+/// dialling side, and adopts a stream another framer detached (`FACT_ACCEPTS`, `FACT_DIALS`,
+/// `FACT_ADOPTS`); it detaches nothing (nothing upgrades out of a WebSocket) and decodes no payload.
+/// The kernel makes the binding's one outbound auth call before `begin`, and the handshake writes
+/// its own lines after it. No transport names another: the carrier is the connector's choice, and
+/// an upgrade reaches this framer by `adopt`, never by composition.
 const TAIL: TransportTail = {
     let mut t = TransportTail::EMPTY
         .with_claim_rows(CLAIMS)
         .with_settings(SETTINGS);
     t.role = ROLE_FRAMER;
     t.framing = FRAMING_STREAM;
+    t.facts = FACT_ACCEPTS | FACT_DIALS | FACT_ADOPTS;
     t.frame_piece_size = FRAME_PIECE_SIZE;
     t
 };
