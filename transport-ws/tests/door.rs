@@ -1584,3 +1584,22 @@ fn the_tail_states_the_ops_the_door_serves() {
     let tail = unsafe { &*st.kind_tail.cast::<TransportTail>() };
     assert_eq!(tail.facts, FACT_ACCEPTS | FACT_DIALS | FACT_ADOPTS);
 }
+
+/// AN OPENING FIELD THE UPGRADE CANNOT CARRY IS REFUSED AS SUCH (codeaudit e916fda WS-14): a field
+/// whose name is no HTTP field name or whose value holds a line break or a control byte cannot be
+/// written on the request, so `begin` says that, naming neither the field's value (it may be a
+/// credential) nor a handshake that never ran. RED before the fix: it answered "the WebSocket
+/// opening handshake failed".
+#[test]
+fn an_opening_field_the_upgrade_cannot_carry_is_refused_as_such() {
+    const WHY: &str = "begin: an opening field is not a valid HTTP field, and the upgrade request cannot carry it";
+    let mut host = Host::open(linked(), (64 * 1024, 64 * 1024, 64));
+    for field in [
+        (&b"authorization"[..], &b"Bearer sk\r\nX-Evil: 1"[..]),
+        (&b"bad name"[..], &b"v"[..]),
+    ] {
+        let said = begin_with_fields(&mut host, "ws://svc.test/x", &[field]);
+        assert_eq!(said.as_deref(), Some(WHY), "{field:?}");
+    }
+    host.close();
+}
