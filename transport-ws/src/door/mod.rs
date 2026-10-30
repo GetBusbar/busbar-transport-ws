@@ -862,13 +862,17 @@ op!(
             return Outcome::Failed;
         }
         let fields = opening_fields(i);
-        if crate::transport::asks_extension(&fields.0) {
-            o.error(BEGIN_EXTENSION);
-            return Outcome::Failed;
-        }
-        if !crate::transport::carries_all(&fields.0) {
-            o.error(BEGIN_UNCARRIABLE);
-            return Outcome::Failed;
+        // Only a dial's request carries its opening fields, and a target that is no ws URL is
+        // refused for that first (by the open below), whatever the fields.
+        if matches!(side, Side::Dial) && crate::transport::split_ws_url(target).is_ok() {
+            if crate::transport::asks_extension(&fields.0) {
+                o.error(BEGIN_EXTENSION);
+                return Outcome::Failed;
+            }
+            if !crate::transport::carries_all(&fields.0) {
+                o.error(BEGIN_UNCARRIABLE);
+                return Outcome::Failed;
+            }
         }
         opening(&p, &BEGIN, i.field(|x| &x.sink), &mut o, |f, c| {
             f.open_with(side, target, &fields.0, c)
