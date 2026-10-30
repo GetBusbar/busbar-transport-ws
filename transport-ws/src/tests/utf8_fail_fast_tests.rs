@@ -304,3 +304,30 @@ fn invalid_text_before_the_carriers_end_is_the_stated_failure() {
         Some("the far end sent a text message that is not UTF-8")
     );
 }
+
+/// OUT-OF-ORDER FRAMES ARE THE LIBRARY'S TO FAIL TOO (codeaudit e916fda WS-3, review): inside a
+/// text message, a new TEXT frame (the next data frame must continue the message) or a reserved
+/// data opcode breaks the protocol; whatever its payload, the library fails it with 1002 (at its
+/// header, or as it completes), never 1007 from the scan.
+#[test]
+fn an_out_of_order_frame_inside_a_text_message_is_not_judged_as_text() {
+    for opcode in [TEXT, 0x3] {
+        let framer = WsFramer::new(0);
+        let state = open(&framer);
+        let mut first = client(false, TEXT, b"ok");
+        let bad = client(true, opcode, &[0xff, 0xfe, 0xfd, 0xfc, 0xfb]);
+        first.extend_from_slice(&bad[..bad.len() - 2]);
+        let mut out = Out::default();
+        framer.ingest(state, &first, false, &mut out).unwrap();
+        framer
+            .ingest(state, &bad[bad.len() - 2..], false, &mut out)
+            .unwrap();
+        assert!(out.ended, "{opcode}");
+        assert_eq!(
+            framer.failure(state),
+            Some("the far end broke the WebSocket protocol"),
+            "{opcode}"
+        );
+        assert_eq!(close_code(&framer, state), Some(1002), "{opcode}");
+    }
+}
