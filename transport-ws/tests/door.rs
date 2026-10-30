@@ -1626,3 +1626,44 @@ fn a_dialling_end_adopts_nothing() {
     );
     host.close();
 }
+
+/// THE FIELD CHECKS ARE A DIAL'S, AND A BAD TARGET STILL SAYS SO FIRST (codeaudit e916fda WS-7,
+/// WS-14, review): a dial whose target is no ws URL is refused for its target whatever its fields,
+/// as before; an accepting `begin`, whose fields no request carries, is not refused for them. RED
+/// before the fix: both answered the field refusal.
+#[test]
+fn the_field_checks_are_a_dials_and_a_bad_target_says_so_first() {
+    let mut host = Host::open(linked(), (64 * 1024, 64 * 1024, 64));
+    for field in [
+        (&b"sec-websocket-extensions"[..], &b"permessage-deflate"[..]),
+        (&b"bad name"[..], &b"v"[..]),
+    ] {
+        assert_eq!(
+            begin_with_fields(&mut host, "http://svc.test/x", &[field]).as_deref(),
+            Some("begin: the target is not a ws:// or wss:// URL"),
+            "{field:?}"
+        );
+    }
+    use busbar_contract::abi::mechanism::call::Field;
+    let (n, v) = (b"bad name", b"v");
+    let fields = [Field {
+        name: AbiStr {
+            ptr: n.as_ptr(),
+            len: n.len(),
+        },
+        value: AbiStr {
+            ptr: v.as_ptr(),
+            len: v.len(),
+        },
+    }];
+    let mut i: BeginIn = z();
+    i.side = SIDE_ACCEPT;
+    i.scheme = busbar_contract::abi::host::service::SCHEME_PLAIN;
+    i.fields = fields.as_ptr();
+    i.fields_len = fields.len();
+    i.sink = host.sink();
+    let mut o: FramerOut = z();
+    let r = call(host.ops.begin, host.inst, &mut i, &mut o, slot::BEGIN);
+    assert_eq!(r, Outcome::Ready, "{}", said(&o.head.error));
+    host.close();
+}
