@@ -89,9 +89,16 @@ pub(crate) struct Pipe {
 /// the session ingests: frame headers by the library's own parser, text payload bytes through
 /// `Utf8Error::error_len` (`None` = an incomplete tail, carried to the next bytes; `Some` = invalid).
 /// It only ever fails EARLIER than the library would; anything it cannot follow switches it off and
-/// the library alone judges.
+/// the library alone judges. A frame whose header already breaks the protocol (RFC 6455 sections
+/// 5.1 to 5.5: masked the wrong way for its side, a reserved bit with no extension, a reserved
+/// opcode, a fragment out of order, a fragmented or oversized control frame) is the library's to
+/// fail with 1002 as it completes, so the scan switches off at its header and never judges it.
 #[derive(Default)]
 struct TextScan {
+    /// The peer's frames are masked: it is the client (RFC 6455 section 5.3).
+    masked: bool,
+    /// A fragmented message is under way: the next data frame must continue it.
+    in_message: bool,
     /// Header bytes of the frame being read (at most 14), and how many.
     head: [u8; 14],
     head_len: usize,
@@ -130,6 +137,25 @@ impl TextScan {
                         if matches!(header.opcode, OpCode::Control(Control::Close)) {
                             self.off = true;
                             continue;
+                        }
+                        let breaks = header.rsv1
+                            || header.rsv2
+                            || header.rsv3
+                            || header.mask.is_some() != self.masked
+                            || match header.opcode {
+                                OpCode::Data(Data::Continue) => !self.in_message,
+                                OpCode::Data(Data::Text | Data::Binary) => self.in_message,
+                                OpCode::Control(Control::Ping | Control::Pong) => {
+                                    !header.is_final || len > 125
+                                }
+                                OpCode::Data(Data::Reserved(_)) | OpCode::Control(_) => true,
+                            };
+                        if breaks {
+                            self.off = true;
+                            continue;
+                        }
+                        if matches!(header.opcode, OpCode::Data(_)) {
+                            self.in_message = !header.is_final;
                         }
                         // A fragmented message's kind is its first fragment's; a control frame
                         // between fragments carries no text.
@@ -1113,7 +1139,10 @@ impl WsFramer {
                     // its frames from the next call on.
                     let pipe = ws.get_mut();
                     pipe.seen = Vec::new();
-                    pipe.scan = Some(TextScan::default());
+                    pipe.scan = Some(TextScan {
+                        masked: true,
+                        ..TextScan::default()
+                    });
                     Phase::open(ws, Vec::new())
                 }
                 Err(HandshakeError::Interrupted(mid)) => {
