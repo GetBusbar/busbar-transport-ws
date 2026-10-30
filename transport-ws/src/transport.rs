@@ -1078,6 +1078,18 @@ impl WsFramer {
         guard.as_mut().map(|phase| phase.pipe().inbound.len())
     }
 
+    /// Where framing `state`'s pipe keeps the bytes it writes, and how large that block is (a test
+    /// watches the block go back to the allocator).
+    #[cfg(test)]
+    pub(crate) fn outbound_block(&self, state: u64) -> Option<(*const u8, usize)> {
+        let conn = self.conn(state).ok()?;
+        let mut guard = Self::enter(&conn).ok()?;
+        guard.as_mut().map(|phase| {
+            let out = &phase.pipe().outbound;
+            (out.as_ptr(), out.capacity())
+        })
+    }
+
     /// Framing `state`'s own lock, found under the map's.
     fn conn(&self, state: u64) -> Result<Conn, TransportError> {
         self.map()

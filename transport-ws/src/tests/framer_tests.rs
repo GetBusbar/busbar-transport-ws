@@ -1068,3 +1068,15 @@ fn a_shipped_dial_sends_a_fresh_key_and_masks_every_frame() {
         "a fresh mask per frame: {masks:02x?}"
     );
 }
+
+/// A CHUNK-SIZE LINE PAST ITS BOUND ENDS THE BODY FAILED (codeaudit e916fda tests LOW): a refused
+/// upgrade's chunked body whose size line runs on past `CHUNK_LINE_MAX` with no line end is
+/// malformed; the frames end there, failed, and the decoder holds no more of it.
+#[test]
+fn a_chunk_line_past_its_bound_ends_the_body_failed() {
+    let mut wire = b"HTTP/1.1 401 Unauthorized\r\nTransfer-Encoding: chunked\r\n\r\n".to_vec();
+    wire.extend(std::iter::repeat_n(b'a', 4097));
+    let (framer, state, heard) = refused_with(&wire, false);
+    assert!(heard.ended, "the frames end at the bound");
+    assert!(framer.failed(state), "failed, not whole");
+}
