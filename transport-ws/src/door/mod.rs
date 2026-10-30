@@ -276,7 +276,11 @@ struct Owed {
     wire_at: usize,
     /// `wire[..secret]` held the framing's opening (a dialled upgrade request carries its auth's
     /// credential lines): each of those bytes is wiped as it is handed over, when the buffer
-    /// outgrows them, and on drop. Message bytes after it are not.
+    /// outgrows them, and on drop. Message bytes after it are not. This is one of the copies of
+    /// the credential this plugin owns, each wiped (the opening fields `begin` copies, the pipe the
+    /// request is written through, this queue); the protocol library's own copies (the request's
+    /// header values it takes, the request buffer it generates) are dropped unwiped inside it, the
+    /// known residue of credentials reaching a framer as plaintext until the sealed attach slot.
     secret: usize,
     pieces: VecDeque<Piece>,
     /// The byte buffers of pieces already handed over, kept for the next pieces: a framing in
@@ -485,17 +489,33 @@ impl frame::FramerOut for Collect<'_> {
     }
 }
 
-/// A dial's opening head fields (`BeginIn::fields`), owned.
-fn opening_fields(i: Lent<'_, BeginIn>) -> Vec<(String, Vec<u8>)> {
-    i.fields()
-        .iter()
-        .map(|f| {
-            (
-                String::from_utf8_lossy(f.field(|x| &x.name).bytes()).into_owned(),
-                f.field(|x| &x.value).bytes().to_vec(),
-            )
-        })
-        .collect()
+/// A dial's opening head fields (`BeginIn::fields`), owned for the one `begin` call: they may carry
+/// the binding's credential (its `Authorization` line), so every byte of this copy is wiped when it
+/// drops, refused or not.
+struct OpeningFields(Vec<(String, Vec<u8>)>);
+
+impl Drop for OpeningFields {
+    fn drop(&mut self) {
+        for (name, value) in &mut self.0 {
+            name.zeroize();
+            value.zeroize();
+        }
+    }
+}
+
+/// A dial's opening head fields, copied out of the host's lent ones.
+fn opening_fields(i: Lent<'_, BeginIn>) -> OpeningFields {
+    OpeningFields(
+        i.fields()
+            .iter()
+            .map(|f| {
+                (
+                    String::from_utf8_lossy(f.field(|x| &x.name).bytes()).into_owned(),
+                    f.field(|x| &x.value).bytes().to_vec(),
+                )
+            })
+            .collect(),
+    )
 }
 
 fn time(sink: &FramerSink) -> HostTime {
@@ -836,12 +856,12 @@ op!(
             return Outcome::Failed;
         }
         let fields = opening_fields(i);
-        if crate::transport::asks_extension(&fields) {
+        if crate::transport::asks_extension(&fields.0) {
             o.error(BEGIN_EXTENSION);
             return Outcome::Failed;
         }
         opening(&p, &BEGIN, i.field(|x| &x.sink), &mut o, |f, c| {
-            f.open_with(side, target, &fields, c)
+            f.open_with(side, target, &fields.0, c)
         })
     }
 );
