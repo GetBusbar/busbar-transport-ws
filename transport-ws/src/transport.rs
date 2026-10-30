@@ -1417,9 +1417,13 @@ impl WsFramer {
         };
         let done = op(ws, message, *max);
         drain(phase, out);
+        // A send once a close has begun (`SendAfterClosing`: the far end's Close was read, the
+        // machine is closing) finds the connection closed, as a terminated machine's does.
         done.map_err(|e| match e {
             WsError::Capacity(_) | WsError::Utf8(_) => TransportError::Framing,
-            WsError::ConnectionClosed | WsError::AlreadyClosed => TransportError::Closed,
+            WsError::ConnectionClosed
+            | WsError::AlreadyClosed
+            | WsError::Protocol(ProtocolError::SendAfterClosing) => TransportError::Closed,
             _ => TransportError::Reset,
         })
     }
