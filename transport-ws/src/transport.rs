@@ -1432,8 +1432,11 @@ impl WsFramer {
             }
         }
         // Text that turned invalid before its frame completed fails the connection now (RFC 6455
-        // section 8.1), as the library fails it when the frame does.
-        if failed.is_none() && ws.get_ref().scan.as_ref().is_some_and(|scan| scan.bad) {
+        // section 8.1), as the library fails it when the frame does; it broke before a carrier end
+        // that came in the same call, so it is the failure stated.
+        if matches!(failed, None | Some(CloseCode::Abnormal))
+            && ws.get_ref().scan.as_ref().is_some_and(|scan| scan.bad)
+        {
             *failed = Some(CloseCode::Invalid);
         }
         if failed.is_some() {
