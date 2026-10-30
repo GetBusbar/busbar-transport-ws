@@ -1603,3 +1603,26 @@ fn an_opening_field_the_upgrade_cannot_carry_is_refused_as_such() {
     }
     host.close();
 }
+
+/// A DIALLING END ADOPTS NOTHING (codeaudit e916fda WS-15): a stream handed over takes the upgrade
+/// request it carried on the accepting side; on the dialling side there is no target to dial, so
+/// `adopt` refuses with the contract's hand-off mismatch, not a URL problem nobody gave it. RED
+/// before the fix: it answered "the target is not a ws:// or wss:// URL".
+#[test]
+fn a_dialling_end_adopts_nothing() {
+    let mut host = Host::open(linked(), (64 * 1024, 64 * 1024, 8));
+    let leftover = b"HTTP/1.1 101 Switching Protocols\r\n\r\n";
+    let mut i: AdoptIn = z();
+    i.side = SIDE_DIAL;
+    i.leftover = leftover.as_ptr();
+    i.leftover_len = leftover.len();
+    i.sink = host.sink();
+    let mut o: FramerOut = z();
+    let r = call(host.ops.adopt, host.inst, &mut i, &mut o, slot::ADOPT);
+    assert_eq!(r, Outcome::Failed);
+    assert_eq!(
+        said(&o.head.error),
+        "adopt: the stream handed over is not one this end can adopt"
+    );
+    host.close();
+}
