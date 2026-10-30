@@ -287,3 +287,20 @@ fn an_accepted_call_with_frame_bytes_after_a_chunk_sized_request_does_not_arm_th
     assert!(!rest.ended, "the connection lives");
     assert_eq!(rest.frames, [payload.to_vec()], "the binary message, whole");
 }
+
+/// THE EARLIER FAULT IS THE ONE STATED (codeaudit e916fda WS-6, review): an invalid text byte and
+/// the carrier's end in the same call fail the connection for the text, which broke first; the end
+/// with no closing handshake came after it. RED before the fix: the end piece blamed the carrier.
+#[test]
+fn invalid_text_before_the_carriers_end_is_the_stated_failure() {
+    let framer = WsFramer::new(0);
+    let state = open(&framer);
+    let frame = client(true, TEXT, &[0xff, 0xfe, 0xfd]);
+    let mut out = Out::default();
+    framer.ingest(state, &frame[..7], true, &mut out).unwrap();
+    assert!(out.ended);
+    assert_eq!(
+        framer.failure(state),
+        Some("the far end sent a text message that is not UTF-8")
+    );
+}
