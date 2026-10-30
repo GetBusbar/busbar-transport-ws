@@ -559,3 +559,43 @@ fn a_dribbled_answer_head_is_not_copied_per_call() {
     println!("PROOF allocations per dribbled call: {per}");
     assert!(per < 0.25, "a dribbled call costs {per} allocations");
 }
+
+/// AN EMIT AFTER THE PEER'S CLOSE FINDS THE CONNECTION CLOSED (codeaudit e916fda WS-13): on a
+/// dialled connection the far end's Close leaves the machine closing, not terminated, and it
+/// refuses a send then (`SendAfterClosing`): the connection closed cleanly, never reset, as an
+/// accepted end (terminated at once) already answers. RED before the fix: it answered `Reset`.
+#[test]
+fn an_emit_after_the_peers_close_finds_the_connection_closed() {
+    use busbar_contract::transport::wire::TransportError;
+    let f = WsFramer::new(0);
+    let mut out = Out::default();
+    let s = f
+        .open(Side::Dial, "ws://svc.test/x", &mut out)
+        .expect("the dial opens");
+    let request = String::from_utf8(std::mem::take(&mut out.wire)).expect("a request");
+    let key = request
+        .lines()
+        .find_map(|l| l.strip_prefix("Sec-WebSocket-Key: "))
+        .expect("a key");
+    let answer = format!(
+        "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\
+         Sec-WebSocket-Accept: {}\r\n\r\n",
+        tungstenite::handshake::derive_accept_key(key.as_bytes())
+    );
+    f.ingest(s, answer.as_bytes(), false, &mut out)
+        .expect("the upgrade completes");
+    // The far end's (unmasked) Close, 1000.
+    let mut closed = Out::default();
+    f.ingest(s, &[0x88, 0x02, 0x03, 0xe8], false, &mut closed)
+        .expect("the far end closes");
+    assert!(closed.ended);
+    let r = f.emit(
+        s,
+        busbar_contract::ids::StreamId(0),
+        b"late",
+        true,
+        false,
+        &mut out,
+    );
+    assert_eq!(r, Err(TransportError::Closed));
+}
