@@ -516,3 +516,25 @@ fn a_steady_framing_adds_no_allocation_of_its_own_per_message() {
         "an outbound message costs {outbound} allocations; the crossing {crossing} and the library {library_out}"
     );
 }
+
+/// A DRIBBLED UPGRADE ANSWER COSTS NO COPY PER CALL (codeaudit e916fda WS-4): while a dial's
+/// answer head arrives a little per call, the framer reads what the handshake has seen in place;
+/// it copies none of it until the head is whole. RED before the fix: every call cloned everything
+/// seen so far (one allocation per call, quadratic bytes under a dribbling far end).
+#[test]
+fn a_dribbled_answer_head_is_not_copied_per_call() {
+    let f = WsFramer::new(0);
+    let mut out = Out::default();
+    let s = f
+        .open(Side::Dial, "ws://svc.test/x", &mut out)
+        .expect("the dial opens");
+    let mut dial = (f, s, true);
+    let head = b"HTTP/1.1 101 Switching Protocols\r\nX-Pad: ";
+    let per = per_call(&mut dial, &mut |(f, s, first)| {
+        let chunk: &[u8] = if std::mem::take(first) { head } else { &[b'a'; 130] };
+        f.ingest(*s, chunk, false, &mut Out::default())
+            .expect("the head is not whole yet");
+    });
+    println!("PROOF allocations per dribbled call: {per}");
+    assert!(per < 0.25, "a dribbled call costs {per} allocations");
+}
