@@ -204,3 +204,19 @@ fn a_handshake_call_ending_mid_frame_in_crlfcrlf_does_not_arm_the_scan() {
     assert_eq!(rest.frames, [payload], "the binary message, whole");
     assert!(!framer.failed(state));
 }
+
+/// NOTHING AFTER A CLOSE IS DATA (codeaudit e916fda WS-2; RFC 6455 section 5.5.1): bytes that
+/// follow the peer's Close in the same call are not judged, so a completed closing handshake ends
+/// the stream cleanly whatever trails it. RED before the fix: a text frame of invalid UTF-8 after
+/// the Close turned the clean close into a failed stream.
+#[test]
+fn bytes_after_the_peers_close_are_not_judged() {
+    let framer = WsFramer::new(0);
+    let state = open(&framer);
+    let mut call = client(true, 0x8, &1000_u16.to_be_bytes());
+    call.extend(client(true, TEXT, &[0xff, 0xfe]));
+    let mut out = Out::default();
+    framer.ingest(state, &call, false, &mut out).unwrap();
+    assert!(out.ended, "the peer closed");
+    assert_eq!(framer.failure(state), None, "cleanly");
+}
