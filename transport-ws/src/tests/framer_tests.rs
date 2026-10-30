@@ -298,22 +298,22 @@ fn a_refused_upgrade_hands_up_its_body_and_its_reason() {
     let mut first = answer.into_bytes();
     first.extend_from_slice(&body[..5]);
     let mut heard = Out::default();
-    framer
-        .ingest(state, &first, false, &mut heard)
+    let reason = framer
+        .ingest_head(state, &first, false, &mut heard)
         .expect("the far end answered");
     assert_eq!(
         heard.statuses[0],
         Some((401, Some(WireStatusClass::CallerFault)))
     );
-    assert_eq!(
-        framer.take_reason(state).as_deref(),
-        Some(&b"Unauthorized"[..])
-    );
-    assert_eq!(framer.take_reason(state), None, "taken once");
+    assert_eq!(reason.as_deref(), Some(&b"Unauthorized"[..]));
     let mut rest = Out::default();
-    framer
-        .ingest(state, &body[5..], false, &mut rest)
+    let reason = framer
+        .ingest_head(state, &body[5..], false, &mut rest)
         .expect("the rest of the body");
+    assert_eq!(
+        reason, None,
+        "only the call that handed the head up states it"
+    );
     let mut got: Vec<u8> = heard.frames[1..].concat();
     got.extend(rest.frames.concat());
     assert_eq!(got, body.to_vec(), "the whole error document, once");
