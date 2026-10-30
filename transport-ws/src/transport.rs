@@ -450,6 +450,19 @@ fn rides_upgrade(name: &str) -> bool {
         && (lower == SUBPROTOCOL || !lower.starts_with("sec-websocket-"))
 }
 
+/// Whether every opening field that rides the upgrade request ([`rides_upgrade`]) can be written on
+/// it: a valid HTTP field name, and a value with no line break or control byte. One that cannot is
+/// refused at `begin` before anything is sent.
+pub(crate) fn carries_all(fields: &[(String, Vec<u8>)]) -> bool {
+    fields
+        .iter()
+        .filter(|(name, _)| rides_upgrade(name))
+        .all(|(name, value)| {
+            HeaderName::from_bytes(name.as_bytes()).is_ok()
+                && HeaderValue::from_bytes(value).is_ok()
+        })
+}
+
 /// Whether a dial's opening `fields` ask for a WebSocket extension (`Sec-WebSocket-Extensions`):
 /// this end negotiates none (RFC 6455 section 9), so such a dial is refused, never sent without it.
 pub(crate) fn asks_extension(fields: &[(String, Vec<u8>)]) -> bool {

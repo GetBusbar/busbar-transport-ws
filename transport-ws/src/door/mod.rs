@@ -589,6 +589,12 @@ const OFFER: &[u8] = b"\x08http/1.1";
 
 const SMALL: &str = "locate: a host buffer is too small";
 
+/// A dial with an opening field the upgrade request cannot carry (an invalid name, or a value with a
+/// line break or a control byte): neither the field's value (it may be a credential) nor a
+/// handshake that never ran is named.
+const BEGIN_UNCARRIABLE: &str =
+    "begin: an opening field is not a valid HTTP field, and the upgrade request cannot carry it";
+
 /// A dial whose opening fields ask for a WebSocket extension: none is supported.
 const BEGIN_EXTENSION: &str = "begin: the opening field sec-websocket-extensions asks for an extension, and this end supports none";
 
@@ -858,6 +864,10 @@ op!(
         let fields = opening_fields(i);
         if crate::transport::asks_extension(&fields.0) {
             o.error(BEGIN_EXTENSION);
+            return Outcome::Failed;
+        }
+        if !crate::transport::carries_all(&fields.0) {
+            o.error(BEGIN_UNCARRIABLE);
             return Outcome::Failed;
         }
         opening(&p, &BEGIN, i.field(|x| &x.sink), &mut o, |f, c| {
