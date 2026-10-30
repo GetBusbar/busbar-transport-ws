@@ -220,3 +220,29 @@ fn bytes_after_the_peers_close_are_not_judged() {
     assert!(out.ended, "the peer closed");
     assert_eq!(framer.failure(state), None, "cleanly");
 }
+
+/// A FRAME WHOSE HEADER BREAKS THE PROTOCOL IS THE LIBRARY'S TO FAIL (codeaudit e916fda WS-3; RFC
+/// 6455 sections 5.1, 5.2): an accepted end's frame that is not masked, or one with a reserved bit
+/// and no extension, fails with 1002 when it completes, however invalid the text it carries. RED
+/// before the fix: the scan judged its first payload byte and failed the connection with 1007.
+#[test]
+fn a_frame_that_breaks_the_protocol_is_not_judged_as_text() {
+    let unmasked = vec![0x81, 0x05, 0xff, 0xfe, 0xfd, 0xfc, 0xfb];
+    let mut reserved = client(true, TEXT, &[0xff, 0xfe, 0xfd, 0xfc, 0xfb]);
+    reserved[0] |= 0x40;
+    for frame in [unmasked, reserved] {
+        let framer = WsFramer::new(0);
+        let state = open(&framer);
+        let mut out = Out::default();
+        framer.ingest(state, &frame[..frame.len() - 2], false, &mut out).unwrap();
+        assert!(!out.ended, "{frame:02x?}: nothing is judged before the frame completes");
+        framer.ingest(state, &frame[frame.len() - 2..], false, &mut out).unwrap();
+        assert!(out.ended, "{frame:02x?}: the frame fails the connection");
+        assert_eq!(
+            framer.failure(state),
+            Some("the far end broke the WebSocket protocol"),
+            "{frame:02x?}"
+        );
+        assert_eq!(close_code(&framer, state), Some(1002), "{frame:02x?}");
+    }
+}
