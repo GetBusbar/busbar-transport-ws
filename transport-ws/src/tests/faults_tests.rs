@@ -205,9 +205,13 @@ fn a_dial_sends_the_host_as_the_target_writes_it() {
 
 /// RED (audit: an abrupt disconnect is reported as a framing failure): a carrier that ends with
 /// no closing handshake (a dropped connection) ends the stream, after every message that arrived
-/// before it; it is no protocol violation.
+/// before it, and the op itself succeeds. RED (codeaudit e916fda WS-6; RFC 6455 sections 7.1.4,
+/// 7.1.5: no Close frame is close code 1006, the connection NOT closed cleanly): the stream ends
+/// FAILED, never whole, so the layer above can tell a cut stream from a finished one, mid-message
+/// or not. RED before that fix: it ended whole, like a completed close.
 #[test]
-fn a_carrier_end_without_a_close_ends_the_stream() {
+fn a_carrier_end_without_a_close_ends_the_stream_failed() {
+    const WHY: &str = "the carrier ended with no WebSocket closing handshake";
     let f = WsFramer::new(0);
     let s = accepted(&f);
     let mut out = Out::default();
@@ -222,12 +226,22 @@ fn a_carrier_end_without_a_close_ends_the_stream() {
         "the message before it is handed up"
     );
     assert!(out.ended, "and the stream ends");
+    assert_eq!(f.failure(s), Some(WHY), "failed, not whole");
 
     let s = accepted(&f);
     let mut out = Out::default();
     let r = f.ingest(s, &[], true, &mut out);
     assert!(r.is_ok(), "an end with nothing before it: {r:?}");
     assert!(out.ended);
+    assert_eq!(f.failure(s), Some(WHY));
+
+    // Mid-message: the first fragment of a message arrived, then the carrier ended.
+    let s = accepted(&f);
+    let mut out = Out::default();
+    let r = f.ingest(s, &[0x02, 0x82, 0, 0, 0, 0, b'h', b'i'], true, &mut out);
+    assert!(r.is_ok(), "{r:?}");
+    assert!(out.ended && out.frames.is_empty(), "no partial message is handed up");
+    assert_eq!(f.failure(s), Some(WHY));
 }
 
 /// RED (audit: one panic poisons every connection of the instance): a panic while one framing
