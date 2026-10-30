@@ -109,13 +109,13 @@ struct TextScan {
     tail_len: usize,
     /// An invalid byte was read.
     bad: bool,
-    /// Switched off: a header the scan cannot follow.
+    /// Switched off: a header the scan cannot follow, or the peer's Close.
     off: bool,
 }
 
 impl TextScan {
     fn feed(&mut self, mut bytes: &[u8]) {
-        use tungstenite::protocol::frame::coding::{Data, OpCode};
+        use tungstenite::protocol::frame::coding::{Control, Data, OpCode};
         use tungstenite::protocol::frame::FrameHeader;
         while !(self.bad || self.off) && !bytes.is_empty() {
             if self.left == 0 {
@@ -125,6 +125,12 @@ impl TextScan {
                 match FrameHeader::parse(&mut std::io::Cursor::new(&self.head[..self.head_len])) {
                     Ok(None) => continue,
                     Ok(Some((header, len))) => {
+                        // Nothing after a Close is data (RFC 6455 section 5.5.1): the scan stops
+                        // at one, and the machine reads no further either.
+                        if matches!(header.opcode, OpCode::Control(Control::Close)) {
+                            self.off = true;
+                            continue;
+                        }
                         // A fragmented message's kind is its first fragment's; a control frame
                         // between fragments carries no text.
                         match header.opcode {
