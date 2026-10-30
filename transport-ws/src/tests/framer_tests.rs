@@ -1025,3 +1025,46 @@ fn no_ceiling_means_no_outbound_ceiling_on_an_open_connection() {
         .expect("no outbound ceiling");
     assert!(sent.sent.len() > big.len(), "the message goes out");
 }
+
+/// A SHIPPED DIAL IS RANDOM WHERE RFC 6455 SAYS SO (codeaudit e916fda tests MEDIUM): its handshake
+/// key is fresh per dial (section 4.1) and every frame it writes is masked with a fresh key
+/// (section 5.3), the payload readable under it. Built UNSEEDED, so it runs the shipped path even
+/// when the workspace's tests unify the harness's `test-seeded` feature onto this crate.
+#[test]
+fn a_shipped_dial_sends_a_fresh_key_and_masks_every_frame() {
+    let open = || {
+        let framer = WsFramer::unseeded(0);
+        let mut out = Out::default();
+        let state = framer
+            .open_with(Side::Dial, "ws://127.0.0.1:9/x", &[], &mut out)
+            .expect("the dial opens");
+        let request = String::from_utf8(out.sent).expect("an upgrade request");
+        framer
+            .ingest(state, &switching(&request), false, &mut Out::default())
+            .expect("open");
+        let key = fields_named(&request, "sec-websocket-key")[0].to_string();
+        (framer, state, key)
+    };
+    let (framer, state, key) = open();
+    let (_, _, other) = open();
+    assert_ne!(key, "dGhlIHNhbXBsZSBub25jZQ==", "not the harness's key");
+    assert_ne!(key, other, "a fresh key per dial");
+    let mut masks = Vec::new();
+    for message in [&b"first"[..], b"second", b"third"] {
+        let mut sent = Out::default();
+        framer
+            .emit_text(state, message, true, false, &mut sent)
+            .expect("sent");
+        assert_ne!(sent.sent[1] & 0x80, 0, "masked");
+        masks.push(sent.sent[2..6].to_vec());
+        assert_eq!(
+            first_data_payload(&sent.sent),
+            Some((0x2, message.to_vec())),
+            "readable under its mask"
+        );
+    }
+    assert!(
+        masks.iter().any(|m| m != &[0, 0, 0, 0]) && masks[0] != masks[1],
+        "a fresh mask per frame: {masks:02x?}"
+    );
+}
