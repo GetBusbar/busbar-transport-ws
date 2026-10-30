@@ -1443,3 +1443,73 @@ fn locate_refuses_a_target_carrying_userinfo() {
     );
     host.close();
 }
+
+/// AN UNDECLARED KEY WITH NOWHERE TO PUT ITS NAME SAYS SO IN THE SDK'S WORDS: `validate` and `open`
+/// with no reason buffer lent answer the lifecycle SDK's text for a reason that was not kept, as
+/// every door on `abi::sdk::life` does. RED before the door moved onto the SDK lifecycle: it said
+/// "settings: a key is not a setting this transport reads".
+#[test]
+fn an_undeclared_key_with_no_reason_buffer_says_the_reason_was_not_kept() {
+    use busbar_contract::abi::mechanism::call::Blob;
+    use busbar_contract::abi::mechanism::lifecycle::ValidateIn;
+    use busbar_contract::abi::sdk::out::NO_REASON_BUFFER;
+    let settings = br#"{"nope": 1}"#;
+    let blob = Blob {
+        ptr: settings.as_ptr(),
+        len: settings.len(),
+        ..z()
+    };
+    let mut vi: ValidateIn = z();
+    vi.settings = blob;
+    let mut vo: OutHead = z();
+    let r = call(
+        linked().head.validate,
+        std::ptr::null_mut(),
+        &mut vi,
+        &mut vo,
+        life::VALIDATE,
+    );
+    assert_eq!(
+        (r, said(&vo.error)),
+        (Outcome::Failed, NO_REASON_BUFFER.to_owned())
+    );
+    let mut oi: OpenIn = z();
+    oi.settings = blob;
+    let mut oo: OpenOut = z();
+    let r = call(
+        linked().head.open,
+        std::ptr::null_mut(),
+        &mut oi,
+        &mut oo,
+        life::OPEN,
+    );
+    assert_eq!(
+        (r, said(&oo.head.error)),
+        (Outcome::Failed, NO_REASON_BUFFER.to_owned())
+    );
+}
+
+/// A RELEASE OF A LEASE THE INSTANCE NEVER HANDED OUT IS REFUSED, in the lifecycle SDK's words
+/// (`release: no such lease`): the door leases nothing, so every release names a lease it does not
+/// hold, a host bug. RED before the door moved onto the SDK lifecycle: it answered READY.
+#[test]
+fn a_release_of_a_lease_never_handed_out_is_refused() {
+    use busbar_contract::abi::mechanism::lifecycle::ReleaseIn;
+    use busbar_contract::abi::sdk::life::NO_SUCH_LEASE;
+    let host = Host::open(linked(), (1024, 1024, 4));
+    let mut i: ReleaseIn = z();
+    i.lease = 7;
+    let mut o: OutHead = z();
+    let r = call(
+        host.ops.head.release,
+        host.inst,
+        &mut i,
+        &mut o,
+        life::RELEASE,
+    );
+    assert_eq!(
+        (r, said(&o.error)),
+        (Outcome::Refused, NO_SUCH_LEASE.to_owned())
+    );
+    host.close();
+}

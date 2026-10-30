@@ -5,7 +5,85 @@
 //! piece.
 
 use super::*;
-use busbar_contract::abi::transport::{FramePiece, FramerOut as DoorOut, HeadSlots};
+use std::cell::RefCell;
+use std::ffi::c_void;
+
+use busbar_contract::abi::mechanism::call::InHead;
+use busbar_contract::abi::mechanism::lifecycle::{slot as life_slot, OpenIn, OpenOut};
+use busbar_contract::abi::sdk::door::Entry;
+use busbar_contract::abi::transport::{slot, FramePiece, FramerOut as DoorOut, HeadSlots};
+
+use crate::frame::HostTime;
+
+/// What [`Poke`] runs on the instance's state.
+type Poked = Box<dyn FnOnce(&Ws)>;
+
+thread_local! {
+    /// The queue [`Fill`] hands over, and what [`Poke`] runs on the instance's state.
+    static OWED: RefCell<Option<Owed>> = const { RefCell::new(None) };
+    static POKE: RefCell<Option<Poked>> = const { RefCell::new(None) };
+}
+
+/// A test slot: [`fill`] of the queue in [`OWED`] into the lent sink, as every framer op answers.
+struct Fill;
+impl SafeSlot for Fill {
+    type In = FramingIn;
+    type Out = DoorOut;
+    type State = Held<Ws>;
+    fn call(_: Instance<'_, Held<Ws>>, i: Lent<'_, FramingIn>, mut o: Out<'_, DoorOut>) -> Outcome {
+        OWED.with(|c| {
+            let mut owed = c.borrow_mut();
+            fill(
+                owed.as_mut().expect("a queue to fill from"),
+                i.field(|x| &x.sink),
+                &mut o,
+            );
+        });
+        Outcome::Ready
+    }
+}
+
+/// A test slot: the closure in [`POKE`], run on the open instance's state.
+struct Poke;
+impl SafeSlot for Poke {
+    type In = FramingIn;
+    type Out = DoorOut;
+    type State = Held<Ws>;
+    fn call(p: Instance<'_, Held<Ws>>, _: Lent<'_, FramingIn>, _: Out<'_, DoorOut>) -> Outcome {
+        let ws = p.get().map(Held::life).expect("an open instance");
+        POKE.with(|c| c.borrow_mut().take().expect("a closure to run"))(ws);
+        Outcome::Ready
+    }
+}
+
+/// [`fill`] `owed` into `sink`, entered as the trampoline enters a slot: the answer.
+fn fill_from(owed: &mut Owed, sink: FramerSink) -> DoorOut {
+    OWED.with(|c| *c.borrow_mut() = Some(std::mem::take(owed)));
+    // SAFETY: plain C data; all-zero is valid.
+    let mut i: FramingIn = unsafe { std::mem::zeroed() };
+    i.sink = sink;
+    // SAFETY: as above.
+    let mut o: DoorOut = unsafe { std::mem::zeroed() };
+    // SAFETY: no instance, and the sink's buffers are live for the call.
+    let r = unsafe { Safe::<Fill>::enter(std::ptr::null_mut(), slot::TIMER, &i, &mut o) };
+    assert_eq!(r, Outcome::Ready);
+    *owed = OWED
+        .with(|c| c.borrow_mut().take())
+        .expect("the queue comes back");
+    o
+}
+
+/// Run `f` on the state of the open instance `inst`.
+fn poke(inst: *mut c_void, f: impl FnOnce(&Ws) + 'static) {
+    POKE.with(|c| *c.borrow_mut() = Some(Box::new(f)));
+    // SAFETY: plain C data; all-zero is valid.
+    let i: FramingIn = unsafe { std::mem::zeroed() };
+    // SAFETY: as above.
+    let mut o: DoorOut = unsafe { std::mem::zeroed() };
+    // SAFETY: the instance `open` answered, not yet closed; the `in` lends nothing.
+    let r = unsafe { Safe::<Poke>::enter(inst, slot::TIMER, &i, &mut o) };
+    assert_eq!(r, Outcome::Ready);
+}
 
 fn sink(frame: &mut [u8], pieces: &mut [FramePiece], heads: &mut [HeadSlots]) -> FramerSink {
     // SAFETY: plain C data; all-zero is valid.
@@ -40,9 +118,7 @@ fn a_reason_rides_only_beside_its_heads_first_piece() {
             unsafe { std::mem::zeroed::<[FramePiece; 4]>() },
             [HeadSlots::default(); 2],
         );
-        // SAFETY: plain C data; all-zero is valid.
-        let mut o: DoorOut = unsafe { std::mem::zeroed() };
-        fill(owed, &sink(&mut frame, &mut pieces, &mut heads), &mut o);
+        let o = fill_from(owed, sink(&mut frame, &mut pieces, &mut heads));
         let phrase = (o.yielded.heads_len > 0).then(|| {
             let r = heads[0].reason;
             frame[r.offset as usize..(r.offset + r.len) as usize].to_vec()
@@ -85,39 +161,62 @@ fn a_reason_rides_only_beside_its_heads_first_piece() {
 /// the door's queue went, the framer's state stayed.
 #[test]
 fn a_panicked_framing_is_forgotten_by_the_framer_at_its_finish() {
-    let inst = Instance {
-        framer: WsFramer::new(0),
-        owed: Mutex::new(HashMap::new()),
-        refused: Mutex::new(String::new()),
+    // SAFETY: plain C data; all-zero is valid.
+    let oi: OpenIn = unsafe { std::mem::zeroed() };
+    // SAFETY: as above.
+    let mut oo: OpenOut = unsafe { std::mem::zeroed() };
+    // SAFETY: no instance yet, and an `in` lending nothing.
+    let r = unsafe {
+        Safe::<life::Open<Ws>>::enter(std::ptr::null_mut(), life_slot::OPEN, &oi, &mut oo)
     };
-    let mut sink_out = Owed::default();
-    let mut c = Collect {
-        owed: &mut sink_out,
-        now: HostTime { unix_nanos: 0 },
-    };
-    let state = inst
-        .framer
-        .open_with(Side::Dial, "ws://127.0.0.1:9/x", &[], &mut c)
-        .expect("the dial opens");
-    let slot: OwedSlot = Arc::new(Mutex::new(Owed::default()));
-    inst.queues().insert(state, Arc::clone(&slot));
-    // An op on this framing panicked while holding its queue.
-    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let _held = slot.lock();
-        panic!("an op panicked");
-    }));
-    assert!(slot.is_poisoned());
+    assert_eq!(r, Outcome::Ready);
+    let p = oo.instance;
+    let state = std::rc::Rc::new(std::cell::Cell::new(0));
+    let opened = std::rc::Rc::clone(&state);
+    poke(p, move |inst| {
+        let mut sink_out = Owed::default();
+        let mut c = Collect {
+            owed: &mut sink_out,
+            now: HostTime { unix_nanos: 0 },
+            opening: true,
+        };
+        let state = inst
+            .framer
+            .open_with(Side::Dial, "ws://127.0.0.1:9/x", &[], &mut c)
+            .expect("the dial opens");
+        opened.set(state);
+        let slot: OwedSlot = Arc::new(Mutex::new(Owed::default()));
+        inst.queues().insert(state, Arc::clone(&slot));
+        // An op on this framing panicked while holding its queue.
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _held = slot.lock();
+            panic!("an op panicked");
+        }));
+        assert!(slot.is_poisoned());
+    });
+    let state = state.get();
     // SAFETY: plain C data; all-zero is valid.
     let mut i: FinishIn = unsafe { std::mem::zeroed() };
     i.framing = state;
+    // SAFETY: as above.
     let mut o: DoorOut = unsafe { std::mem::zeroed() };
-    let p = std::ptr::from_ref(&inst).cast_mut().cast::<c_void>();
-    assert_eq!(Finish::call(p, &i, &mut o), Outcome::Failed);
-    assert!(
-        !inst.queues().contains_key(&state),
-        "the door's queue is gone"
-    );
-    assert!(!inst.framer.holds(state), "the framer's state is gone too");
+    // SAFETY: the instance `open` answered; the sink lends nothing.
+    let r = unsafe { Safe::<Finish>::enter(p, slot::FINISH, &i, &mut o) };
+    assert_eq!(r, Outcome::Failed);
+    poke(p, move |inst| {
+        assert!(
+            !inst.queues().contains_key(&state),
+            "the door's queue is gone"
+        );
+        assert!(!inst.framer.holds(state), "the framer's state is gone too");
+    });
+    // SAFETY: plain C data; all-zero is valid.
+    let ci: InHead = unsafe { std::mem::zeroed() };
+    // SAFETY: as above.
+    let mut co: OutHead = unsafe { std::mem::zeroed() };
+    // SAFETY: the instance `open` answered, closed once, with no op in flight.
+    let r = unsafe { Safe::<life::Close<Ws>>::enter(p, life_slot::CLOSE, &ci, &mut co) };
+    assert_eq!(r, Outcome::Ready);
 }
 
 /// Hand `owed` over through a sink of the given caps, one fill at a time, until it is dry: every
@@ -138,9 +237,7 @@ fn drain_owed(
         let mut s = sink(&mut frame, &mut pieces, &mut heads);
         s.wire = wire.as_mut_ptr();
         s.wire_cap = wire_cap;
-        // SAFETY: plain C data; all-zero is valid.
-        let mut o: DoorOut = unsafe { std::mem::zeroed() };
-        fill(owed, &s, &mut o);
+        let o = fill_from(owed, s);
         wire_out.extend_from_slice(&wire[..o.yielded.wire_len as usize]);
         for p in &pieces[..o.yielded.pieces_len as usize] {
             let at = p.offset as usize;
@@ -160,7 +257,7 @@ fn a_large_piece_and_wire_are_handed_over_intact_across_recalls() {
     let message: Vec<u8> = (0..1000_u32).map(|n| (n % 251) as u8).collect();
     let wire_bytes: Vec<u8> = (0..700_u32).map(|n| (n % 241) as u8 + 1).collect();
     let mut owed = Owed::default();
-    push_wiped(&mut owed.wire, &mut owed.wire_at, &wire_bytes);
+    owed.push(&wire_bytes, true);
     owed.pieces
         .push_back(Piece::plain(7, message.clone(), true));
     let (wire, got) = drain_owed(&mut owed, 100, 64);
@@ -186,7 +283,7 @@ fn a_large_piece_and_wire_are_handed_over_intact_across_recalls() {
 #[test]
 fn handing_over_a_large_piece_or_wire_moves_no_remainder() {
     let mut owed = Owed::default();
-    push_wiped(&mut owed.wire, &mut owed.wire_at, &[0xAA; 300]);
+    owed.push(&[0xAA; 300], true);
     owed.pieces
         .push_back(Piece::plain(1, vec![0xBB; 500], true));
     let ptr = owed.pieces[0].bytes.as_ptr();
@@ -199,9 +296,7 @@ fn handing_over_a_large_piece_or_wire_moves_no_remainder() {
     let mut s = sink(&mut frame, &mut pieces, &mut heads);
     s.wire = wire.as_mut_ptr();
     s.wire_cap = wire.len();
-    // SAFETY: plain C data; all-zero is valid.
-    let mut o: DoorOut = unsafe { std::mem::zeroed() };
-    fill(&mut owed, &s, &mut o);
+    let o = fill_from(&mut owed, s);
     assert_eq!(o.yielded.wire_len, 100);
     assert_eq!(wire, [0xAA; 100]);
     assert_eq!(o.yielded.pieces_len, 1);
@@ -229,8 +324,8 @@ fn handing_over_a_large_piece_or_wire_moves_no_remainder() {
 fn the_wire_s_capacity_follows_its_backlog_not_its_throughput() {
     let mut owed = Owed::default();
     for _ in 0..500 {
-        push_wiped(&mut owed.wire, &mut owed.wire_at, &[0x5A; 101]);
-        consume_wiped(&mut owed.wire, &mut owed.wire_at, 100);
+        owed.push(&[0x5A; 101], true);
+        owed.consume(100);
         let backlog = owed.wire_owed().len();
         assert!(
             owed.wire.capacity() <= 2 * (backlog + 101),
@@ -255,5 +350,33 @@ fn a_kept_piece_buffer_is_bounded() {
     assert!(
         owed.spare[1].capacity() >= 1024,
         "a working-size buffer is kept whole"
+    );
+}
+
+/// ONLY THE OPENING IS WIPED (PL10): the bytes a framing's opening owed (a dialled upgrade request
+/// carries its auth's credential lines) are wiped as they are handed over and when the buffer
+/// outgrows them; the message bytes owed after them are handed over as they are, never wiped.
+#[test]
+fn only_the_opening_is_wiped_as_it_is_handed_over() {
+    let mut owed = Owed::default();
+    owed.push(&[0xC5; 40], true);
+    owed.push(&[0x11; 10], false);
+    owed.consume(30);
+    assert!(
+        owed.wire[..30].iter().all(|&b| b == 0),
+        "the handed-over opening is wiped"
+    );
+    // Outgrowing the buffer copies the 10 opening bytes still owed and wipes the old buffer.
+    let big = vec![0x22; 4 * owed.wire.capacity()];
+    owed.push(&big, false);
+    assert_eq!(owed.secret, 10, "the opening bytes still owed stay marked");
+    owed.consume(15);
+    assert!(
+        owed.wire[..10].iter().all(|&b| b == 0),
+        "the rest of the opening is wiped"
+    );
+    assert!(
+        owed.wire[10..15].iter().all(|&b| b == 0x11),
+        "a message byte is handed over as it is"
     );
 }
