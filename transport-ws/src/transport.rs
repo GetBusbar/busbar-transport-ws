@@ -261,8 +261,12 @@ type Conn = Arc<Mutex<Option<Phase>>>;
 
 /// Where one framing state is.
 enum Phase {
-    /// An accepted connection waiting for (the rest of) the upgrade request.
-    Accepting(MidHandshake<ServerHandshake<Pipe, NoCallback>>),
+    /// An accepted connection waiting for (the rest of) the upgrade request, and the message
+    /// ceiling it began under (`0` = none).
+    Accepting {
+        mid: MidHandshake<ServerHandshake<Pipe, NoCallback>>,
+        max: usize,
+    },
     /// A dialled connection waiting for (the rest of) the upgrade response, with the messages
     /// written before it completes (a text one checked once, as it is held) and the pieces of one
     /// not yet marked complete.
@@ -275,12 +279,14 @@ enum Phase {
         max: usize,
     },
     /// The session: the protocol machine, the pieces of an outbound message not yet marked
-    /// complete, and the failure that ended the inbound frames (its close code), if the far side
+    /// complete, the message ceiling the framing began under (`0` = none: the library's inbound
+    /// default stands, and nothing bounds what this end writes), and the failure that ended the inbound frames (its close code), if the far side
     /// broke the protocol or the carrier ended with no closing handshake (`1006`, which the
     /// terminated machine never writes).
     Open {
         ws: Box<WebSocket<Pipe>>,
         message: Vec<u8>,
+        max: usize,
         failed: Option<CloseCode>,
     },
     /// A dialled connection the far end answered with something other than `101`: its answer's
@@ -308,11 +314,12 @@ enum Phase {
 }
 
 impl Phase {
-    /// The session over `ws`, its outbound message starting as `message`.
-    fn open(ws: WebSocket<Pipe>, message: Vec<u8>) -> Self {
+    /// The session over `ws`, its outbound message starting as `message`, under the ceiling `max`.
+    fn open(ws: WebSocket<Pipe>, message: Vec<u8>, max: usize) -> Self {
         Phase::Open {
             ws: Box::new(ws),
             message,
+            max,
             failed: None,
         }
     }
@@ -321,7 +328,7 @@ impl Phase {
 impl Phase {
     fn pipe(&mut self) -> &mut Pipe {
         match self {
-            Phase::Accepting(mid) => mid.get_mut().get_mut(),
+            Phase::Accepting { mid, .. } => mid.get_mut().get_mut(),
             Phase::Dialling { mid, .. } => mid.get_mut().get_mut(),
             Phase::Open { ws, .. } => ws.get_mut(),
             Phase::Answered { pipe, .. } | Phase::Refused(pipe) => pipe,
@@ -880,7 +887,7 @@ impl WsFramer {
     }
 
     /// A framer whose messages (and frames) are capped at `max_message_bytes`; `0` = the protocol
-    /// library's own default stands.
+    /// library's own default stands for what is read, and nothing bounds what is written.
     #[must_use]
     pub(crate) fn new(max_message_bytes: usize) -> Self {
         Self {
@@ -974,9 +981,8 @@ impl WsFramer {
             }
             return Ok(());
         }
-        Self::with_open(guard.as_mut(), out, |ws, message| {
-            let max = ws.get_config().max_message_size.unwrap_or(0);
-            // The ceiling applies outbound too: the machine bounds only what it reads, so a message this
+        Self::with_open(guard.as_mut(), out, |ws, message, max| {
+            // The ceiling the framing began under (`0` = none) applies outbound too: the machine bounds only what it reads, so a message this
             // end writes is held to the same ceiling here, as a held one is above (a capacity
             // failure), and its gathered pieces are dropped.
             let size = message.len().saturating_add(bytes.len());
@@ -1061,8 +1067,13 @@ impl WsFramer {
     ) -> Result<Phase, TransportError> {
         let mut phase = match side {
             Side::Accept => {
-                match tungstenite::accept_with_config(Pipe::default(), self.config()) {
-                    Err(HandshakeError::Interrupted(mid)) => Phase::Accepting(mid),
+                let config = self.config();
+                let max = config
+                    .as_ref()
+                    .and_then(|c| c.max_message_size)
+                    .unwrap_or(0);
+                match tungstenite::accept_with_config(Pipe::default(), config) {
+                    Err(HandshakeError::Interrupted(mid)) => Phase::Accepting { mid, max },
                     // Nothing has been read, so nothing can have completed or failed yet.
                     Ok(_) | Err(HandshakeError::Failure(_)) => {
                         return Err(TransportError::HandshakeFailed)
@@ -1162,7 +1173,7 @@ impl WsFramer {
         // it), set on the call that hands the head up.
         let mut reason = None;
         let mut phase = match phase {
-            Phase::Accepting(mid) => match mid.handshake() {
+            Phase::Accepting { mid, max } => match mid.handshake() {
                 Ok(mut ws) => {
                     // The machine refuses any byte after the request (the client waits for the
                     // answer), so the session starts at a frame boundary: the text scan follows
@@ -1173,10 +1184,10 @@ impl WsFramer {
                         masked: true,
                         ..TextScan::default()
                     });
-                    Phase::open(ws, Vec::new())
+                    Phase::open(ws, Vec::new(), max)
                 }
                 Err(HandshakeError::Interrupted(mid)) => {
-                    return Ok((Phase::Accepting(mid), false, None))
+                    return Ok((Phase::Accepting { mid, max }, false, None))
                 }
                 // A request that is not an upgrade this end accepts is ANSWERED (RFC 6455 4.2.1:
                 // 400; a version it does not speak, 4.4: 426 naming the one it does), and the
@@ -1231,7 +1242,7 @@ impl WsFramer {
                         pipe.scan = Some(TextScan::default());
                     }
                     pipe.seen = Vec::new();
-                    Phase::open(ws, message)
+                    Phase::open(ws, message, max)
                 }
                 Err(HandshakeError::Interrupted(mut mid)) => {
                     mid.get_mut().get_mut().seen = shaken.map(|(seen, _)| seen).unwrap_or_default();
@@ -1393,13 +1404,16 @@ impl WsFramer {
     fn with_open(
         phase: Option<&mut Phase>,
         out: &mut dyn FramerOut,
-        op: impl FnOnce(&mut WebSocket<Pipe>, &mut Vec<u8>) -> Result<(), WsError>,
+        op: impl FnOnce(&mut WebSocket<Pipe>, &mut Vec<u8>, usize) -> Result<(), WsError>,
     ) -> Result<(), TransportError> {
         let phase = phase.ok_or(TransportError::Closed)?;
-        let Phase::Open { ws, message, .. } = phase else {
+        let Phase::Open {
+            ws, message, max, ..
+        } = phase
+        else {
             return Err(TransportError::Closed);
         };
-        let done = op(ws, message);
+        let done = op(ws, message, *max);
         drain(phase, out);
         done.map_err(|e| match e {
             WsError::Capacity(_) | WsError::Utf8(_) => TransportError::Framing,
