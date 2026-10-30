@@ -406,3 +406,320 @@ fn a_drained_wire_is_bounded() {
         "a working-size buffer is kept whole"
     );
 }
+
+// ── the door's ops, driven as the host drives them (codeaudit e916fda, tests) ───────────────────
+
+/// One answer's lent buffers.
+struct Lend {
+    wire: Vec<u8>,
+    frame: Vec<u8>,
+    pieces: Vec<FramePiece>,
+    heads: Vec<HeadSlots>,
+}
+
+impl Lend {
+    fn new(wire: usize, frame: usize, pieces: usize, heads: usize) -> Self {
+        Self {
+            wire: vec![0; wire],
+            frame: vec![0; frame],
+            // SAFETY: plain C data; all-zero is valid.
+            pieces: vec![unsafe { std::mem::zeroed::<FramePiece>() }; pieces],
+            heads: vec![HeadSlots::default(); heads],
+        }
+    }
+
+    fn roomy() -> Self {
+        Self::new(64 * 1024, 64 * 1024, 16, 1)
+    }
+
+    fn sink(&mut self) -> FramerSink {
+        let mut s = sink(&mut self.frame, &mut self.pieces, &mut self.heads);
+        s.wire = self.wire.as_mut_ptr();
+        s.wire_cap = self.wire.len();
+        s
+    }
+}
+
+/// What one answer said: its outcome, its wire bytes, each piece (bytes, flags), each head's
+/// reason phrase, and its yield flags.
+struct Said {
+    outcome: Outcome,
+    wire: Vec<u8>,
+    pieces: Vec<(Vec<u8>, u16)>,
+    reasons: Vec<Vec<u8>>,
+    flags: u32,
+}
+
+fn said(r: Outcome, o: &DoorOut, l: &Lend) -> Said {
+    use busbar_contract::abi::transport::check::{check_framer, check_head_slots};
+    if r == Outcome::Ready {
+        let n = o.yielded.pieces_len as usize;
+        check_framer(
+            r,
+            o,
+            &l.pieces[..n],
+            l.wire.len() as u64,
+            l.frame.len() as u64,
+            l.pieces.len() as u64,
+        )
+        .expect("the answer passes the kind's check");
+        check_head_slots(o, &l.heads, l.heads.len() as u64).expect("the head slots pass");
+    }
+    let span = |at: u64, len: u64| l.frame[at as usize..(at + len) as usize].to_vec();
+    Said {
+        outcome: r,
+        wire: l.wire[..o.yielded.wire_len as usize].to_vec(),
+        pieces: l.pieces[..o.yielded.pieces_len as usize]
+            .iter()
+            .map(|p| (span(p.offset, p.len), p.flags))
+            .collect(),
+        reasons: l.heads[..o.yielded.heads_len as usize]
+            .iter()
+            .map(|h| span(h.reason.offset, h.reason.len))
+            .collect(),
+        flags: o.yielded.flags,
+    }
+}
+
+/// An open instance.
+fn instance() -> *mut c_void {
+    // SAFETY: plain C data; all-zero is valid.
+    let i: OpenIn = unsafe { std::mem::zeroed() };
+    // SAFETY: as above.
+    let mut o: OpenOut = unsafe { std::mem::zeroed() };
+    // SAFETY: no instance yet, and an `in` lending nothing.
+    let r =
+        unsafe { Safe::<life::Open<Ws>>::enter(std::ptr::null_mut(), life_slot::OPEN, &i, &mut o) };
+    assert_eq!(r, Outcome::Ready);
+    o.instance
+}
+
+/// Close the instance `p`.
+fn shut(p: *mut c_void) {
+    // SAFETY: plain C data; all-zero is valid.
+    let i: InHead = unsafe { std::mem::zeroed() };
+    // SAFETY: as above.
+    let mut o: OutHead = unsafe { std::mem::zeroed() };
+    // SAFETY: the instance `open` answered, closed once, with no op in flight.
+    let r = unsafe { Safe::<life::Close<Ws>>::enter(p, life_slot::CLOSE, &i, &mut o) };
+    assert_eq!(r, Outcome::Ready);
+}
+
+/// `begin` on `side` toward `target`, with opening `fields`: the answer and the framing.
+fn begin(
+    p: *mut c_void,
+    side: u32,
+    target: &'static str,
+    fields: &[(&'static [u8], &'static [u8])],
+    l: &mut Lend,
+) -> (Said, u64) {
+    use busbar_contract::abi::mechanism::call::Field;
+    let fields: Vec<Field> = fields
+        .iter()
+        .map(|(n, v)| Field {
+            name: AbiStr {
+                ptr: n.as_ptr(),
+                len: n.len(),
+            },
+            value: AbiStr {
+                ptr: v.as_ptr(),
+                len: v.len(),
+            },
+        })
+        .collect();
+    // SAFETY: plain C data; all-zero is valid.
+    let mut i: BeginIn = unsafe { std::mem::zeroed() };
+    i.side = side;
+    i.scheme = busbar_contract::abi::host::service::SCHEME_PLAIN;
+    i.target = AbiStr {
+        ptr: target.as_ptr(),
+        len: target.len(),
+    };
+    i.fields = fields.as_ptr();
+    i.fields_len = fields.len();
+    i.sink = l.sink();
+    // SAFETY: as above.
+    let mut o: DoorOut = unsafe { std::mem::zeroed() };
+    // SAFETY: the open instance; the `in` lends `fields`, `target` and the sink, live for the call.
+    let r = unsafe { Safe::<Begin>::enter(p, slot::BEGIN, &i, &mut o) };
+    (said(r, &o, l), o.framing)
+}
+
+/// `ingest` of `bytes` (`end`: the carrier ended) on framing `token`; no bytes and no end is the
+/// `YIELD_MORE` re-call.
+fn ingest(p: *mut c_void, token: u64, bytes: &[u8], end: bool, l: &mut Lend) -> Said {
+    // SAFETY: plain C data; all-zero is valid.
+    let mut i: IngestIn = unsafe { std::mem::zeroed() };
+    i.framing = token;
+    i.bytes = bytes.as_ptr();
+    i.len = bytes.len();
+    i.end = u32::from(end);
+    i.sink = l.sink();
+    // SAFETY: as above.
+    let mut o: DoorOut = unsafe { std::mem::zeroed() };
+    // SAFETY: the open instance; the `in` lends `bytes` and the sink, live for the call.
+    let r = unsafe { Safe::<Ingest>::enter(p, slot::INGEST, &i, &mut o) };
+    said(r, &o, l)
+}
+
+/// `emit` of one whole binary message on framing `token`.
+fn emit(p: *mut c_void, token: u64, bytes: &[u8], l: &mut Lend) -> Said {
+    // SAFETY: plain C data; all-zero is valid.
+    let mut i: EmitIn = unsafe { std::mem::zeroed() };
+    i.framing = token;
+    i.bytes = bytes.as_ptr();
+    i.len = bytes.len();
+    i.end_of_frame = 1;
+    i.sink = l.sink();
+    // SAFETY: as above.
+    let mut o: DoorOut = unsafe { std::mem::zeroed() };
+    // SAFETY: the open instance; the `in` lends `bytes` and the sink, live for the call.
+    let r = unsafe { Safe::<Emit>::enter(p, slot::EMIT, &i, &mut o) };
+    said(r, &o, l)
+}
+
+/// `finish` of framing `token`, an orderly close.
+fn finish(p: *mut c_void, token: u64, l: &mut Lend) -> Said {
+    // SAFETY: plain C data; all-zero is valid.
+    let mut i: FinishIn = unsafe { std::mem::zeroed() };
+    i.framing = token;
+    i.sink = l.sink();
+    // SAFETY: as above.
+    let mut o: DoorOut = unsafe { std::mem::zeroed() };
+    // SAFETY: the open instance; the `in` lends the sink, live for the call.
+    let r = unsafe { Safe::<Finish>::enter(p, slot::FINISH, &i, &mut o) };
+    said(r, &o, l)
+}
+
+const UPGRADE: &[u8] = b"GET /echo HTTP/1.1\r\nHost: svc.test\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n";
+
+/// An accepted framing past its upgrade, on instance `p`.
+fn accepted(p: *mut c_void) -> u64 {
+    let (_, token) = begin(p, SIDE_ACCEPT, "", &[], &mut Lend::roomy());
+    let up = ingest(p, token, UPGRADE, false, &mut Lend::roomy());
+    assert!(up.wire.starts_with(b"HTTP/1.1 101"));
+    token
+}
+
+/// The far end's switching answer to the upgrade request `request`.
+fn switching(request: &[u8]) -> Vec<u8> {
+    let request = String::from_utf8_lossy(request);
+    let key = request
+        .lines()
+        .find_map(|l| l.strip_prefix("Sec-WebSocket-Key: "))
+        .expect("a key");
+    format!(
+        "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\
+         Sec-WebSocket-Accept: {}\r\n\r\n",
+        tungstenite::handshake::derive_accept_key(key.as_bytes())
+    )
+    .into_bytes()
+}
+
+/// THE CARRIER'S END REACHES THE MACHINE THROUGH THE DOOR (codeaudit e916fda tests MEDIUM): an
+/// `ingest` that carries no bytes but `end` is no re-call; the framer hears the end and the stream
+/// ends, FAILED with its reason, and the answer says the connection ended (`YIELD_ENDED`). An
+/// accepting framing whose request was cut short by the end has its state ended by the op: the
+/// failed end piece says why, and the connection ends with it.
+#[test]
+fn the_carriers_end_reaches_the_machine_through_the_door() {
+    let p = instance();
+    let token = accepted(p);
+    let end = ingest(p, token, &[], true, &mut Lend::roomy());
+    assert_eq!(end.outcome, Outcome::Ready);
+    let (why, flags) = end.pieces.last().expect("an end piece");
+    assert_ne!(flags & PIECE_STREAM_FAILED, 0, "the stream ends failed");
+    assert_eq!(
+        why,
+        b"the carrier ended with no WebSocket closing handshake"
+    );
+    assert_ne!(end.flags & YIELD_ENDED, 0, "the connection ended");
+
+    let (_, token) = begin(p, SIDE_ACCEPT, "", &[], &mut Lend::roomy());
+    let cut = ingest(
+        p,
+        token,
+        b"GET /echo HTTP/1.1\r\nHost",
+        true,
+        &mut Lend::roomy(),
+    );
+    assert_eq!(cut.outcome, Outcome::Ready);
+    let (why, flags) = cut.pieces.last().expect("an end piece");
+    assert_ne!(flags & PIECE_STREAM_FAILED, 0);
+    assert_eq!(why, b"the WebSocket opening handshake failed");
+    assert_ne!(cut.flags & YIELD_ENDED, 0);
+    shut(p);
+}
+
+/// A FINISHED FRAMING IS GONE ONCE WHAT IT OWES IS OUT (codeaudit e916fda tests MEDIUM): a finish
+/// that drains removes the framing's door queue and the framer's state; one that leaves a backlog
+/// (`YIELD_MORE`) keeps the queue until the re-called finish drains it.
+#[test]
+fn a_finished_framing_is_gone_once_drained() {
+    let p = instance();
+    let token = accepted(p);
+    let done = finish(p, token, &mut Lend::roomy());
+    assert_eq!(done.flags & YIELD_MORE, 0, "drained");
+    poke(p, move |inst| {
+        assert!(
+            !inst.queues().contains_key(&token),
+            "the door's queue is gone"
+        );
+        assert!(!inst.framer.holds(token), "the framer's state is gone");
+    });
+
+    let token = accepted(p);
+    let first = finish(p, token, &mut Lend::new(1, 64, 4, 1));
+    assert_ne!(first.flags & YIELD_MORE, 0, "the close is still owed");
+    poke(p, move |inst| {
+        assert!(inst.queues().contains_key(&token), "the backlog is kept");
+    });
+    let rest = finish(p, token, &mut Lend::roomy());
+    assert_eq!(rest.flags & YIELD_MORE, 0);
+    assert!(!rest.wire.is_empty(), "the rest of the close went out");
+    poke(p, move |inst| {
+        assert!(!inst.queues().contains_key(&token), "gone once drained");
+    });
+    shut(p);
+}
+
+/// ONLY A DIAL'S OPENING IS MARKED TO BE WIPED, THROUGH THE DOOR (codeaudit e916fda tests MEDIUM,
+/// PL10): the upgrade request `begin` owes (its auth's credential among its lines) is marked secret
+/// in the framing's queue, and the message bytes a later `emit` owes are not.
+#[test]
+fn only_a_dials_opening_is_marked_secret_through_the_door() {
+    let p = instance();
+    let (opened, token) = begin(
+        p,
+        SIDE_DIAL,
+        "ws://svc.test/x",
+        &[(b"authorization", b"Bearer sk-door-secret")],
+        &mut Lend::new(16, 64, 4, 1),
+    );
+    assert_ne!(opened.flags & YIELD_MORE, 0, "most of the request is owed");
+    poke(p, move |inst| {
+        let slot = inst.queues().get(&token).cloned().expect("a queue");
+        let owed = slot.lock().expect("unpoisoned");
+        assert!(owed.secret > owed.wire_at, "the owed opening is marked");
+        assert_eq!(owed.secret, owed.wire.len(), "all of it");
+    });
+    let mut request = opened.wire;
+    loop {
+        let more = ingest(p, token, &[], false, &mut Lend::new(16, 64, 4, 1));
+        request.extend_from_slice(&more.wire);
+        if more.flags & YIELD_MORE == 0 {
+            break;
+        }
+    }
+    let mut open = Lend::roomy();
+    ingest(p, token, &switching(&request), false, &mut open);
+    let sent = emit(p, token, &[0x5A; 64], &mut Lend::new(4, 64, 4, 1));
+    assert_ne!(sent.flags & YIELD_MORE, 0, "most of the message is owed");
+    poke(p, move |inst| {
+        let slot = inst.queues().get(&token).cloned().expect("a queue");
+        let owed = slot.lock().expect("unpoisoned");
+        assert!(!owed.wire_owed().is_empty());
+        assert_eq!(owed.secret, 0, "a message is never marked");
+    });
+    shut(p);
+}
