@@ -1513,3 +1513,50 @@ fn a_release_of_a_lease_never_handed_out_is_refused() {
     );
     host.close();
 }
+
+// ── what an opening field asks that the upgrade cannot carry (codeaudit e916fda) ────────────────
+
+/// `begin` dialling `target` with `fields` (name, value); the refusal's text, or `None` once it
+/// opens.
+fn begin_with_fields(host: &mut Host, target: &'static str, fields: &[(&[u8], &[u8])]) -> Option<String> {
+    use busbar_contract::abi::mechanism::call::Field;
+    let fields: Vec<Field> = fields
+        .iter()
+        .map(|(n, v)| Field {
+            name: AbiStr { ptr: n.as_ptr(), len: n.len() },
+            value: AbiStr { ptr: v.as_ptr(), len: v.len() },
+        })
+        .collect();
+    let mut i: BeginIn = z();
+    i.side = SIDE_DIAL;
+    i.scheme = busbar_contract::abi::host::service::SCHEME_PLAIN;
+    i.target = AbiStr {
+        ptr: target.as_ptr(),
+        len: target.len(),
+    };
+    i.fields = fields.as_ptr();
+    i.fields_len = fields.len();
+    i.sink = host.sink();
+    let mut o: FramerOut = z();
+    let r = call(host.ops.begin, host.inst, &mut i, &mut o, slot::BEGIN);
+    (r == Outcome::Failed).then(|| said(&o.head.error))
+}
+
+/// AN EXTENSION IS REFUSED IN WORDS (codeaudit e916fda WS-7; RFC 6455 section 9): this end
+/// negotiates no extension, so a dial whose opening fields ask for one is refused at `begin`,
+/// saying so, rather than sent without it in silence. RED before the fix: the field was dropped and
+/// the dial opened.
+#[test]
+fn a_dial_asking_for_an_extension_is_refused_in_words() {
+    let mut host = Host::open(linked(), (64 * 1024, 64 * 1024, 64));
+    assert_eq!(
+        begin_with_fields(
+            &mut host,
+            "ws://svc.test/x",
+            &[(b"Sec-WebSocket-Extensions", b"permessage-deflate")]
+        )
+        .as_deref(),
+        Some("begin: the opening field sec-websocket-extensions asks for an extension, and this end supports none")
+    );
+    host.close();
+}

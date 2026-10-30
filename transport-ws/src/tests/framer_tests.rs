@@ -943,3 +943,39 @@ fn an_upgrade_answered_with_another_2xx_is_no_success() {
         );
     }
 }
+
+/// A DIAL'S SUBPROTOCOL RIDES ITS UPGRADE AND THE ANSWER IS HELD TO IT (codeaudit e916fda WS-7; RFC
+/// 6455 sections 1.9, 4.1): the plane's `Sec-WebSocket-Protocol` opening field goes out on the
+/// upgrade request; an answer selecting one of the offered subprotocols opens, its selection handed
+/// up in the head, and an answer selecting another fails the handshake. RED before the fix: the
+/// field was silently dropped.
+#[test]
+fn a_dials_subprotocol_rides_the_upgrade_and_the_answer_is_held_to_it() {
+    let fields = vec![(
+        "Sec-WebSocket-Protocol".to_string(),
+        b"graphql-transport-ws".to_vec(),
+    )];
+    for (selected, opens) in [("graphql-transport-ws", true), ("mqtt", false)] {
+        let framer = WsFramer::new(0);
+        let mut out = Out::default();
+        let state = framer
+            .open_with(Side::Dial, "ws://127.0.0.1:9/graphql", &fields, &mut out)
+            .expect("the dial opens");
+        let request = String::from_utf8(out.sent.clone()).expect("an upgrade request");
+        assert_eq!(
+            fields_named(&request, "sec-websocket-protocol"),
+            ["graphql-transport-ws"],
+            "{request}"
+        );
+        let mut answer = switching(&request);
+        answer.truncate(answer.len() - 2);
+        answer.extend_from_slice(format!("Sec-WebSocket-Protocol: {selected}\r\n\r\n").as_bytes());
+        let mut heard = Out::default();
+        let r = framer.ingest(state, &answer, false, &mut heard);
+        assert_eq!(r.is_ok(), opens, "{selected}: {r:?}");
+        if opens {
+            let head = String::from_utf8(heard.frames[0].clone()).unwrap();
+            assert_eq!(head, format!("sec-websocket-protocol: {selected}\r\n"));
+        }
+    }
+}
