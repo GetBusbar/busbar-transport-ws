@@ -400,5 +400,9 @@ fn a_drained_wire_is_bounded() {
     owed.push(&[0x44; 1024], false);
     let kept = owed.wire.capacity();
     owed.consume(1024);
-    assert_eq!(owed.wire.capacity(), kept, "a working-size buffer is kept whole");
+    assert_eq!(
+        owed.wire.capacity(),
+        kept,
+        "a working-size buffer is kept whole"
+    );
 }

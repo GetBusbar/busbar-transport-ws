@@ -328,7 +328,8 @@ impl Owed {
     }
 
     /// Mark the next `n` owed bytes handed to the host, wiping the secret ones in place; once all
-    /// are handed over the buffer empties.
+    /// are handed over the buffer empties, and gives back what one large message grew it past
+    /// [`KEEP_BYTES`] (as a kept piece buffer does): a working-size buffer is kept whole.
     fn consume(&mut self, n: usize) {
         let end = self.wire_at + n;
         if self.secret > self.wire_at {
@@ -337,6 +338,9 @@ impl Owed {
         self.wire_at = end;
         if self.wire_at == self.wire.len() {
             self.wire.clear();
+            if self.wire.capacity() > KEEP_BYTES {
+                self.wire.shrink_to(KEEP_BYTES);
+            }
             self.wire_at = 0;
             self.secret = 0;
         }
