@@ -1409,14 +1409,19 @@ impl WsFramer {
     }
 }
 
-/// One `ws://`/`wss://` URL, read into `(secure, host, port, path)`. Strict over the scheme, with
-/// the authority read by the contract's one URL reader ([`busbar_contract::net::parse_url`], WHATWG
-/// rules): it ends at `/`, `?`, `#` or `\` exactly where the handshake's parser ends it, the host
+/// One `ws://`/`wss://` URL, read into `(secure, host, port, path)`. Strict over the scheme (in any
+/// case), with the authority read by the contract's one URL reader
+/// ([`busbar_contract::net::parse_url`], WHATWG rules): it ends at `/`, `?`, `#` or `\` exactly where the handshake's parser ends it, the host
 /// comes back unbracketed, and a userinfo is refused. The path always opens with `/`.
 pub(crate) fn split_ws_url(url: &str) -> Result<(bool, String, u16, String), TransportError> {
-    let secure = if url.starts_with("wss://") {
+    // A scheme is case-insensitive (RFC 3986 section 3.1): `WSS://` is `wss://`.
+    let scheme = |s: &str| {
+        url.get(..s.len())
+            .is_some_and(|p| p.eq_ignore_ascii_case(s))
+    };
+    let secure = if scheme("wss://") {
         true
-    } else if url.starts_with("ws://") {
+    } else if scheme("ws://") {
         false
     } else {
         return Err(TransportError::AddressRefused);
