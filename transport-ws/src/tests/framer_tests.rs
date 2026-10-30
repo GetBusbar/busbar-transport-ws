@@ -1002,3 +1002,26 @@ fn the_scheme_is_read_whatever_its_case() {
     assert!(request.starts_with("GET /v1 HTTP/1.1\r\n"), "{request}");
     assert_eq!(fields_named(&request, "host"), ["api.example"]);
 }
+
+/// A FRAMER WITH NO CEILING PUTS NONE ON WHAT IT WRITES (codeaudit e916fda WS-9): `new(0)` is the
+/// library's inbound default and no outbound ceiling, on an open connection as on a dialling one.
+/// RED before the fix: an open connection read the library's 64 MiB default back as its outbound
+/// ceiling and refused a larger message the dialling path held.
+#[test]
+fn no_ceiling_means_no_outbound_ceiling_on_an_open_connection() {
+    let framer = WsFramer::new(0);
+    let mut out = Out::default();
+    let state = framer
+        .open_with(Side::Dial, "ws://127.0.0.1:9/x", &[], &mut out)
+        .expect("the dial opens");
+    let request = String::from_utf8(out.sent.clone()).unwrap();
+    framer
+        .ingest(state, &switching(&request), false, &mut Out::default())
+        .expect("open");
+    let big = vec![b'x'; 64 * 1024 * 1024 + 1];
+    let mut sent = Out::default();
+    framer
+        .emit_text(state, &big, true, false, &mut sent)
+        .expect("no outbound ceiling");
+    assert!(sent.sent.len() > big.len(), "the message goes out");
+}
