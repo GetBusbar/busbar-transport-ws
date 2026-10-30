@@ -1570,3 +1570,17 @@ fn a_dial_asking_for_an_extension_is_refused_in_words() {
     );
     host.close();
 }
+
+/// THE TAIL STATES THE OPS THE DOOR SERVES (codeaudit e916fda WS-10; `FACT_ACCEPTS`: "a tail that
+/// states no op bit declares no op"): the ws framer begins on the accepting side and on the
+/// dialling side, and adopts a stream another framer detached; it detaches nothing (nothing
+/// upgrades out of a WebSocket) and decodes no payload. RED before the fix: the tail stated no fact,
+/// so the door declared no op it serves.
+#[test]
+fn the_tail_states_the_ops_the_door_serves() {
+    use busbar_contract::abi::transport::{TransportTail, FACT_ACCEPTS, FACT_ADOPTS, FACT_DIALS};
+    let st = busbar_transport_ws::door::STATEMENT;
+    // SAFETY: the Statement's kind tail is this crate's `'static` `TransportTail`.
+    let tail = unsafe { &*st.kind_tail.cast::<TransportTail>() };
+    assert_eq!(tail.facts, FACT_ACCEPTS | FACT_DIALS | FACT_ADOPTS);
+}
