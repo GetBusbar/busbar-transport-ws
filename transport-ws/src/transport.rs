@@ -28,7 +28,8 @@
 //!   answered the upgrade and not yet sent a message has answered. It is the only frame this framer
 //!   states a status on: a message never carries one.
 //! * A ping is answered with its pong on the next bytes out; a peer's close is answered with the
-//!   peer's own code and ends the frames.
+//!   peer's own code and ends the frames. A carrier that ends with no closing handshake ends them
+//!   FAILED (RFC 6455 section 7.1.5, `1006`: not closed cleanly), mid-message or not.
 //! * A close this end starts carries the RFC 6455 code its reason names ([`close_code_for`]).
 //! * Bytes that break the protocol FAIL the connection (RFC 6455 §7.1.7) the way the RFC orders it:
 //!   every message completed before them is handed up first, the frames end, the layer above may
@@ -273,7 +274,8 @@ enum Phase {
     },
     /// The session: the protocol machine, the pieces of an outbound message not yet marked
     /// complete, and the failure that ended the inbound frames (its close code), if the far side
-    /// broke the protocol.
+    /// broke the protocol or the carrier ended with no closing handshake (`1006`, which the
+    /// terminated machine never writes).
     Open {
         ws: Box<WebSocket<Pipe>>,
         message: Vec<u8>,
@@ -1322,9 +1324,12 @@ impl WsFramer {
                 }
                 // The carrier ended with no closing handshake (a dropped connection, a closed
                 // tab): every message completed before it was handed up above, and the stream
-                // ends here. That is the connection going away, not a protocol the far side broke.
+                // ends here, FAILED: the connection was not closed cleanly (RFC 6455 sections
+                // 7.1.4, 7.1.5: close code 1006, which no frame ever carries), so the layer above
+                // can tell a cut stream from a finished one. It is the connection going away, not
+                // a protocol the far side broke, and the machine, terminated, writes no close.
                 Err(WsError::Protocol(ProtocolError::ResetWithoutClosingHandshake)) => {
-                    ended = true;
+                    *failed = Some(CloseCode::Abnormal);
                     break;
                 }
                 Err(e) => match failure_code(&e) {
@@ -1429,7 +1434,8 @@ fn request_url(url: &str) -> Result<String, TransportError> {
 
 impl WsFramer {
     /// Whether the far side FAILED the connection in `state` (a protocol violation, text that is
-    /// not UTF-8, a message over the ceiling), an upgrade request this end refused, or a refused
+    /// not UTF-8, a message over the ceiling, a carrier end with no closing handshake), an upgrade
+    /// request this end refused, or a refused
     /// upgrade's body was cut short by the carrier's end or declared a `Content-Length` that is not
     /// a length or disagrees (RFC 9110 §8.6): its frames ended failed, not cleanly.
     #[cfg(test)]
@@ -1447,6 +1453,7 @@ impl WsFramer {
             } => Some(match code {
                 CloseCode::Invalid => "the far end sent a text message that is not UTF-8",
                 CloseCode::Size => "the far end sent a message over the message ceiling",
+                CloseCode::Abnormal => "the carrier ended with no WebSocket closing handshake",
                 _ => "the far end broke the WebSocket protocol",
             }),
             Phase::Answered { short: true, .. } => {
