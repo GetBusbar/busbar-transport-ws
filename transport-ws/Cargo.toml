@@ -19,7 +19,9 @@ crate-type = ["rlib"]
 [features]
 # TEST HARNESS ONLY: a dial's handshake key is fixed and a dialled end's frames carry the all-zero
 # mask, so the published conformance suite's scripted dial reads the same bytes every run. The plugin
-# crate's dev-dependency enables it for its tests; no shipped build does (RFC 6455 section 5.3).
+# crate's dev-dependency enables it, and cargo unifies it onto every test build of the workspace;
+# no shipped build has it (RFC 6455 section 5.3). With it on, the seed is a per-framer switch, so the
+# framer's own tests still run the shipped key and mask path (`WsFramer::unseeded`).
 test-seeded = []
 
 [dependencies]

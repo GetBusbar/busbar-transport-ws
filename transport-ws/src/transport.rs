@@ -80,10 +80,10 @@ pub(crate) struct Pipe {
     /// machine's own handshake limit (64 KiB read, or the handshake fails and the state is gone)
     /// plus what the one call that completes the head carries; emptied once the head is read.
     seen: Vec<u8>,
-    /// This end dialled: its frames are masked (RFC 6455 section 5.3). Read only by the test
-    /// harness's seed (`test-seeded`), which unmasks a dialled end's frames.
-    #[cfg_attr(not(feature = "test-seeded"), allow(dead_code))]
-    client: bool,
+    /// The test harness's seed is on for this dialled end (`test-seeded`): its frames go out under
+    /// the all-zero mask ([`seeded::unmask`]).
+    #[cfg(feature = "test-seeded")]
+    seeded: bool,
     /// The open session's text payload as it arrives, judged at the first invalid byte
     /// ([`TextScan`]); `None` until a session that began at a frame boundary is open.
     scan: Option<TextScan>,
@@ -350,6 +350,9 @@ pub(crate) struct WsFramer {
     /// ceiling); a refresh moves it ([`WsFramer::set_max`]), and every framing keeps the one it
     /// began under.
     max_message_bytes: AtomicUsize,
+    /// The test harness's seed is on for this framer's dials (`test-seeded`; [`seeded`]).
+    #[cfg(feature = "test-seeded")]
+    seeded: bool,
 }
 
 impl std::fmt::Debug for WsFramer {
@@ -785,7 +788,7 @@ fn drain(phase: &mut Phase, out: &mut dyn FramerOut) {
     let pipe = phase.pipe();
     if !pipe.outbound.is_empty() {
         #[cfg(feature = "test-seeded")]
-        if open && pipe.client {
+        if open && pipe.seeded {
             seeded::unmask(&mut pipe.outbound);
         }
         out.send(&pipe.outbound);
@@ -797,6 +800,11 @@ fn drain(phase: &mut Phase, out: &mut dyn FramerOut) {
 /// suite builds with; never in a shipped build, where the handshake key and every frame's mask stay
 /// random as RFC 6455 section 5.3 requires): a dial's handshake key is fixed, and a dialled end's
 /// frames carry the all-zero mask, so the bytes a scripted dial writes are the same every run.
+///
+/// Cargo unifies a dev-dependency's features onto every test build of the workspace (resolver 2),
+/// so with the feature on the seed is still a per-framer switch, on by default
+/// ([`WsFramer::new`]): a framer test builds an unseeded framer ([`WsFramer::unseeded`]) and runs
+/// the shipped key and mask path in the same build.
 #[cfg(feature = "test-seeded")]
 mod seeded {
     /// The handshake key a seeded dial sends (RFC 6455 section 1.3's own example).
@@ -907,6 +915,19 @@ impl WsFramer {
             states: Mutex::new(HashMap::new()),
             next: AtomicU64::new(1),
             max_message_bytes: AtomicUsize::new(max_message_bytes),
+            #[cfg(feature = "test-seeded")]
+            seeded: true,
+        }
+    }
+
+    /// [`WsFramer::new`] with the test harness's seed off, whatever the build's features: its dials
+    /// send a random handshake key and mask every frame at random, as a shipped build's do.
+    #[cfg(test)]
+    pub(crate) fn unseeded(max_message_bytes: usize) -> Self {
+        Self {
+            #[cfg(feature = "test-seeded")]
+            seeded: false,
+            ..Self::new(max_message_bytes)
         }
     }
 
@@ -1121,9 +1142,11 @@ impl WsFramer {
             request.headers_mut().append(name, value);
         }
         #[cfg(feature = "test-seeded")]
-        request
-            .headers_mut()
-            .insert("sec-websocket-key", HeaderValue::from_static(seeded::KEY));
+        if self.seeded {
+            request
+                .headers_mut()
+                .insert("sec-websocket-key", HeaderValue::from_static(seeded::KEY));
+        }
         let config = self.config();
         let max = config
             .as_ref()
@@ -1132,7 +1155,8 @@ impl WsFramer {
         match tungstenite::client::client_with_config(
             request,
             Pipe {
-                client: true,
+                #[cfg(feature = "test-seeded")]
+                seeded: self.seeded,
                 ..Pipe::default()
             },
             config,
