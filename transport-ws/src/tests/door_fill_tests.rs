@@ -380,3 +380,25 @@ fn only_the_opening_is_wiped_as_it_is_handed_over() {
         "a message byte is handed over as it is"
     );
 }
+
+/// A DRAINED WIRE GIVES BACK WHAT ONE LARGE MESSAGE GREW IT PAST [`KEEP_BYTES`] (codeaudit e916fda
+/// WS-11), as a kept piece buffer does: an idle framing holds a working-size wire buffer, not twice
+/// its largest message. A working-size buffer is kept whole, so steady state allocates nothing.
+/// RED before the fix: the drained wire kept its whole high-water capacity.
+#[test]
+fn a_drained_wire_is_bounded() {
+    let mut owed = Owed::default();
+    owed.push(&vec![0x33; 4 * 1024 * 1024], false);
+    let all = owed.wire_owed().len();
+    owed.consume(all);
+    assert!(
+        owed.wire.capacity() <= KEEP_BYTES,
+        "kept at {} bytes",
+        owed.wire.capacity()
+    );
+    let mut owed = Owed::default();
+    owed.push(&[0x44; 1024], false);
+    let kept = owed.wire.capacity();
+    owed.consume(1024);
+    assert_eq!(owed.wire.capacity(), kept, "a working-size buffer is kept whole");
+}
