@@ -72,8 +72,10 @@ pub(crate) struct Pipe {
     inbound: VecDeque<u8>,
     ended: bool,
     outbound: Vec<u8>,
-    /// Every byte ingested while the opening handshake runs: a dialled head's status line (its
-    /// reason phrase) is read from here.
+    /// Every byte ingested while a dial's opening handshake runs: its head's status line (its
+    /// reason phrase) and a refused upgrade's first body bytes are read from here. Bounded by the
+    /// machine's own handshake limit (64 KiB read, or the handshake fails and the state is gone)
+    /// plus what the one call that completes the head carries; emptied once the head is read.
     seen: Vec<u8>,
     /// This end dialled: its frames are masked (RFC 6455 section 5.3). Read only by the test
     /// harness's seed (`test-seeded`), which unmasks a dialled end's frames.
@@ -1118,19 +1120,21 @@ impl WsFramer {
             phase => phase,
         };
         let shaking = !matches!(phase, Phase::Open { .. });
-        // The dialled head's reason phrase (the dialled side fills `reason`, as the far end sent
-        // it), read off the status line before the machine takes the head.
-        // What the dial's handshake has seen, and whether the carrier ended: a refusal's body is
-        // read from here, every byte past the head (the machine reads the wire in chunks and keeps
-        // what it read; what it did not read is still here).
+        // What the dial's handshake has seen, and whether the carrier ended: the dialled head's
+        // reason phrase is read off its status line, and a refusal's body is every byte past the
+        // head (the machine reads the wire in chunks and keeps what it read; what it did not read
+        // is still here). Taken out of the pipe, never copied, and put back while the head is not
+        // whole: it is read only on the call that completes the head.
         let shaken = match &mut phase {
             Phase::Dialling { mid, .. } => {
                 let pipe = mid.get_mut().get_mut();
-                Some((pipe.seen.clone(), pipe.ended))
+                Some((std::mem::take(&mut pipe.seen), pipe.ended))
             }
             _ => None,
         };
-        let reason = shaken.as_ref().and_then(|(seen, _)| reason_phrase(seen));
+        // The dialled head's reason phrase (the dialled side fills `reason`, as the far end sent
+        // it), set on the call that hands the head up.
+        let mut reason = None;
         let mut phase = match phase {
             Phase::Accepting(mid) => match mid.handshake() {
                 Ok(mut ws) => {
@@ -1187,6 +1191,7 @@ impl WsFramer {
                         status_code: Some(u32::from(response.status().as_u16())),
                         ..Framed::plain(StreamId(0), &block, true)
                     });
+                    reason = shaken.as_ref().and_then(|(seen, _)| reason_phrase(seen));
                     for m in held {
                         ws.write(m).map_err(|e| read_error(&e))?;
                     }
@@ -1202,7 +1207,8 @@ impl WsFramer {
                     pipe.seen = Vec::new();
                     Phase::open(ws, message)
                 }
-                Err(HandshakeError::Interrupted(mid)) => {
+                Err(HandshakeError::Interrupted(mut mid)) => {
+                    mid.get_mut().get_mut().seen = shaken.map(|(seen, _)| seen).unwrap_or_default();
                     return Ok((
                         Phase::Dialling {
                             mid,
@@ -1226,6 +1232,7 @@ impl WsFramer {
                 // `Content-Length` that is not a length or disagrees fails the body at once (RFC 9110
                 // §8.6); then the frames end.
                 Err(HandshakeError::Failure(WsError::Http(response))) => {
+                    let reason = shaken.as_ref().and_then(|(seen, _)| reason_phrase(seen));
                     let code = response.status().as_u16();
                     let block = head_block(response.headers());
                     out.frame(Framed {
