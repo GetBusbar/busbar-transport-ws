@@ -1083,7 +1083,9 @@ impl WsFramer {
             Side::Dial => self.dial(target, fields)?,
         };
         drain(&mut phase, out);
-        // The upgrade request may carry credential lines: what held it is wiped once sent.
+        // The upgrade request may carry credential lines: the pipe that held it is wiped once it is
+        // handed out. The machine's own copies (the request's header values, the request buffer it
+        // generated) are the library's, dropped unwiped inside it.
         phase.pipe().outbound.zeroize();
         Ok(phase)
     }
