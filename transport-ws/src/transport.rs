@@ -1102,7 +1102,12 @@ impl WsFramer {
         let mut phase = match phase {
             Phase::Accepting(mid) => match mid.handshake() {
                 Ok(mut ws) => {
-                    ws.get_mut().seen = Vec::new();
+                    // The machine refuses any byte after the request (the client waits for the
+                    // answer), so the session starts at a frame boundary: the text scan follows
+                    // its frames from the next call on.
+                    let pipe = ws.get_mut();
+                    pipe.seen = Vec::new();
+                    pipe.scan = Some(TextScan::default());
                     Phase::open(ws, Vec::new())
                 }
                 Err(HandshakeError::Interrupted(mid)) => {
@@ -1150,7 +1155,16 @@ impl WsFramer {
                     for m in held {
                         ws.write(m).map_err(|e| read_error(&e))?;
                     }
-                    ws.get_mut().seen = Vec::new();
+                    // The far end may send its first frames with the head: the session starts at a
+                    // frame boundary, and the text scan follows its frames from the next call on,
+                    // only when the head ended exactly at the last byte seen (a call that merely
+                    // ENDS like a head may end inside a frame's payload).
+                    let pipe = ws.get_mut();
+                    let seen = shaken.as_ref().map_or(&[][..], |(seen, _)| seen.as_slice());
+                    if head_end(seen) == Some(seen.len()) {
+                        pipe.scan = Some(TextScan::default());
+                    }
+                    pipe.seen = Vec::new();
                     Phase::open(ws, message)
                 }
                 Err(HandshakeError::Interrupted(mid)) => {
@@ -1469,12 +1483,6 @@ impl WsFramer {
         }
         match Self::drive(phase, out) {
             Ok((mut phase, ended, reason)) => {
-                // A session whose handshake ended exactly at this call's last byte starts at a
-                // frame boundary, so the text scan can follow its frames from the next call on.
-                if !was_open && matches!(phase, Phase::Open { .. }) && bytes.ends_with(b"\r\n\r\n")
-                {
-                    phase.pipe().scan = Some(TextScan::default());
-                }
                 drain(&mut phase, out);
                 if ended {
                     out.end();
