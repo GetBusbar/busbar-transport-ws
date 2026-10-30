@@ -1226,15 +1226,19 @@ impl WsFramer {
         let mut phase = match phase {
             Phase::Accepting { mid, max } => match mid.handshake() {
                 Ok(mut ws) => {
-                    // The machine refuses any byte after the request (the client waits for the
-                    // answer), so the session starts at a frame boundary: the text scan follows
-                    // its frames from the next call on.
+                    // The machine refuses any byte it read past the request, but it reads in
+                    // chunks: a request that ends exactly on a chunk's end leaves what followed it
+                    // unread in the pipe, which the session reads and the scan never saw. Only
+                    // with nothing left there does the session start at a frame boundary, and the
+                    // text scan follow its frames from the next call on.
                     let pipe = ws.get_mut();
                     pipe.seen = Vec::new();
-                    pipe.scan = Some(TextScan {
-                        masked: true,
-                        ..TextScan::default()
-                    });
+                    if pipe.inbound.is_empty() {
+                        pipe.scan = Some(TextScan {
+                            masked: true,
+                            ..TextScan::default()
+                        });
+                    }
                     Phase::open(ws, Vec::new(), max)
                 }
                 Err(HandshakeError::Interrupted(mid)) => {
