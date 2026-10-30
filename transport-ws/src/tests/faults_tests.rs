@@ -289,11 +289,44 @@ fn a_panic_in_one_framing_leaves_the_others_working() {
 // ── the allocations ──────────────────────────────────────────────────────────────────────────────
 
 /// Counts every allocation (and reallocation) the CURRENT thread makes while its count is on, so
-/// the tests of this binary running side by side never count each other.
+/// the tests of this binary running side by side never count each other. It also WATCHES one
+/// block the current thread frees ([`watch_free`]): whether a secret was still in it when it went
+/// back, so a test can see a wipe of memory it can no longer read.
 struct Counting;
+
+/// The watched block's address and size, and the bytes it must not still hold when freed.
+type Watch = (usize, usize, &'static [u8]);
 
 thread_local! {
     static COUNT: Cell<Option<usize>> = const { Cell::new(None) };
+    static WATCH: Cell<Option<Watch>> = const { Cell::new(None) };
+    static WATCHED: Cell<Option<bool>> = const { Cell::new(None) };
+}
+
+/// Watch the block at `ptr`, `len` bytes, for its free on this thread: [`freed_wiped`] then says
+/// whether `secret` was gone from it.
+pub(crate) fn watch_free(ptr: *const u8, len: usize, secret: &'static [u8]) {
+    WATCHED.with(|w| w.set(None));
+    WATCH.with(|w| w.set(Some((ptr as usize, len, secret))));
+}
+
+/// Whether the watched block was freed (`None`: not yet) with no copy of its secret left in it.
+pub(crate) fn freed_wiped() -> Option<bool> {
+    WATCHED.with(Cell::get)
+}
+
+/// The watched block is going back: note whether its secret is gone from it. Allocates nothing.
+fn inspect(ptr: *mut u8) {
+    let _ = WATCH.try_with(|w| {
+        let Some((at, len, secret)) = w.get().filter(|(at, _, _)| *at == ptr as usize) else {
+            return;
+        };
+        w.set(None);
+        // SAFETY: the block is still the caller's (it is freed after this), `len` bytes long.
+        let block = unsafe { std::slice::from_raw_parts(at as *const u8, len) };
+        let held = block.windows(secret.len()).any(|run| run == secret);
+        let _ = WATCHED.try_with(|r| r.set(Some(!held)));
+    });
 }
 
 fn bump() {
@@ -304,7 +337,8 @@ fn bump() {
     });
 }
 
-// SAFETY: every call is `System`'s, unchanged; the counter only bumps a per-thread cell.
+// SAFETY: every call is `System`'s, unchanged; the counter only bumps a per-thread cell, and the
+// watch only reads a block the caller still owns, before it is freed.
 unsafe impl GlobalAlloc for Counting {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         bump();
@@ -312,6 +346,7 @@ unsafe impl GlobalAlloc for Counting {
         unsafe { System.alloc(layout) }
     }
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        inspect(ptr);
         // SAFETY: as allocated above.
         unsafe { System.dealloc(ptr, layout) }
     }
@@ -598,4 +633,32 @@ fn an_emit_after_the_peers_close_finds_the_connection_closed() {
         &mut out,
     );
     assert_eq!(r, Err(TransportError::Closed));
+}
+
+/// THE PIPE THAT WROTE A DIAL'S UPGRADE REQUEST IS WIPED ONCE IT IS HANDED OUT (codeaudit e916fda
+/// tests LOW, PL10): the request carries the auth's credential line, and the pipe's write buffer
+/// that held it goes back to the allocator with no copy of it.
+#[test]
+fn the_pipe_that_wrote_the_upgrade_request_is_wiped() {
+    const SECRET: &[u8] = b"Bearer sk-start-secret";
+    let f = WsFramer::new(0);
+    let mut out = Out::default();
+    let s = f
+        .open_with(
+            Side::Dial,
+            "ws://svc.test/x",
+            &[("authorization".to_string(), SECRET.to_vec())],
+            &mut out,
+        )
+        .expect("the dial opens");
+    assert!(out.wire.windows(SECRET.len()).any(|w| w == SECRET), "sent");
+    let (ptr, cap) = f.outbound_block(s).expect("a pipe");
+    assert!(cap >= SECRET.len(), "the block that held the request");
+    watch_free(ptr, cap, SECRET);
+    f.forget(s);
+    assert_eq!(
+        freed_wiped(),
+        Some(true),
+        "no copy of the credential is left in it"
+    );
 }

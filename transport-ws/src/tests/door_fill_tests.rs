@@ -723,3 +723,38 @@ fn only_a_dials_opening_is_marked_secret_through_the_door() {
     });
     shut(p);
 }
+
+/// A DIALLED HEAD'S REASON REACHES THE HOST'S HEAD SLOTS, BESIDE ITS HEAD (codeaudit e916fda tests
+/// LOW): the far end's refusal head `401 Unauthorized` crosses as one field-block piece with the
+/// phrase in a head slot, the answer passing the kind's head-slot check.
+#[test]
+fn a_dialled_heads_reason_reaches_the_head_slots() {
+    let p = instance();
+    let (_, token) = begin(p, SIDE_DIAL, "ws://svc.test/x", &[], &mut Lend::roomy());
+    let heard = ingest(
+        p,
+        token,
+        b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\n\r\n",
+        false,
+        &mut Lend::roomy(),
+    );
+    assert_eq!(heard.reasons, [b"Unauthorized".to_vec()]);
+    assert_ne!(heard.pieces[0].1 & PIECE_FIELDS, 0, "beside the head");
+    shut(p);
+}
+
+/// THE WIPE IS SEEN (codeaudit e916fda tests LOW): a queue buffer holding owed opening bytes goes
+/// back to the allocator wiped, both when the queue outgrows it and when the queue drops.
+#[test]
+fn an_opening_buffer_goes_back_wiped() {
+    use crate::faults_tests::{freed_wiped, watch_free};
+    const SECRET: &[u8] = b"Bearer sk-wipe-me";
+    let mut owed = Owed::default();
+    owed.push(SECRET, true);
+    watch_free(owed.wire.as_ptr(), owed.wire.capacity(), SECRET);
+    owed.push(&vec![0x22; 4 * owed.wire.capacity()], false);
+    assert_eq!(freed_wiped(), Some(true), "outgrown, wiped");
+    watch_free(owed.wire.as_ptr(), owed.wire.capacity(), SECRET);
+    drop(owed);
+    assert_eq!(freed_wiped(), Some(true), "dropped, wiped");
+}
