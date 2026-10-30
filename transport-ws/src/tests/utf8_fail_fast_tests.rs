@@ -156,3 +156,51 @@ fn a_code_point_split_across_fragments_is_still_accepted() {
     }
     assert_eq!(frames.concat(), bytes);
 }
+
+/// THE SCAN STARTS ONLY WHERE THE HANDSHAKE ENDED (codeaudit e916fda WS-1): on a dial, the call that
+/// completes the upgrade may carry the start of the far end's first frame, and when that frame's
+/// payload so far ends in CRLFCRLF the call ends with CRLFCRLF though the session is mid-frame. The
+/// rest of the frame is payload, never a frame header, so a valid binary message whose bytes read
+/// like a text header and invalid UTF-8 is handed up whole and the connection lives. (An accepted
+/// end never meets this: the handshake refuses bytes after the request.) RED before the fix: the
+/// scan armed mid-frame, read `81 05` as a text frame and failed the connection with 1007.
+#[test]
+fn a_handshake_call_ending_mid_frame_in_crlfcrlf_does_not_arm_the_scan() {
+    let mut payload = b"GET / HTTP/1.1\r\nHost: x\r\n\r\n".to_vec();
+    let split = payload.len();
+    payload.extend_from_slice(&[0x81, 0x05, 0xff, 0xfe, 0xfd, 0xfc, 0xfb]);
+    // The far end's (unmasked) binary frame.
+    let mut frame = vec![0x82, payload.len() as u8];
+    frame.extend_from_slice(&payload);
+    let at = 2 + split;
+    let framer = WsFramer::new(0);
+    let mut out = Out::default();
+    let state = framer
+        .open(Side::Dial, "ws://svc.test/x", &mut out)
+        .expect("the dial opens");
+    let request = String::from_utf8(out.sent).expect("an upgrade request");
+    let key = request
+        .lines()
+        .find_map(|l| l.strip_prefix("Sec-WebSocket-Key: "))
+        .expect("a key");
+    let mut first = format!(
+        "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\
+         Sec-WebSocket-Accept: {}\r\n\r\n",
+        tungstenite::handshake::derive_accept_key(key.as_bytes())
+    )
+    .into_bytes();
+    first.extend_from_slice(&frame[..at]);
+    assert!(first.ends_with(b"\r\n\r\n"));
+    let mut opened = Out::default();
+    framer
+        .ingest(state, &first, false, &mut opened)
+        .expect("the upgrade completes");
+    assert!(!opened.ended, "the session is open");
+    let mut rest = Out::default();
+    framer
+        .ingest(state, &frame[at..], false, &mut rest)
+        .expect("the rest of the frame");
+    assert!(!rest.ended, "the connection lives");
+    assert_eq!(rest.frames, [payload], "the binary message, whole");
+    assert!(!framer.failed(state));
+}
