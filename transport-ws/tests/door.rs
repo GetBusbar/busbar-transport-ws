@@ -1518,13 +1518,23 @@ fn a_release_of_a_lease_never_handed_out_is_refused() {
 
 /// `begin` dialling `target` with `fields` (name, value); the refusal's text, or `None` once it
 /// opens.
-fn begin_with_fields(host: &mut Host, target: &'static str, fields: &[(&[u8], &[u8])]) -> Option<String> {
+fn begin_with_fields(
+    host: &mut Host,
+    target: &'static str,
+    fields: &[(&[u8], &[u8])],
+) -> Option<String> {
     use busbar_contract::abi::mechanism::call::Field;
     let fields: Vec<Field> = fields
         .iter()
         .map(|(n, v)| Field {
-            name: AbiStr { ptr: n.as_ptr(), len: n.len() },
-            value: AbiStr { ptr: v.as_ptr(), len: v.len() },
+            name: AbiStr {
+                ptr: n.as_ptr(),
+                len: n.len(),
+            },
+            value: AbiStr {
+                ptr: v.as_ptr(),
+                len: v.len(),
+            },
         })
         .collect();
     let mut i: BeginIn = z();
