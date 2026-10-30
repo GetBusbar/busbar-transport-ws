@@ -140,7 +140,8 @@ struct Piece {
     text: bool,
     /// The stream's end is a FAILURE (`PIECE_STREAM_FAILED`): the far side broke the protocol, sent
     /// text that is not UTF-8 or a message over the ceiling, sent an upgrade request this end
-    /// refused, or ended a refused upgrade's answer short; or an op ended the framing's state.
+    /// refused, or ended a refused upgrade's answer short; the carrier ended with no closing
+    /// handshake; or an op ended the framing's state.
     /// Only ever the end piece, whose bytes say why; never split.
     failed: bool,
     /// The stream ends WHOLE here (`PIECE_END`): the empty last piece of its frames. An empty
