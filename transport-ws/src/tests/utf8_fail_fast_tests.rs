@@ -234,9 +234,16 @@ fn a_frame_that_breaks_the_protocol_is_not_judged_as_text() {
         let framer = WsFramer::new(0);
         let state = open(&framer);
         let mut out = Out::default();
-        framer.ingest(state, &frame[..frame.len() - 2], false, &mut out).unwrap();
-        assert!(!out.ended, "{frame:02x?}: nothing is judged before the frame completes");
-        framer.ingest(state, &frame[frame.len() - 2..], false, &mut out).unwrap();
+        framer
+            .ingest(state, &frame[..frame.len() - 2], false, &mut out)
+            .unwrap();
+        assert!(
+            !out.ended,
+            "{frame:02x?}: nothing is judged before the frame completes"
+        );
+        framer
+            .ingest(state, &frame[frame.len() - 2..], false, &mut out)
+            .unwrap();
         assert!(out.ended, "{frame:02x?}: the frame fails the connection");
         assert_eq!(
             framer.failure(state),

@@ -17,7 +17,9 @@
 //!   one stated as text ([`Framed::text`]), and each frame emitted (its last piece marked) goes out
 //!   as one message, TEXT when the emit says so (`EMIT_TEXT`), else BINARY.
 //! * A DIALLED connection's upgrade request carries the dial's opening head fields (the bound
-//!   auth's `Authorization` among them), the WebSocket handshake's own fields excepted; a message
+//!   auth's `Authorization` among them), the WebSocket handshake's own fields excepted
+//!   ([`HANDSHAKE_FIELDS`]; the plane's `Sec-WebSocket-Protocol` rides, and the far end's answer
+//!   is held to it; a dial asking for an extension is refused, as none is supported); a message
 //!   written before the handshake completes is held and goes out, in order, the moment it does.
 //! * A DIALLED connection's head yields its reason phrase as the far end sent it (HTTP/1), for the
 //!   door's head slots ([`WsFramer::ingest_head`]).
@@ -404,8 +406,15 @@ fn read_error(e: &WsError) -> TransportError {
     }
 }
 
-/// The upgrade request's own fields, which the handshake writes itself: an opening field of one of
-/// these names is not copied onto it.
+/// The fields an opening field may not set on the upgrade request: `host`, `connection` and
+/// `upgrade`, which the handshake writes itself, and `content-length` and `transfer-encoding`,
+/// which the machine never writes and which would frame a body the upgrade request does not have
+/// (a plane's `Content-Length` must not ride it). An opening field of one of these names is not
+/// copied onto the request, nor is a field of the handshake's own `sec-websocket-*` family
+/// (`-key`, `-version`, `-accept`), except `sec-websocket-protocol`: the subprotocols the plane
+/// offers ride the request, and the machine holds the answer to them (RFC 6455 section 4.1: a
+/// subprotocol the far end selects that was not offered, or none when some were, fails the
+/// handshake). `sec-websocket-extensions` is refused at `begin` ([`asks_extension`]).
 ///
 /// The order of the dialled head, as it is written (tungstenite 0.29 `generate_request`): the
 /// request line, then the protocol machine's handshake lines (`Host` from the dialled URL,
@@ -414,8 +423,7 @@ fn read_error(e: &WsError) -> TransportError {
 /// the order the fields were added in), a repeated name's lines together and in their own order;
 /// the binding's auth fields arrive among the opening fields (the kernel makes the one outbound
 /// auth call before `begin`). The handshake lines lead because the machine writes them
-/// (`framer_tests::the_dialled_heads_order_is_pinned` pins it). An opening field of a handshake
-/// name is the machine's to write, so it is not copied.
+/// (`framer_tests::the_dialled_heads_order_is_pinned` pins it).
 const HANDSHAKE_FIELDS: &[&str] = &[
     "host",
     "connection",
@@ -424,19 +432,33 @@ const HANDSHAKE_FIELDS: &[&str] = &[
     "transfer-encoding",
 ];
 
-/// Whether an opening field may ride the upgrade request.
+/// The one `sec-websocket-*` field that is the layer above's and not this hop's: the subprotocols.
+const SUBPROTOCOL: &str = "sec-websocket-protocol";
+
+/// Whether a field rides between this hop and the layer above: an opening field onto the upgrade
+/// request, or an answer's field into the head handed up ([`head_block`]).
 fn rides_upgrade(name: &str) -> bool {
     let lower = name.to_ascii_lowercase();
-    !HANDSHAKE_FIELDS.contains(&lower.as_str()) && !lower.starts_with("sec-websocket-")
+    !HANDSHAKE_FIELDS.contains(&lower.as_str())
+        && (lower == SUBPROTOCOL || !lower.starts_with("sec-websocket-"))
+}
+
+/// Whether a dial's opening `fields` ask for a WebSocket extension (`Sec-WebSocket-Extensions`):
+/// this end negotiates none (RFC 6455 section 9), so such a dial is refused, never sent without it.
+pub(crate) fn asks_extension(fields: &[(String, Vec<u8>)]) -> bool {
+    fields
+        .iter()
+        .any(|(name, _)| name.eq_ignore_ascii_case("sec-websocket-extensions"))
 }
 
 /// The answer's head as a field block (`busbar_contract::abi::transport::fields`): the switching
 /// response's fields as the parsed head holds them (`HeaderMap`: names in the order they first
 /// appear, a repeated name's values together under its first appearance, in their own order), names
-/// lower-case, each value on its own line. Hop-by-hop fields (and every field a `connection` field names) never enter it, nor do
-/// the handshake's own fields ([`rides_upgrade`]'s refusals: `content-length` among them, and every
-/// `sec-websocket-*` field, which answer this hop's handshake and nothing above it). No field left
-/// is the EMPTY block, still handed up: an empty head is a head.
+/// lower-case, each value on its own line. Hop-by-hop fields (and every field a `connection` field
+/// names) never enter it, nor do the handshake's own fields ([`rides_upgrade`]'s refusals:
+/// `content-length` among them, and every `sec-websocket-*` field but `sec-websocket-protocol`,
+/// which answer this hop's handshake and nothing above it; the subprotocol the far end selected is
+/// the layer above's). No field left is the EMPTY block, still handed up: an empty head is a head.
 fn head_block(headers: &HeaderMap) -> Vec<u8> {
     let nominated: Vec<&[u8]> = headers
         .get_all("connection")
@@ -1222,7 +1244,7 @@ impl WsFramer {
                         },
                         false,
                         None,
-                    ))
+                    ));
                 }
                 // The far end refused the upgrade (the head is always the first fields piece): its
                 // answer is handed up as ONE head with its status, its class and

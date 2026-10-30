@@ -561,6 +561,9 @@ const OFFER: &[u8] = b"\x08http/1.1";
 
 const SMALL: &str = "locate: a host buffer is too small";
 
+/// A dial whose opening fields ask for a WebSocket extension: none is supported.
+const BEGIN_EXTENSION: &str = "begin: the opening field sec-websocket-extensions asks for an extension, and this end supports none";
+
 op!(
     /// `locate`. A LISTENER names no far end (`LocateIn::accept`): the answer is the offer it
     /// makes, with no authority and no name.
@@ -825,6 +828,10 @@ op!(
             return Outcome::Failed;
         }
         let fields = opening_fields(i);
+        if crate::transport::asks_extension(&fields) {
+            o.error(BEGIN_EXTENSION);
+            return Outcome::Failed;
+        }
         opening(&p, &BEGIN, i.field(|x| &x.sink), &mut o, |f, c| {
             f.open_with(side, target, &fields, c)
         })
