@@ -18,17 +18,18 @@ use std::io::{Read, Write};
 use std::mem::zeroed;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 
-use crate::door::{Begin, Emit, Ingest, Open};
+use crate::door::{Begin, Emit, Ingest, Ws};
 use crate::frame::{Framed, FramerOut, HostTime, Side};
 use crate::meta;
 use crate::transport::WsFramer;
 use busbar_contract::abi::mechanism::call::{AbiStr, Outcome};
-use busbar_contract::abi::mechanism::lifecycle::{OpenIn, OpenOut};
-use busbar_contract::abi::sdk::door::Slot;
+use busbar_contract::abi::mechanism::lifecycle::{slot as life, OpenIn, OpenOut};
+use busbar_contract::abi::sdk::door::Entry;
 use busbar_contract::abi::sdk::transport::form_codes;
+use busbar_contract::abi::sdk::Safe;
 use busbar_contract::abi::transport::{
-    BeginIn, Claim, EmitIn, FramePiece, FramerOut as DoorOut, FramerSink, IngestIn, TransportTail,
-    SIDE_ACCEPT, UNIT0_UPGRADE, YIELD_MORE,
+    slot, BeginIn, Claim, EmitIn, FramePiece, FramerOut as DoorOut, FramerSink, IngestIn,
+    TransportTail, SIDE_ACCEPT, UNIT0_UPGRADE, YIELD_MORE,
 };
 use tungstenite::protocol::Role;
 use tungstenite::{Bytes, Message, WebSocket};
@@ -312,7 +313,7 @@ fn z<T>() -> T {
     unsafe { zeroed() }
 }
 
-/// The door's own slots, called as its trampoline calls them but outside it: the count is the
+/// The door's own slots, entered as its trampoline enters them but outside it: the count is the
 /// door's and the framer's logic, not the crossing's log capture (whose cost is the SDK's).
 struct Host {
     inst: *mut c_void,
@@ -327,7 +328,16 @@ impl Host {
     fn accepted() -> Self {
         let i: OpenIn = z();
         let mut o: OpenOut = z();
-        assert_eq!(Open::call(std::ptr::null_mut(), &i, &mut o), Outcome::Ready);
+        // SAFETY: no instance yet, and an `in` lending nothing.
+        let r = unsafe {
+            Safe::<busbar_contract::abi::sdk::life::Open<Ws>>::enter(
+                std::ptr::null_mut(),
+                life::OPEN,
+                &i,
+                &mut o,
+            )
+        };
+        assert_eq!(r, Outcome::Ready);
         let mut host = Host {
             inst: o.instance,
             wire: vec![0; 64 * 1024],
@@ -344,7 +354,9 @@ impl Host {
         };
         b.sink = host.sink();
         let mut bo: DoorOut = z();
-        assert_eq!(Begin::call(host.inst, &b, &mut bo), Outcome::Ready);
+        // SAFETY: the instance `open` answered, and the host's buffers lent in the sink.
+        let r = unsafe { Safe::<Begin>::enter(host.inst, slot::BEGIN, &b, &mut bo) };
+        assert_eq!(r, Outcome::Ready);
         host.framing = bo.framing;
         let answer = host.ingest(UPGRADE);
         assert!(host.wire[..answer.yielded.wire_len as usize].starts_with(b"HTTP/1.1 101"));
@@ -374,7 +386,8 @@ impl Host {
         i.len = bytes.len();
         i.sink = self.sink();
         let mut o: DoorOut = z();
-        let r = Ingest::call(self.inst, &i, &mut o);
+        // SAFETY: the instance `open` answered, and the host's buffers lent in the sink.
+        let r = unsafe { Safe::<Ingest>::enter(self.inst, slot::INGEST, &i, &mut o) };
         assert_eq!(r, Outcome::Ready);
         assert_eq!(o.yielded.flags & YIELD_MORE, 0, "a roomy sink holds it all");
         o
@@ -389,7 +402,8 @@ impl Host {
         i.end_of_frame = 1;
         i.sink = self.sink();
         let mut o: DoorOut = z();
-        let r = Emit::call(self.inst, &i, &mut o);
+        // SAFETY: the instance `open` answered, and the host's buffers lent in the sink.
+        let r = unsafe { Safe::<Emit>::enter(self.inst, slot::EMIT, &i, &mut o) };
         assert_eq!(r, Outcome::Ready);
         assert_eq!(o.yielded.flags & YIELD_MORE, 0, "a roomy sink holds it all");
         o

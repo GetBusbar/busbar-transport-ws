@@ -20,7 +20,7 @@
 //!   auth's `Authorization` among them), the WebSocket handshake's own fields excepted; a message
 //!   written before the handshake completes is held and goes out, in order, the moment it does.
 //! * A DIALLED connection's head yields its reason phrase as the far end sent it (HTTP/1), for the
-//!   door's head slots ([`WsFramer::take_reason`]).
+//!   door's head slots ([`WsFramer::ingest_head`]).
 //! * A DIALLED connection's switching-protocols response is the far end's ANSWER (a transport
 //!   always hands the response head up as the stream's first fields frame): the moment
 //!   it completes the handshake it is handed up as ONE frame carrying its status (`101`, a
@@ -119,7 +119,6 @@ impl TextScan {
         use tungstenite::protocol::frame::FrameHeader;
         while !(self.bad || self.off) && !bytes.is_empty() {
             if self.left == 0 {
-                // A header: collect until the library's parser has all of it.
                 self.head[self.head_len] = bytes[0];
                 self.head_len += 1;
                 bytes = &bytes[1..];
@@ -228,11 +227,11 @@ enum Phase {
     /// An accepted connection waiting for (the rest of) the upgrade request.
     Accepting(MidHandshake<ServerHandshake<Pipe, NoCallback>>),
     /// A dialled connection waiting for (the rest of) the upgrade response, with the messages
-    /// written before it completes (each with its text flag) and the pieces of one not yet marked
-    /// complete.
+    /// written before it completes (a text one checked once, as it is held) and the pieces of one
+    /// not yet marked complete.
     Dialling {
         mid: MidHandshake<ClientHandshake<Pipe>>,
-        held: Vec<(Vec<u8>, bool)>,
+        held: Vec<Message>,
         message: Vec<u8>,
         /// The message ceiling this framing began under (`0` = none): a refresh after it moves
         /// only framings begun later.
@@ -301,9 +300,6 @@ pub(crate) struct WsFramer {
     /// remove one, never across a framing's work, so connections run side by side and a panic in
     /// one fails that one alone.
     states: Mutex<HashMap<u64, Conn>>,
-    /// Each dialled framing's head reason phrase, from the call that handed the head up until the
-    /// door takes it ([`WsFramer::take_reason`]).
-    reasons: Mutex<HashMap<u64, Vec<u8>>>,
     next: AtomicU64,
     /// The message ceiling a framing begun now takes (`0` = the library's default and no outbound
     /// ceiling); a refresh moves it ([`WsFramer::set_max`]), and every framing keeps the one it
@@ -829,7 +825,6 @@ impl WsFramer {
     pub(crate) fn new(max_message_bytes: usize) -> Self {
         Self {
             states: Mutex::new(HashMap::new()),
-            reasons: Mutex::new(HashMap::new()),
             next: AtomicU64::new(1),
             max_message_bytes: AtomicUsize::new(max_message_bytes),
         }
@@ -909,16 +904,17 @@ impl WsFramer {
             if end_of_frame {
                 // A text message is checked at the call, as the open connection checks it: bytes
                 // that are not UTF-8 fail the write before they are held, never later at replay.
-                if text && std::str::from_utf8(message).is_err() {
-                    message.clear();
-                    return Err(TransportError::Framing);
-                }
-                held.push((std::mem::take(message), text));
+                let whole = std::mem::take(message);
+                held.push(if text {
+                    let text = String::from_utf8(whole).map_err(|_| TransportError::Framing)?;
+                    Message::Text(text.into())
+                } else {
+                    Message::Binary(whole.into())
+                });
             }
             return Ok(());
         }
         Self::with_open(guard.as_mut(), out, |ws, message| {
-            // The ceiling this framing began under, which its machine holds (`None` = none).
             let max = ws.get_config().max_message_size.unwrap_or(0);
             // The ceiling applies outbound too: the machine bounds only what it reads, so a message this
             // end writes is held to the same ceiling here, as a held one is above (a capacity
@@ -961,23 +957,10 @@ impl WsFramer {
         self.states.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// The reason phrase of the head framing `state`'s last call handed up (a dialled framing's,
-    /// HTTP/1 as sent), taken once: the door states it in the head's slots.
-    pub(crate) fn take_reason(&self, state: u64) -> Option<Vec<u8>> {
-        self.reasons
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .remove(&state)
-    }
-
-    /// Drop framing `state` and anything kept for it, writing nothing: the door's finish of a
-    /// framing whose op panicked, which never reached the framer to close it.
+    /// Drop framing `state`, writing nothing: the door's finish of a framing whose op panicked,
+    /// which never reached the framer to close it.
     pub(crate) fn forget(&self, state: u64) {
         self.map().remove(&state);
-        self.reasons
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .remove(&state);
     }
 
     /// Whether framing `state` is still held: an op that failed with its state alive failed that
@@ -1164,9 +1147,7 @@ impl WsFramer {
                         status_code: Some(u32::from(response.status().as_u16())),
                         ..Framed::plain(StreamId(0), &block, true)
                     });
-                    // What was written before the handshake completed goes out now, in order.
-                    for (bytes, text) in held {
-                        let m = message_of(Bytes::from(bytes), text).map_err(|e| read_error(&e))?;
+                    for m in held {
                         ws.write(m).map_err(|e| read_error(&e))?;
                     }
                     ws.get_mut().seen = Vec::new();
@@ -1457,6 +1438,18 @@ impl WsFramer {
         end: bool,
         out: &mut dyn FramerOut,
     ) -> Result<(), TransportError> {
+        self.ingest_head(state, bytes, end, out).map(drop)
+    }
+
+    /// [`WsFramer::ingest`], answering the reason phrase of the head this call handed up (a dialled
+    /// framing's, HTTP/1 as sent) for the door's head slots.
+    pub(crate) fn ingest_head(
+        &self,
+        state: u64,
+        bytes: &[u8],
+        end: bool,
+        out: &mut dyn FramerOut,
+    ) -> Result<Option<Vec<u8>>, TransportError> {
         let conn = self.conn(state)?;
         let mut held = Self::enter(&conn)?;
         let mut phase = held.take().ok_or(TransportError::Closed)?;
@@ -1482,24 +1475,17 @@ impl WsFramer {
                 {
                     phase.pipe().scan = Some(TextScan::default());
                 }
-                if let Some(reason) = reason {
-                    self.reasons
-                        .lock()
-                        .unwrap_or_else(PoisonError::into_inner)
-                        .insert(state, reason);
-                }
                 drain(&mut phase, out);
                 if ended {
                     out.end();
                 }
                 *held = Some(phase);
-                Ok(())
+                Ok(reason)
             }
             // A failed state is gone: its connection has nothing more to say.
             Err(e) => {
                 drop(held);
                 self.map().remove(&state);
-                self.take_reason(state);
                 Err(e)
             }
         }
