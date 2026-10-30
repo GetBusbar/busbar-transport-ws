@@ -979,3 +979,26 @@ fn a_dials_subprotocol_rides_the_upgrade_and_the_answer_is_held_to_it() {
         }
     }
 }
+
+/// THE SCHEME IS READ WHATEVER ITS CASE (codeaudit e916fda WS-8; RFC 3986 section 3.1, as the
+/// contract's own URL reader reads it): `WSS://` and `Ws://` are `wss` and `ws` targets, and a dial
+/// to one opens. RED before the fix: they were refused as not a ws or wss URL.
+#[test]
+fn the_scheme_is_read_whatever_its_case() {
+    assert_eq!(
+        crate::transport::split_ws_url("WSS://host/p").unwrap(),
+        (true, "host".to_string(), 443, "/p".to_string())
+    );
+    assert_eq!(
+        crate::transport::split_ws_url("Ws://host:9/p").unwrap(),
+        (false, "host".to_string(), 9, "/p".to_string())
+    );
+    let framer = WsFramer::new(0);
+    let mut out = Out::default();
+    framer
+        .open_with(Side::Dial, "wSs://api.example/v1", &[], &mut out)
+        .expect("the dial opens");
+    let request = String::from_utf8(out.sent).unwrap();
+    assert!(request.starts_with("GET /v1 HTTP/1.1\r\n"), "{request}");
+    assert_eq!(fields_named(&request, "host"), ["api.example"]);
+}
