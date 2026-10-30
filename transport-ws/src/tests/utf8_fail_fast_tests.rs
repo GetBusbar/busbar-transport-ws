@@ -161,9 +161,8 @@ fn a_code_point_split_across_fragments_is_still_accepted() {
 /// completes the upgrade may carry the start of the far end's first frame, and when that frame's
 /// payload so far ends in CRLFCRLF the call ends with CRLFCRLF though the session is mid-frame. The
 /// rest of the frame is payload, never a frame header, so a valid binary message whose bytes read
-/// like a text header and invalid UTF-8 is handed up whole and the connection lives. (An accepted
-/// end never meets this: the handshake refuses bytes after the request.) RED before the fix: the
-/// scan armed mid-frame, read `81 05` as a text frame and failed the connection with 1007.
+/// like a text header and invalid UTF-8 is handed up whole and the connection lives. RED before the
+/// fix: the scan armed mid-frame, read `81 05` as a text frame and failed the connection with 1007.
 #[test]
 fn a_handshake_call_ending_mid_frame_in_crlfcrlf_does_not_arm_the_scan() {
     let mut payload = b"GET / HTTP/1.1\r\nHost: x\r\n\r\n".to_vec();
@@ -252,4 +251,39 @@ fn a_frame_that_breaks_the_protocol_is_not_judged_as_text() {
         );
         assert_eq!(close_code(&framer, state), Some(1002), "{frame:02x?}");
     }
+}
+
+/// AN ACCEPTED SESSION'S SCAN STARTS ONLY WHERE NOTHING FOLLOWED THE REQUEST (codeaudit e916fda WS-1,
+/// review): the handshake reads the request in 4096-byte chunks, so a request ending exactly on a
+/// chunk's end leaves the frame bytes that came with it unread in the pipe, and the machine refuses
+/// nothing. The library reads them as the session opens; the scan never saw them, so it must not
+/// start there. RED before the fix: the scan armed, read the rest of a valid binary frame as a text
+/// frame and failed the connection with 1007.
+#[test]
+fn an_accepted_call_with_frame_bytes_after_a_chunk_sized_request_does_not_arm_the_scan() {
+    let head = b"GET /echo HTTP/1.1\r\nHost: svc.test\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\nX-Pad: ";
+    let mut request = head.to_vec();
+    request.resize(4096 - 4, b'p');
+    request.extend_from_slice(b"\r\n\r\n");
+    assert_eq!(request.len(), 4096);
+    // A valid masked binary frame (all-zero key), its payload bytes reading like a text header and
+    // invalid UTF-8.
+    let payload = [0xaa, 0xbb, 0x81, 0x82, 0, 0, 0, 0, 0xff, 0xff];
+    let mut frame = vec![0x82, 0x80 | payload.len() as u8, 0, 0, 0, 0];
+    frame.extend_from_slice(&payload);
+    let framer = WsFramer::new(0);
+    let mut out = Out::default();
+    let state = framer.open(Side::Accept, "", &mut out).expect("opens");
+    let mut first = request;
+    first.extend_from_slice(&frame[..8]);
+    framer
+        .ingest(state, &first, false, &mut out)
+        .expect("the upgrade is answered");
+    assert!(out.sent.starts_with(b"HTTP/1.1 101"), "switching protocols");
+    let mut rest = Out::default();
+    framer
+        .ingest(state, &frame[8..], false, &mut rest)
+        .expect("the rest of the frame");
+    assert!(!rest.ended, "the connection lives");
+    assert_eq!(rest.frames, [payload.to_vec()], "the binary message, whole");
 }
