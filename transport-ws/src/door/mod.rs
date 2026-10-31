@@ -126,10 +126,22 @@ const TAIL: TransportTail = {
     t
 };
 
+busbar_contract::statement_extensions!(
+    /// The Statement's extensions: this plugin's whole `declares` document.
+    EXTENSIONS: [(
+        busbar_contract::abi::mechanism::extensions::EXT_DECLARES,
+        include_bytes!("../../declares.json")
+    )]
+);
+
 /// The door's Statement: the `ws` framer.
-pub const STATEMENT: Statement = statement(KEY, env!("CARGO_PKG_VERSION"), 64)
-    .with_kind_tail(&TAIL)
-    .with_claims(CLAIM_NAMES);
+pub const STATEMENT: Statement = {
+    let mut s = statement(KEY, env!("CARGO_PKG_VERSION"), 64)
+        .with_kind_tail(&TAIL)
+        .with_claims(CLAIM_NAMES);
+    s.extensions = EXTENSIONS;
+    s
+};
 
 /// One frame piece waiting for the host.
 struct Piece {
