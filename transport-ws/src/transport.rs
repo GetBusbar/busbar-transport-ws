@@ -1701,3 +1701,37 @@ impl WsFramer {
         Ok(state)
     }
 }
+
+#[cfg(test)]
+mod drain_tests {
+    use super::*;
+    use crate::door::KEEP_BYTES;
+    use crate::frame::{Framed, HostTime};
+
+    struct Sink(usize);
+    impl FramerOut for Sink {
+        fn send(&mut self, bytes: &[u8]) {
+            self.0 += bytes.len();
+        }
+        fn frame(&mut self, _: Framed<'_>) {}
+        fn end(&mut self) {}
+        fn now(&self) -> HostTime {
+            HostTime::default()
+        }
+    }
+
+    /// WS-11 residue: a big outbound burst does not leave its capacity behind once drained (as
+    /// `Owed::wire` and the kept piece buffers shrink to `KEEP_BYTES`).
+    #[test]
+    fn a_drained_outbound_buffer_gives_back_its_capacity() {
+        let big = KEEP_BYTES * 4;
+        let mut pipe = Pipe::default();
+        pipe.outbound.extend(std::iter::repeat(7_u8).take(big));
+        let mut phase = Phase::Refused(pipe);
+        let mut out = Sink(0);
+        drain(&mut phase, &mut out);
+        assert_eq!(out.0, big);
+        let kept = phase.pipe().outbound.capacity();
+        assert!(kept <= KEEP_BYTES, "the drained buffer kept {kept} bytes");
+    }
+}

@@ -327,7 +327,7 @@ const SPARE_MAX: usize = 8;
 /// The capacity a kept piece buffer holds at most: what one large message grew it past this is
 /// given back, so a framing keeps working-size spares, not its high-water mark (as stdio's
 /// `KEEP_BYTES`). A buffer within it is kept whole, so steady state allocates nothing.
-const KEEP_BYTES: usize = 256 * 1024;
+pub(crate) const KEEP_BYTES: usize = 256 * 1024;
 
 impl Owed {
     /// The bytes owed to the far side and not handed over yet.
