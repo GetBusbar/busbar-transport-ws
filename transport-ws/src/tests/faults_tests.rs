@@ -68,6 +68,27 @@ fn ws_claims_ws_and_wss() {
     assert_eq!(rows.len(), names.len(), "one row per claim");
 }
 
+/// RED (sibling alignment D13/R3): the ws claim declares only the selector forms something at the
+/// pin evaluates. A guest line spells path forms and header present/prefix predicates (route.rs,
+/// kernel guest.rs); no route predicate spells an exact header value, and nothing matches an
+/// arriving connection's SNI or ALPN, and `Port` is honoured only on a carrier (`address_carrier`).
+#[test]
+fn ws_declares_only_the_forms_something_evaluates() {
+    use busbar_contract::grammar::SelectorForm::*;
+    assert_eq!(
+        meta::SELECTOR_FORMS,
+        [
+            ExactPath,
+            PrefixOneLevel,
+            PathPattern,
+            PathSuffix,
+            PathContains,
+            HeaderPresent,
+            HeaderPrefix
+        ]
+    );
+}
+
 /// RED (audit: the admitted claim row contradicts the transport's own declaration): every row the
 /// Statement admits states exactly what `meta.rs` declares (THE DESIGN §2, "Each fact is
 /// declared once; anything derivable is derived").
