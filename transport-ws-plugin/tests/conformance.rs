@@ -327,3 +327,17 @@ fn the_statement_carries_the_declares_document() {
         Some(&include_bytes!("../../transport-ws/declares.json")[..]),
     );
 }
+
+/// The ws framer makes no auth call on an accepted stream (its only auth call is the dial's
+/// outbound one, before `begin`), so its Statement states an explicit EMPTY offered-points record:
+/// boot refuses a guest line whose auth needs a point, instead of defaulting to {Head, HeadBody}.
+#[test]
+fn the_statement_offers_no_auth_points() {
+    use busbar_contract::abi::auth::AuthPoints;
+    use busbar_contract::abi::transport::check::check_offered_points;
+    let read = busbar_contract::abi::mechanism::rendering::read(&row().statement).unwrap();
+    assert_eq!(
+        check_offered_points(&read.extensions.bytes),
+        Ok(AuthPoints(0))
+    );
+}
