@@ -55,6 +55,7 @@ use busbar_contract::abi::transport::fields::{hop_by_hop, LINE_END, SEPARATOR};
 use busbar_contract::ids::StreamId;
 use busbar_contract::transport::wire::{CloseReason, TransportError, WireStatusClass};
 
+use crate::door::KEEP_BYTES;
 use crate::frame::{Framed, FramerOut, Located, Side};
 use tungstenite::client::IntoClientRequest;
 use tungstenite::error::ProtocolError;
@@ -793,6 +794,9 @@ fn drain(phase: &mut Phase, out: &mut dyn FramerOut) {
         }
         out.send(&pipe.outbound);
         pipe.outbound.clear();
+        if pipe.outbound.capacity() > KEEP_BYTES {
+            pipe.outbound.shrink_to(KEEP_BYTES);
+        }
     }
 }
 
@@ -1705,7 +1709,6 @@ impl WsFramer {
 #[cfg(test)]
 mod drain_tests {
     use super::*;
-    use crate::door::KEEP_BYTES;
     use crate::frame::{Framed, HostTime};
 
     struct Sink(usize);

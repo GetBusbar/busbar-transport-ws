@@ -18,7 +18,9 @@
 //! listener's upgrade or dialled over the carrier the connector chooses. No transport encrypts:
 //! TLS is core's connection security, applied host-side and never composed as a layer.
 
-#![deny(unsafe_code)]
+// The one `unsafe` in this crate is test-only (the counting allocator and zeroed ABI structs).
+#![cfg_attr(not(test), forbid(unsafe_code))]
+#![cfg_attr(test, deny(unsafe_code))]
 #![deny(missing_docs)]
 
 mod claims;
