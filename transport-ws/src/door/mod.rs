@@ -31,7 +31,6 @@ use zeroize::Zeroize;
 
 use busbar_contract::abi::mechanism::call::{AbiStr, OutHead, Outcome};
 use busbar_contract::abi::mechanism::door::Statement;
-use busbar_contract::abi::mechanism::lifecycle::RefreshIn;
 use busbar_contract::abi::sdk::door::{abi_str, statement};
 use busbar_contract::abi::sdk::life::{self, Held, Life, Refreshed, Refusal};
 use busbar_contract::abi::sdk::transport::{form_codes, settings_reading, DEFAULT_BODY_MAX};
@@ -429,21 +428,6 @@ impl Life for Ws {
     fn refresh(&self, settings: &[u8], _: &[&[u8]], _: u64) -> Result<Refreshed, Refusal> {
         self.framer.set_max(read_settings(settings)?);
         Ok(Refreshed::default())
-    }
-}
-
-/// `refresh`: the SDK's, and with no instance FAILED by name (the SDK's answers FAULT).
-pub(crate) struct Refresh;
-impl SafeSlot for Refresh {
-    type In = RefreshIn;
-    type Out = OutHead;
-    type State = Held<Ws>;
-    fn call(p: Instance<'_, Held<Ws>>, i: Lent<'_, RefreshIn>, mut o: Out<'_, OutHead>) -> Outcome {
-        if p.get().is_none() {
-            o.error("refresh: no open instance");
-            return Outcome::Failed;
-        }
-        life::Refresh::<Ws>::call(p, i, o)
     }
 }
 
@@ -1122,7 +1106,7 @@ busbar_contract::plugin_door! {
     lifecycle: {
         validate: Safe<life::Validate<Ws>>,
         open: Safe<life::Open<Ws>>,
-        refresh: Safe<Refresh>,
+        refresh: Safe<life::Refresh<Ws>>,
         retire: Safe<life::Retire<Ws>>,
         tick: Safe<life::Tick<Ws>>,
         drive: Safe<life::Drive<Ws>>,
