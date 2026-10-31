@@ -42,11 +42,11 @@ use busbar_contract::abi::transport::{
     IngestIn, IoOut, ListenIn, ListenOut, LocateIn, LocateOut, Ops, ReadIn, RefuseIn, SettingDecl,
     ShutIn, TransportTail, WriteIn, CANCEL_NOTHING_MOVED, CLOSE_CAPACITY_EXHAUSTED, CLOSE_DRAIN,
     CLOSE_PEER_CLOSED, CLOSE_POISONED, CLOSE_REVOKED, CLOSE_TIMEOUT, CLOSE_TRANSPORT_FAILED,
-    EMIT_TEXT, FAULT_NONE, FRAME_PIECE_SIZE, FRAMING_STREAM, PIECE_CONTINUED, PIECE_END,
-    PIECE_END_OF_FRAME, PIECE_FIELDS, PIECE_HAS_CODE, PIECE_HAS_RETRY_AFTER, PIECE_STREAM_FAILED,
-    PIECE_TEXT, ROLE_FRAMER, SETTING_COUNT, SIDE_ACCEPT, SIDE_DIAL, STATUS_CALLER_FAULT,
-    STATUS_FAR_END_FAULT, STATUS_NONE, STATUS_OTHER, STATUS_SUCCESS, UNIT0_UPGRADE, YIELD_ENDED,
-    YIELD_MORE,
+    EMIT_TEXT, FACT_ACCEPTS, FACT_ADOPTS, FACT_DIALS, FAULT_NONE, FRAME_PIECE_SIZE, FRAMING_STREAM,
+    PIECE_CONTINUED, PIECE_END, PIECE_END_OF_FRAME, PIECE_FIELDS, PIECE_HAS_CODE,
+    PIECE_HAS_RETRY_AFTER, PIECE_STREAM_FAILED, PIECE_TEXT, ROLE_FRAMER, SETTING_COUNT,
+    SIDE_ACCEPT, SIDE_DIAL, STATUS_CALLER_FAULT, STATUS_FAR_END_FAULT, STATUS_NONE, STATUS_OTHER,
+    STATUS_SUCCESS, UNIT0_UPGRADE, YIELD_ENDED, YIELD_MORE,
 };
 use busbar_contract::ids::StreamId;
 use busbar_contract::transport::registry::DEFAULT_REQUEST_BODY_MAX_BYTES;
@@ -110,15 +110,19 @@ const SETTINGS: &[SettingDecl] = &[SettingDecl {
     default: abi_str(DEFAULT_BODY_MAX),
 }];
 
-/// No fact: the kernel makes the binding's one outbound auth call before `begin`, and the handshake
-/// writes its own lines after it. No transport names another: the carrier is the connector's
-/// choice, and an upgrade reaches this framer by `adopt`, never by composition.
+/// The op facts are the ops the door serves: the framer begins on the accepting side and on the
+/// dialling side, and adopts a stream another framer detached (`FACT_ACCEPTS`, `FACT_DIALS`,
+/// `FACT_ADOPTS`); it detaches nothing (nothing upgrades out of a WebSocket) and decodes no payload.
+/// The kernel makes the binding's one outbound auth call before `begin`, and the handshake writes
+/// its own lines after it. No transport names another: the carrier is the connector's choice, and
+/// an upgrade reaches this framer by `adopt`, never by composition.
 const TAIL: TransportTail = {
     let mut t = TransportTail::EMPTY
         .with_claim_rows(CLAIMS)
         .with_settings(SETTINGS);
     t.role = ROLE_FRAMER;
     t.framing = FRAMING_STREAM;
+    t.facts = FACT_ACCEPTS | FACT_DIALS | FACT_ADOPTS;
     t.frame_piece_size = FRAME_PIECE_SIZE;
     t
 };
@@ -140,7 +144,8 @@ struct Piece {
     text: bool,
     /// The stream's end is a FAILURE (`PIECE_STREAM_FAILED`): the far side broke the protocol, sent
     /// text that is not UTF-8 or a message over the ceiling, sent an upgrade request this end
-    /// refused, or ended a refused upgrade's answer short; or an op ended the framing's state.
+    /// refused, or ended a refused upgrade's answer short; the carrier ended with no closing
+    /// handshake; or an op ended the framing's state.
     /// Only ever the end piece, whose bytes say why; never split.
     failed: bool,
     /// The stream ends WHOLE here (`PIECE_END`): the empty last piece of its frames. An empty
@@ -271,7 +276,11 @@ struct Owed {
     wire_at: usize,
     /// `wire[..secret]` held the framing's opening (a dialled upgrade request carries its auth's
     /// credential lines): each of those bytes is wiped as it is handed over, when the buffer
-    /// outgrows them, and on drop. Message bytes after it are not.
+    /// outgrows them, and on drop. Message bytes after it are not. This is one of the copies of
+    /// the credential this plugin owns, each wiped (the opening fields `begin` copies, the pipe the
+    /// request is written through, this queue); the protocol library's own copies (the request's
+    /// header values it takes, the request buffer it generates) are dropped unwiped inside it, the
+    /// known residue of credentials reaching a framer as plaintext until the sealed attach slot.
     secret: usize,
     pieces: VecDeque<Piece>,
     /// The byte buffers of pieces already handed over, kept for the next pieces: a framing in
@@ -323,7 +332,8 @@ impl Owed {
     }
 
     /// Mark the next `n` owed bytes handed to the host, wiping the secret ones in place; once all
-    /// are handed over the buffer empties.
+    /// are handed over the buffer empties, and gives back what one large message grew it past
+    /// [`KEEP_BYTES`] (as a kept piece buffer does): a working-size buffer is kept whole.
     fn consume(&mut self, n: usize) {
         let end = self.wire_at + n;
         if self.secret > self.wire_at {
@@ -332,6 +342,9 @@ impl Owed {
         self.wire_at = end;
         if self.wire_at == self.wire.len() {
             self.wire.clear();
+            if self.wire.capacity() > KEEP_BYTES {
+                self.wire.shrink_to(KEEP_BYTES);
+            }
             self.wire_at = 0;
             self.secret = 0;
         }
@@ -476,17 +489,33 @@ impl frame::FramerOut for Collect<'_> {
     }
 }
 
-/// A dial's opening head fields (`BeginIn::fields`), owned.
-fn opening_fields(i: Lent<'_, BeginIn>) -> Vec<(String, Vec<u8>)> {
-    i.fields()
-        .iter()
-        .map(|f| {
-            (
-                String::from_utf8_lossy(f.field(|x| &x.name).bytes()).into_owned(),
-                f.field(|x| &x.value).bytes().to_vec(),
-            )
-        })
-        .collect()
+/// A dial's opening head fields (`BeginIn::fields`), owned for the one `begin` call: they may carry
+/// the binding's credential (its `Authorization` line), so every byte of this copy is wiped when it
+/// drops, refused or not.
+struct OpeningFields(Vec<(String, Vec<u8>)>);
+
+impl Drop for OpeningFields {
+    fn drop(&mut self) {
+        for (name, value) in &mut self.0 {
+            name.zeroize();
+            value.zeroize();
+        }
+    }
+}
+
+/// A dial's opening head fields, copied out of the host's lent ones.
+fn opening_fields(i: Lent<'_, BeginIn>) -> OpeningFields {
+    OpeningFields(
+        i.fields()
+            .iter()
+            .map(|f| {
+                (
+                    String::from_utf8_lossy(f.field(|x| &x.name).bytes()).into_owned(),
+                    f.field(|x| &x.value).bytes().to_vec(),
+                )
+            })
+            .collect(),
+    )
 }
 
 fn time(sink: &FramerSink) -> HostTime {
@@ -559,6 +588,15 @@ macro_rules! op {
 const OFFER: &[u8] = b"\x08http/1.1";
 
 const SMALL: &str = "locate: a host buffer is too small";
+
+/// A dial with an opening field the upgrade request cannot carry (an invalid name, or a value with a
+/// line break or a control byte): neither the field's value (it may be a credential) nor a
+/// handshake that never ran is named.
+const BEGIN_UNCARRIABLE: &str =
+    "begin: an opening field is not a valid HTTP field, and the upgrade request cannot carry it";
+
+/// A dial whose opening fields ask for a WebSocket extension: none is supported.
+const BEGIN_EXTENSION: &str = "begin: the opening field sec-websocket-extensions asks for an extension, and this end supports none";
 
 op!(
     /// `locate`. A LISTENER names no far end (`LocateIn::accept`): the answer is the offer it
@@ -824,8 +862,20 @@ op!(
             return Outcome::Failed;
         }
         let fields = opening_fields(i);
+        // Only a dial's request carries its opening fields, and a target that is no ws URL is
+        // refused for that first (by the open below), whatever the fields.
+        if matches!(side, Side::Dial) && crate::transport::split_ws_url(target).is_ok() {
+            if crate::transport::asks_extension(&fields.0) {
+                o.error(BEGIN_EXTENSION);
+                return Outcome::Failed;
+            }
+            if !crate::transport::carries_all(&fields.0) {
+                o.error(BEGIN_UNCARRIABLE);
+                return Outcome::Failed;
+            }
+        }
         opening(&p, &BEGIN, i.field(|x| &x.sink), &mut o, |f, c| {
-            f.open_with(side, target, &fields, c)
+            f.open_with(side, target, &fields.0, c)
         })
     }
 );

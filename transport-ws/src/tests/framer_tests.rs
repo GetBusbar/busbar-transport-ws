@@ -926,3 +926,157 @@ fn nothing_is_kept_after_the_peers_close() {
         assert_eq!(framer.inbound_len(state), Some(0), "nobody's bytes");
     }
 }
+
+/// AN UPGRADE ANSWERED WITH ANOTHER 2XX IS NO SUCCESS (codeaudit e916fda WS-5; RFC 6455 section
+/// 4.1: any status but `101` fails the handshake): a far end that answers `200` (a plain web server,
+/// an SPA fallback) never upgraded, so its head states no success to the breaker or the plane; it
+/// is a refused upgrade outside the three classes. RED before the fix: `200` was stated `Success`.
+#[test]
+fn an_upgrade_answered_with_another_2xx_is_no_success() {
+    for code in [200, 204, 206] {
+        let wire = format!("HTTP/1.1 {code} OK\r\nContent-Length: 0\r\n\r\n");
+        let (_, _, heard) = refused_with(wire.as_bytes(), false);
+        assert_eq!(
+            heard.statuses[0],
+            Some((code, Some(WireStatusClass::Other))),
+            "{code}"
+        );
+    }
+}
+
+/// A DIAL'S SUBPROTOCOL RIDES ITS UPGRADE AND THE ANSWER IS HELD TO IT (codeaudit e916fda WS-7; RFC
+/// 6455 sections 1.9, 4.1): the plane's `Sec-WebSocket-Protocol` opening field goes out on the
+/// upgrade request; an answer selecting one of the offered subprotocols opens, its selection handed
+/// up in the head, and an answer selecting another fails the handshake. RED before the fix: the
+/// field was silently dropped.
+#[test]
+fn a_dials_subprotocol_rides_the_upgrade_and_the_answer_is_held_to_it() {
+    let fields = vec![(
+        "Sec-WebSocket-Protocol".to_string(),
+        b"graphql-transport-ws".to_vec(),
+    )];
+    for (selected, opens) in [("graphql-transport-ws", true), ("mqtt", false)] {
+        let framer = WsFramer::new(0);
+        let mut out = Out::default();
+        let state = framer
+            .open_with(Side::Dial, "ws://127.0.0.1:9/graphql", &fields, &mut out)
+            .expect("the dial opens");
+        let request = String::from_utf8(out.sent.clone()).expect("an upgrade request");
+        assert_eq!(
+            fields_named(&request, "sec-websocket-protocol"),
+            ["graphql-transport-ws"],
+            "{request}"
+        );
+        let mut answer = switching(&request);
+        answer.truncate(answer.len() - 2);
+        answer.extend_from_slice(format!("Sec-WebSocket-Protocol: {selected}\r\n\r\n").as_bytes());
+        let mut heard = Out::default();
+        let r = framer.ingest(state, &answer, false, &mut heard);
+        assert_eq!(r.is_ok(), opens, "{selected}: {r:?}");
+        if opens {
+            let head = String::from_utf8(heard.frames[0].clone()).unwrap();
+            assert_eq!(head, format!("sec-websocket-protocol: {selected}\r\n"));
+        }
+    }
+}
+
+/// THE SCHEME IS READ WHATEVER ITS CASE (codeaudit e916fda WS-8; RFC 3986 section 3.1, as the
+/// contract's own URL reader reads it): `WSS://` and `Ws://` are `wss` and `ws` targets, and a dial
+/// to one opens. RED before the fix: they were refused as not a ws or wss URL.
+#[test]
+fn the_scheme_is_read_whatever_its_case() {
+    assert_eq!(
+        crate::transport::split_ws_url("WSS://host/p").unwrap(),
+        (true, "host".to_string(), 443, "/p".to_string())
+    );
+    assert_eq!(
+        crate::transport::split_ws_url("Ws://host:9/p").unwrap(),
+        (false, "host".to_string(), 9, "/p".to_string())
+    );
+    let framer = WsFramer::new(0);
+    let mut out = Out::default();
+    framer
+        .open_with(Side::Dial, "wSs://api.example/v1", &[], &mut out)
+        .expect("the dial opens");
+    let request = String::from_utf8(out.sent).unwrap();
+    assert!(request.starts_with("GET /v1 HTTP/1.1\r\n"), "{request}");
+    assert_eq!(fields_named(&request, "host"), ["api.example"]);
+}
+
+/// A FRAMER WITH NO CEILING PUTS NONE ON WHAT IT WRITES (codeaudit e916fda WS-9): `new(0)` is the
+/// library's inbound default and no outbound ceiling, on an open connection as on a dialling one.
+/// RED before the fix: an open connection read the library's 64 MiB default back as its outbound
+/// ceiling and refused a larger message the dialling path held.
+#[test]
+fn no_ceiling_means_no_outbound_ceiling_on_an_open_connection() {
+    let framer = WsFramer::new(0);
+    let mut out = Out::default();
+    let state = framer
+        .open_with(Side::Dial, "ws://127.0.0.1:9/x", &[], &mut out)
+        .expect("the dial opens");
+    let request = String::from_utf8(out.sent.clone()).unwrap();
+    framer
+        .ingest(state, &switching(&request), false, &mut Out::default())
+        .expect("open");
+    let big = vec![b'x'; 64 * 1024 * 1024 + 1];
+    let mut sent = Out::default();
+    framer
+        .emit_text(state, &big, true, false, &mut sent)
+        .expect("no outbound ceiling");
+    assert!(sent.sent.len() > big.len(), "the message goes out");
+}
+
+/// A SHIPPED DIAL IS RANDOM WHERE RFC 6455 SAYS SO (codeaudit e916fda tests MEDIUM): its handshake
+/// key is fresh per dial (section 4.1) and every frame it writes is masked with a fresh key
+/// (section 5.3), the payload readable under it. Built UNSEEDED, so it runs the shipped path even
+/// when the workspace's tests unify the harness's `test-seeded` feature onto this crate.
+#[test]
+fn a_shipped_dial_sends_a_fresh_key_and_masks_every_frame() {
+    let open = || {
+        let framer = WsFramer::unseeded(0);
+        let mut out = Out::default();
+        let state = framer
+            .open_with(Side::Dial, "ws://127.0.0.1:9/x", &[], &mut out)
+            .expect("the dial opens");
+        let request = String::from_utf8(out.sent).expect("an upgrade request");
+        framer
+            .ingest(state, &switching(&request), false, &mut Out::default())
+            .expect("open");
+        let key = fields_named(&request, "sec-websocket-key")[0].to_string();
+        (framer, state, key)
+    };
+    let (framer, state, key) = open();
+    let (_, _, other) = open();
+    assert_ne!(key, "dGhlIHNhbXBsZSBub25jZQ==", "not the harness's key");
+    assert_ne!(key, other, "a fresh key per dial");
+    let mut masks = Vec::new();
+    for message in [&b"first"[..], b"second", b"third"] {
+        let mut sent = Out::default();
+        framer
+            .emit_text(state, message, true, false, &mut sent)
+            .expect("sent");
+        assert_ne!(sent.sent[1] & 0x80, 0, "masked");
+        masks.push(sent.sent[2..6].to_vec());
+        assert_eq!(
+            first_data_payload(&sent.sent),
+            Some((0x2, message.to_vec())),
+            "readable under its mask"
+        );
+    }
+    assert!(
+        masks.iter().any(|m| m != &[0, 0, 0, 0]) && masks[0] != masks[1],
+        "a fresh mask per frame: {masks:02x?}"
+    );
+}
+
+/// A CHUNK-SIZE LINE PAST ITS BOUND ENDS THE BODY FAILED (codeaudit e916fda tests LOW): a refused
+/// upgrade's chunked body whose size line runs on past `CHUNK_LINE_MAX` with no line end is
+/// malformed; the frames end there, failed, and the decoder holds no more of it.
+#[test]
+fn a_chunk_line_past_its_bound_ends_the_body_failed() {
+    let mut wire = b"HTTP/1.1 401 Unauthorized\r\nTransfer-Encoding: chunked\r\n\r\n".to_vec();
+    wire.extend(std::iter::repeat_n(b'a', 4097));
+    let (framer, state, heard) = refused_with(&wire, false);
+    assert!(heard.ended, "the frames end at the bound");
+    assert!(framer.failed(state), "failed, not whole");
+}

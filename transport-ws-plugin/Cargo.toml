@@ -26,7 +26,9 @@ busbar-contract = { workspace = true }
 busbar-plugin-loader = { workspace = true }
 busbar-test-kit = { workspace = true }
 # The published suite's scripted dial reads fixed bytes: the logic crate's test-only seed (a fixed
-# handshake key, all-zero masks), on for this crate's tests alone, never in the shipped cdylib.
+# handshake key, all-zero masks). Cargo (resolver 2) unifies it onto every test build of the
+# workspace, the cdylib `cargo test` builds included; a shipped (non-test) build never has it. The
+# logic crate's framer tests build an unseeded framer (`WsFramer::unseeded`) for the shipped path.
 busbar-transport-ws = { path = "../transport-ws", features = ["test-seeded"] }
 
 [lints]

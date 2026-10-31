@@ -156,3 +156,178 @@ fn a_code_point_split_across_fragments_is_still_accepted() {
     }
     assert_eq!(frames.concat(), bytes);
 }
+
+/// THE SCAN STARTS ONLY WHERE THE HANDSHAKE ENDED (codeaudit e916fda WS-1): on a dial, the call that
+/// completes the upgrade may carry the start of the far end's first frame, and when that frame's
+/// payload so far ends in CRLFCRLF the call ends with CRLFCRLF though the session is mid-frame. The
+/// rest of the frame is payload, never a frame header, so a valid binary message whose bytes read
+/// like a text header and invalid UTF-8 is handed up whole and the connection lives. RED before the
+/// fix: the scan armed mid-frame, read `81 05` as a text frame and failed the connection with 1007.
+#[test]
+fn a_handshake_call_ending_mid_frame_in_crlfcrlf_does_not_arm_the_scan() {
+    let mut payload = b"GET / HTTP/1.1\r\nHost: x\r\n\r\n".to_vec();
+    let split = payload.len();
+    payload.extend_from_slice(&[0x81, 0x05, 0xff, 0xfe, 0xfd, 0xfc, 0xfb]);
+    // The far end's (unmasked) binary frame.
+    let mut frame = vec![0x82, payload.len() as u8];
+    frame.extend_from_slice(&payload);
+    let at = 2 + split;
+    let framer = WsFramer::new(0);
+    let mut out = Out::default();
+    let state = framer
+        .open(Side::Dial, "ws://svc.test/x", &mut out)
+        .expect("the dial opens");
+    let request = String::from_utf8(out.sent).expect("an upgrade request");
+    let key = request
+        .lines()
+        .find_map(|l| l.strip_prefix("Sec-WebSocket-Key: "))
+        .expect("a key");
+    let mut first = format!(
+        "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\
+         Sec-WebSocket-Accept: {}\r\n\r\n",
+        tungstenite::handshake::derive_accept_key(key.as_bytes())
+    )
+    .into_bytes();
+    first.extend_from_slice(&frame[..at]);
+    assert!(first.ends_with(b"\r\n\r\n"));
+    let mut opened = Out::default();
+    framer
+        .ingest(state, &first, false, &mut opened)
+        .expect("the upgrade completes");
+    assert!(!opened.ended, "the session is open");
+    let mut rest = Out::default();
+    framer
+        .ingest(state, &frame[at..], false, &mut rest)
+        .expect("the rest of the frame");
+    assert!(!rest.ended, "the connection lives");
+    assert_eq!(rest.frames, [payload], "the binary message, whole");
+    assert!(!framer.failed(state));
+}
+
+/// NOTHING AFTER A CLOSE IS DATA (codeaudit e916fda WS-2; RFC 6455 section 5.5.1): bytes that
+/// follow the peer's Close in the same call are not judged, so a completed closing handshake ends
+/// the stream cleanly whatever trails it. RED before the fix: a text frame of invalid UTF-8 after
+/// the Close turned the clean close into a failed stream.
+#[test]
+fn bytes_after_the_peers_close_are_not_judged() {
+    let framer = WsFramer::new(0);
+    let state = open(&framer);
+    let mut call = client(true, 0x8, &1000_u16.to_be_bytes());
+    call.extend(client(true, TEXT, &[0xff, 0xfe]));
+    let mut out = Out::default();
+    framer.ingest(state, &call, false, &mut out).unwrap();
+    assert!(out.ended, "the peer closed");
+    assert_eq!(framer.failure(state), None, "cleanly");
+}
+
+/// A FRAME WHOSE HEADER BREAKS THE PROTOCOL IS THE LIBRARY'S TO FAIL (codeaudit e916fda WS-3; RFC
+/// 6455 sections 5.1, 5.2): an accepted end's frame that is not masked, or one with a reserved bit
+/// and no extension, fails with 1002 when it completes, however invalid the text it carries. RED
+/// before the fix: the scan judged its first payload byte and failed the connection with 1007.
+#[test]
+fn a_frame_that_breaks_the_protocol_is_not_judged_as_text() {
+    let unmasked = vec![0x81, 0x05, 0xff, 0xfe, 0xfd, 0xfc, 0xfb];
+    let mut reserved = client(true, TEXT, &[0xff, 0xfe, 0xfd, 0xfc, 0xfb]);
+    reserved[0] |= 0x40;
+    for frame in [unmasked, reserved] {
+        let framer = WsFramer::new(0);
+        let state = open(&framer);
+        let mut out = Out::default();
+        framer
+            .ingest(state, &frame[..frame.len() - 2], false, &mut out)
+            .unwrap();
+        assert!(
+            !out.ended,
+            "{frame:02x?}: nothing is judged before the frame completes"
+        );
+        framer
+            .ingest(state, &frame[frame.len() - 2..], false, &mut out)
+            .unwrap();
+        assert!(out.ended, "{frame:02x?}: the frame fails the connection");
+        assert_eq!(
+            framer.failure(state),
+            Some("the far end broke the WebSocket protocol"),
+            "{frame:02x?}"
+        );
+        assert_eq!(close_code(&framer, state), Some(1002), "{frame:02x?}");
+    }
+}
+
+/// AN ACCEPTED SESSION'S SCAN STARTS ONLY WHERE NOTHING FOLLOWED THE REQUEST (codeaudit e916fda WS-1,
+/// review): the handshake reads the request in 4096-byte chunks, so a request ending exactly on a
+/// chunk's end leaves the frame bytes that came with it unread in the pipe, and the machine refuses
+/// nothing. The library reads them as the session opens; the scan never saw them, so it must not
+/// start there. RED before the fix: the scan armed, read the rest of a valid binary frame as a text
+/// frame and failed the connection with 1007.
+#[test]
+fn an_accepted_call_with_frame_bytes_after_a_chunk_sized_request_does_not_arm_the_scan() {
+    let head = b"GET /echo HTTP/1.1\r\nHost: svc.test\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\nX-Pad: ";
+    let mut request = head.to_vec();
+    request.resize(4096 - 4, b'p');
+    request.extend_from_slice(b"\r\n\r\n");
+    assert_eq!(request.len(), 4096);
+    // A valid masked binary frame (all-zero key), its payload bytes reading like a text header and
+    // invalid UTF-8.
+    let payload = [0xaa, 0xbb, 0x81, 0x82, 0, 0, 0, 0, 0xff, 0xff];
+    let mut frame = vec![0x82, 0x80 | payload.len() as u8, 0, 0, 0, 0];
+    frame.extend_from_slice(&payload);
+    let framer = WsFramer::new(0);
+    let mut out = Out::default();
+    let state = framer.open(Side::Accept, "", &mut out).expect("opens");
+    let mut first = request;
+    first.extend_from_slice(&frame[..8]);
+    framer
+        .ingest(state, &first, false, &mut out)
+        .expect("the upgrade is answered");
+    assert!(out.sent.starts_with(b"HTTP/1.1 101"), "switching protocols");
+    let mut rest = Out::default();
+    framer
+        .ingest(state, &frame[8..], false, &mut rest)
+        .expect("the rest of the frame");
+    assert!(!rest.ended, "the connection lives");
+    assert_eq!(rest.frames, [payload.to_vec()], "the binary message, whole");
+}
+
+/// THE EARLIER FAULT IS THE ONE STATED (codeaudit e916fda WS-6, review): an invalid text byte and
+/// the carrier's end in the same call fail the connection for the text, which broke first; the end
+/// with no closing handshake came after it. RED before the fix: the end piece blamed the carrier.
+#[test]
+fn invalid_text_before_the_carriers_end_is_the_stated_failure() {
+    let framer = WsFramer::new(0);
+    let state = open(&framer);
+    let frame = client(true, TEXT, &[0xff, 0xfe, 0xfd]);
+    let mut out = Out::default();
+    framer.ingest(state, &frame[..7], true, &mut out).unwrap();
+    assert!(out.ended);
+    assert_eq!(
+        framer.failure(state),
+        Some("the far end sent a text message that is not UTF-8")
+    );
+}
+
+/// OUT-OF-ORDER FRAMES ARE THE LIBRARY'S TO FAIL TOO (codeaudit e916fda WS-3, review): inside a
+/// text message, a new TEXT frame (the next data frame must continue the message) or a reserved
+/// data opcode breaks the protocol; whatever its payload, the library fails it with 1002 (at its
+/// header, or as it completes), never 1007 from the scan.
+#[test]
+fn an_out_of_order_frame_inside_a_text_message_is_not_judged_as_text() {
+    for opcode in [TEXT, 0x3] {
+        let framer = WsFramer::new(0);
+        let state = open(&framer);
+        let mut first = client(false, TEXT, b"ok");
+        let bad = client(true, opcode, &[0xff, 0xfe, 0xfd, 0xfc, 0xfb]);
+        first.extend_from_slice(&bad[..bad.len() - 2]);
+        let mut out = Out::default();
+        framer.ingest(state, &first, false, &mut out).unwrap();
+        framer
+            .ingest(state, &bad[bad.len() - 2..], false, &mut out)
+            .unwrap();
+        assert!(out.ended, "{opcode}");
+        assert_eq!(
+            framer.failure(state),
+            Some("the far end broke the WebSocket protocol"),
+            "{opcode}"
+        );
+        assert_eq!(close_code(&framer, state), Some(1002), "{opcode}");
+    }
+}
