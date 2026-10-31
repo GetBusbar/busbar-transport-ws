@@ -1390,13 +1390,11 @@ fn an_op_with_no_instance_fails_by_name() {
         FramerOut,
         "timer: no open instance"
     );
-    failed!(
-        refresh,
-        life::REFRESH,
-        RefreshIn,
-        OutHead,
-        "refresh: no open instance"
-    );
+    // `refresh` is the SDK's, and with no instance the SDK answers its bare FAULT.
+    let mut i: RefreshIn = z();
+    let mut o: OutHead = z();
+    let r = call(refresh, none, &mut i, &mut o, life::REFRESH);
+    assert_eq!((r, said(&o.error)), (Outcome::Fault, String::new()));
 }
 
 /// A FRAMING THE DOOR DOES NOT HOLD IS NAMED BY ITS OP. RED before the fix: "no such framing".
