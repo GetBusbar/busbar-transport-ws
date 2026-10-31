@@ -58,7 +58,8 @@ use busbar_contract::transport::wire::{CloseReason, TransportError, WireStatusCl
 use crate::frame::{Framed, FramerOut, Located, Side};
 use tungstenite::client::IntoClientRequest;
 use tungstenite::error::ProtocolError;
-use tungstenite::handshake::client::ClientHandshake;
+use tungstenite::handshake::client::{ClientHandshake, Response as UpgradeResponse};
+use tungstenite::handshake::machine::{HandshakeMachine, RoundResult, StageResult};
 use tungstenite::handshake::server::{NoCallback, ServerHandshake};
 use tungstenite::handshake::{HandshakeError, MidHandshake};
 use tungstenite::http::{HeaderMap, HeaderName, HeaderValue};
@@ -272,6 +273,7 @@ enum Phase {
     /// not yet marked complete.
     Dialling {
         mid: MidHandshake<ClientHandshake<Pipe>>,
+        response: Option<HandshakeMachine<Pipe>>,
         held: Vec<Message>,
         message: Vec<u8>,
         /// The message ceiling this framing began under (`0` = none): a refresh after it moves
@@ -314,6 +316,16 @@ enum Phase {
 }
 
 impl Phase {
+    fn input(&mut self) -> &mut Pipe {
+        match self {
+            Phase::Dialling {
+                response: Some(parser),
+                ..
+            } => parser.get_mut(),
+            other => other.pipe(),
+        }
+    }
+
     /// The session over `ws`, its outbound message starting as `message`, under the ceiling `max`.
     fn open(ws: WebSocket<Pipe>, message: Vec<u8>, max: usize) -> Self {
         Phase::Open {
@@ -1175,11 +1187,64 @@ impl WsFramer {
         ) {
             Err(HandshakeError::Interrupted(mid)) => Ok(Phase::Dialling {
                 mid,
+                response: Some(HandshakeMachine::start_read(Pipe::default())),
                 held: Vec::new(),
                 message: Vec::new(),
                 max,
             }),
             Ok(_) | Err(HandshakeError::Failure(_)) => Err(TransportError::HandshakeFailed),
+        }
+    }
+
+    /// Parse interim response heads with the protocol library's parser and existing handshake
+    /// attack checks. Only the final response reaches its WebSocket accept-key validation.
+    fn response_heads(phase: &mut Phase, out: &mut dyn FramerOut) -> Result<bool, TransportError> {
+        let Phase::Dialling { mid, response, .. } = phase else {
+            return Ok(true);
+        };
+        loop {
+            let Some(parser) = response.take() else {
+                return Ok(true);
+            };
+            match parser
+                .single_round::<UpgradeResponse>()
+                .map_err(|_| TransportError::HandshakeFailed)?
+            {
+                RoundResult::Incomplete(next) => *response = Some(next),
+                RoundResult::WouldBlock(next) => {
+                    *response = Some(next);
+                    return Ok(false);
+                }
+                RoundResult::StageFinished(StageResult::DoneReading {
+                    result, mut stream, ..
+                }) => {
+                    let code = result.status().as_u16();
+                    if !(100..200).contains(&code) || code == 101 {
+                        let pipe = mid.get_mut().get_mut();
+                        pipe.inbound = stream.seen.iter().copied().collect();
+                        pipe.seen = std::mem::take(&mut stream.seen);
+                        pipe.ended = stream.ended;
+                        return Ok(true);
+                    }
+                    let block = head_block(result.headers());
+                    let reason = reason_phrase(&stream.seen);
+                    out.frame(Framed {
+                        status: Some(status_class(code)),
+                        status_code: Some(u32::from(code)),
+                        reason: reason.as_deref(),
+                        ..Framed::plain(StreamId(0), &block, true)
+                    });
+                    let at = head_end(&stream.seen).ok_or(TransportError::HandshakeFailed)?;
+                    let remaining = stream.seen.split_off(at);
+                    stream.seen.zeroize();
+                    stream.seen = remaining;
+                    stream.inbound = stream.seen.iter().copied().collect();
+                    *response = Some(HandshakeMachine::start_read(stream));
+                }
+                RoundResult::StageFinished(StageResult::DoneWriting(_)) => {
+                    return Err(TransportError::HandshakeFailed);
+                }
+            }
         }
     }
 
@@ -1207,6 +1272,9 @@ impl WsFramer {
             }
             phase => phase,
         };
+        if !Self::response_heads(&mut phase, out)? {
+            return Ok((phase, false, None));
+        }
         let shaking = !matches!(phase, Phase::Open { .. });
         // What the dial's handshake has seen, and whether the carrier ended: the dialled head's
         // reason phrase is read off its status line, and a refusal's body is every byte past the
@@ -1269,6 +1337,7 @@ impl WsFramer {
             },
             Phase::Dialling {
                 mid,
+                response,
                 held,
                 message,
                 max,
@@ -1304,6 +1373,7 @@ impl WsFramer {
                     return Ok((
                         Phase::Dialling {
                             mid,
+                            response,
                             held,
                             message,
                             max,
@@ -1622,11 +1692,10 @@ impl WsFramer {
         let mut held = Self::enter(&conn)?;
         let mut phase = held.take().ok_or(TransportError::Closed)?;
         let dialling = matches!(phase, Phase::Dialling { .. });
-        let pipe = phase.pipe();
+        let was_open = matches!(phase, Phase::Open { .. });
+        let pipe = phase.input();
         pipe.inbound.extend(bytes);
         pipe.ended |= end;
-        let was_open = matches!(phase, Phase::Open { .. });
-        let pipe = phase.pipe();
         if let Some(scan) = pipe.scan.as_mut().filter(|_| was_open) {
             scan.feed(bytes);
         }

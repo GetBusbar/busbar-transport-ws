@@ -42,6 +42,8 @@ pub(crate) struct Framed<'a> {
     pub(crate) status: Option<WireStatusClass>,
     /// The exact status number the frame carries.
     pub(crate) status_code: Option<u32>,
+    /// An informational head's reason phrase, before the final upgrade response.
+    pub(crate) reason: Option<&'a [u8]>,
     /// How long the far side asked to be left alone, in seconds.
     pub(crate) retry_after_secs: Option<u64>,
     /// The bytes belong to a TEXT message, not a binary one.
@@ -58,6 +60,7 @@ impl<'a> Framed<'a> {
             end_of_frame,
             status: None,
             status_code: None,
+            reason: None,
             retry_after_secs: None,
             text: false,
         }

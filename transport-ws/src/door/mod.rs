@@ -460,8 +460,7 @@ impl frame::FramerOut for Collect<'_> {
         self.owed.push(bytes, self.opening);
     }
     fn frame(&mut self, piece: Framed<'_>) {
-        // The framer states a status on ONE frame only, the dialled stream's head: a message
-        // never carries one (`crate::transport`).
+        // Only response heads carry status; WebSocket messages never do.
         let head = piece.status_code.is_some();
         let bytes = self.owed.buffer(piece.bytes);
         self.owed.pieces.push_back(Piece {
@@ -471,6 +470,7 @@ impl frame::FramerOut for Collect<'_> {
                 .status_code
                 .map(|code| (code, class_code(piece.status))),
             retry_after: piece.retry_after_secs.filter(|_| head),
+            reason: piece.reason.map(<[u8]>::to_vec),
             ..Piece::plain(piece.stream.0, bytes, piece.end_of_frame)
         });
     }
