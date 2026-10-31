@@ -1513,3 +1513,157 @@ fn a_release_of_a_lease_never_handed_out_is_refused() {
     );
     host.close();
 }
+
+// ── what an opening field asks that the upgrade cannot carry (codeaudit e916fda) ────────────────
+
+/// `begin` dialling `target` with `fields` (name, value); the refusal's text, or `None` once it
+/// opens.
+fn begin_with_fields(
+    host: &mut Host,
+    target: &'static str,
+    fields: &[(&[u8], &[u8])],
+) -> Option<String> {
+    use busbar_contract::abi::mechanism::call::Field;
+    let fields: Vec<Field> = fields
+        .iter()
+        .map(|(n, v)| Field {
+            name: AbiStr {
+                ptr: n.as_ptr(),
+                len: n.len(),
+            },
+            value: AbiStr {
+                ptr: v.as_ptr(),
+                len: v.len(),
+            },
+        })
+        .collect();
+    let mut i: BeginIn = z();
+    i.side = SIDE_DIAL;
+    i.scheme = busbar_contract::abi::host::service::SCHEME_PLAIN;
+    i.target = AbiStr {
+        ptr: target.as_ptr(),
+        len: target.len(),
+    };
+    i.fields = fields.as_ptr();
+    i.fields_len = fields.len();
+    i.sink = host.sink();
+    let mut o: FramerOut = z();
+    let r = call(host.ops.begin, host.inst, &mut i, &mut o, slot::BEGIN);
+    (r == Outcome::Failed).then(|| said(&o.head.error))
+}
+
+/// AN EXTENSION IS REFUSED IN WORDS (codeaudit e916fda WS-7; RFC 6455 section 9): this end
+/// negotiates no extension, so a dial whose opening fields ask for one is refused at `begin`,
+/// saying so, rather than sent without it in silence. RED before the fix: the field was dropped and
+/// the dial opened.
+#[test]
+fn a_dial_asking_for_an_extension_is_refused_in_words() {
+    let mut host = Host::open(linked(), (64 * 1024, 64 * 1024, 64));
+    assert_eq!(
+        begin_with_fields(
+            &mut host,
+            "ws://svc.test/x",
+            &[(b"Sec-WebSocket-Extensions", b"permessage-deflate")]
+        )
+        .as_deref(),
+        Some("begin: the opening field sec-websocket-extensions asks for an extension, and this end supports none")
+    );
+    host.close();
+}
+
+/// THE TAIL STATES THE OPS THE DOOR SERVES (codeaudit e916fda WS-10; `FACT_ACCEPTS`: "a tail that
+/// states no op bit declares no op"): the ws framer begins on the accepting side and on the
+/// dialling side, and adopts a stream another framer detached; it detaches nothing (nothing
+/// upgrades out of a WebSocket) and decodes no payload. RED before the fix: the tail stated no fact,
+/// so the door declared no op it serves.
+#[test]
+fn the_tail_states_the_ops_the_door_serves() {
+    use busbar_contract::abi::transport::{TransportTail, FACT_ACCEPTS, FACT_ADOPTS, FACT_DIALS};
+    let st = busbar_transport_ws::door::STATEMENT;
+    // SAFETY: the Statement's kind tail is this crate's `'static` `TransportTail`.
+    let tail = unsafe { &*st.kind_tail.cast::<TransportTail>() };
+    assert_eq!(tail.facts, FACT_ACCEPTS | FACT_DIALS | FACT_ADOPTS);
+}
+
+/// AN OPENING FIELD THE UPGRADE CANNOT CARRY IS REFUSED AS SUCH (codeaudit e916fda WS-14): a field
+/// whose name is no HTTP field name or whose value holds a line break or a control byte cannot be
+/// written on the request, so `begin` says that, naming neither the field's value (it may be a
+/// credential) nor a handshake that never ran. RED before the fix: it answered "the WebSocket
+/// opening handshake failed".
+#[test]
+fn an_opening_field_the_upgrade_cannot_carry_is_refused_as_such() {
+    const WHY: &str = "begin: an opening field is not a valid HTTP field, and the upgrade request cannot carry it";
+    let mut host = Host::open(linked(), (64 * 1024, 64 * 1024, 64));
+    for field in [
+        (&b"authorization"[..], &b"Bearer sk\r\nX-Evil: 1"[..]),
+        (&b"bad name"[..], &b"v"[..]),
+    ] {
+        let said = begin_with_fields(&mut host, "ws://svc.test/x", &[field]);
+        assert_eq!(said.as_deref(), Some(WHY), "{field:?}");
+    }
+    host.close();
+}
+
+/// A DIALLING END ADOPTS NOTHING (codeaudit e916fda WS-15): a stream handed over takes the upgrade
+/// request it carried on the accepting side; on the dialling side there is no target to dial, so
+/// `adopt` refuses with the contract's hand-off mismatch, not a URL problem nobody gave it. RED
+/// before the fix: it answered "the target is not a ws:// or wss:// URL".
+#[test]
+fn a_dialling_end_adopts_nothing() {
+    let mut host = Host::open(linked(), (64 * 1024, 64 * 1024, 8));
+    let leftover = b"HTTP/1.1 101 Switching Protocols\r\n\r\n";
+    let mut i: AdoptIn = z();
+    i.side = SIDE_DIAL;
+    i.leftover = leftover.as_ptr();
+    i.leftover_len = leftover.len();
+    i.sink = host.sink();
+    let mut o: FramerOut = z();
+    let r = call(host.ops.adopt, host.inst, &mut i, &mut o, slot::ADOPT);
+    assert_eq!(r, Outcome::Failed);
+    assert_eq!(
+        said(&o.head.error),
+        "adopt: the stream handed over is not one this end can adopt"
+    );
+    host.close();
+}
+
+/// THE FIELD CHECKS ARE A DIAL'S, AND A BAD TARGET STILL SAYS SO FIRST (codeaudit e916fda WS-7,
+/// WS-14, review): a dial whose target is no ws URL is refused for its target whatever its fields,
+/// as before; an accepting `begin`, whose fields no request carries, is not refused for them. RED
+/// before the fix: both answered the field refusal.
+#[test]
+fn the_field_checks_are_a_dials_and_a_bad_target_says_so_first() {
+    let mut host = Host::open(linked(), (64 * 1024, 64 * 1024, 64));
+    for field in [
+        (&b"sec-websocket-extensions"[..], &b"permessage-deflate"[..]),
+        (&b"bad name"[..], &b"v"[..]),
+    ] {
+        assert_eq!(
+            begin_with_fields(&mut host, "http://svc.test/x", &[field]).as_deref(),
+            Some("begin: the target is not a ws:// or wss:// URL"),
+            "{field:?}"
+        );
+    }
+    use busbar_contract::abi::mechanism::call::Field;
+    let (n, v) = (b"bad name", b"v");
+    let fields = [Field {
+        name: AbiStr {
+            ptr: n.as_ptr(),
+            len: n.len(),
+        },
+        value: AbiStr {
+            ptr: v.as_ptr(),
+            len: v.len(),
+        },
+    }];
+    let mut i: BeginIn = z();
+    i.side = SIDE_ACCEPT;
+    i.scheme = busbar_contract::abi::host::service::SCHEME_PLAIN;
+    i.fields = fields.as_ptr();
+    i.fields_len = fields.len();
+    i.sink = host.sink();
+    let mut o: FramerOut = z();
+    let r = call(host.ops.begin, host.inst, &mut i, &mut o, slot::BEGIN);
+    assert_eq!(r, Outcome::Ready, "{}", said(&o.head.error));
+    host.close();
+}
