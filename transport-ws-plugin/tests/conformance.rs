@@ -317,3 +317,13 @@ busbar_test_kit::conformance_suite! {
     cdylib: "busbar_transport_ws_plugin",
     inputs: include_str!("conformance.json"),
 }
+
+#[test]
+fn the_statement_carries_the_declares_document() {
+    let row = row();
+    let read = busbar_contract::abi::mechanism::rendering::read(&row.statement).unwrap();
+    assert_eq!(
+        busbar_contract::abi::mechanism::extensions::declares(&read.extensions.bytes),
+        Some(&include_bytes!("../../transport-ws/declares.json")[..]),
+    );
+}
