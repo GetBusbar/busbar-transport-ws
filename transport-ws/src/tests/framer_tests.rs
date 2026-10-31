@@ -64,6 +64,80 @@ fn switching(request: &str) -> Vec<u8> {
     .into_bytes()
 }
 
+#[test]
+fn informational_heads_before_the_upgrade_are_nonterminal_at_every_input_split() {
+    for split in 0.. {
+        let framer = WsFramer::new(0);
+        let mut opening = Out::default();
+        let state = framer
+            .open_with(Side::Dial, "ws://127.0.0.1:9/session", &[], &mut opening)
+            .unwrap();
+        let request = String::from_utf8(opening.sent).unwrap();
+        let mut wire =
+            b"HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 103 Early Hints\r\nX-Hint: present\r\n\r\n"
+                .to_vec();
+        wire.extend_from_slice(&switching(&request));
+        wire.extend_from_slice(b"\x81\x02ok");
+        if split > wire.len() {
+            break;
+        }
+        let mut out = Out::default();
+        framer
+            .emit_text(state, b"queued", true, true, &mut out)
+            .unwrap();
+        assert!(out.sent.is_empty());
+        framer
+            .ingest(state, &wire[..split], false, &mut out)
+            .unwrap();
+        assert!(
+            !out.ended,
+            "informational response ended the stream at split {split}"
+        );
+        framer
+            .ingest(state, &wire[split..], false, &mut out)
+            .unwrap();
+        assert_eq!(
+            out.statuses,
+            [
+                Some((100, Some(WireStatusClass::Other))),
+                Some((103, Some(WireStatusClass::Other))),
+                Some((101, Some(WireStatusClass::Success))),
+                None,
+            ],
+            "split {split}"
+        );
+        assert_eq!(out.frames.last().unwrap(), b"ok");
+        assert!(out.frames[1]
+            .windows(b"x-hint".len())
+            .any(|w| w == b"x-hint"));
+        assert_eq!(
+            opcodes(&out.sent),
+            [1],
+            "the held message is flushed once after validation"
+        );
+        assert!(!out.ended);
+    }
+}
+
+#[test]
+fn informational_heads_cannot_replace_or_bypass_the_validated_upgrade() {
+    for final_head in [
+        b"".as_slice(),
+        b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: forged\r\n\r\n".as_slice(),
+    ] {
+        let framer = WsFramer::new(0);
+        let mut opening = Out::default();
+        let state = framer.open_with(Side::Dial, "ws://127.0.0.1:9/session", &[], &mut opening).unwrap();
+        let mut out = Out::default();
+        framer.emit_text(state, b"queued", true, true, &mut out).unwrap();
+        let mut wire = b"HTTP/1.1 100 Continue\r\n\r\n".to_vec();
+        wire.extend_from_slice(final_head);
+        assert!(framer.ingest(state, &wire, true, &mut out).is_err());
+        assert!(out.sent.is_empty(), "no held message leaves before a verified upgrade");
+        assert!(!out.statuses.iter().any(|s| s.as_ref().is_some_and(|(code, _)| *code == 101)));
+    }
+}
+
 /// The opcode of each WebSocket frame in `wire` (a client's frames: masked).
 fn opcodes(wire: &[u8]) -> Vec<u8> {
     let mut at = 0;
