@@ -8,8 +8,8 @@
 //! listener source since INBOUND-LISTEN H5), framed through a transport door admitted by the one
 //! dispatcher, over the carrier that listens and accepts (the `tcp` door, over the host's I/O). This
 //! binary takes exactly that path for the `ws` door — the door (`busbar_transport_ws::door::door`)
-//! admitted and opened by the root's own doors module (`crates/busbar/src/root/doors.rs`, mounted
-//! here), bound with `Listening::bind` over the carrier, each connection
+//! admitted and opened by the root's doors module copied from the selected core checkout,
+//! bound with `Listening::bind` over the carrier, each connection
 //! taken with `poll_accept` — and echoes every message back on the stream it came on. The
 //! fuzzingclient sends each case's frames and grades the echo, the handshake, the pings and the
 //! close the framer answers with, so what Autobahn grades is busbar's own RFC 6455 framer.
@@ -26,10 +26,9 @@ use busbar_core_connector::framer::FramerDoor;
 use busbar_core_connector::listen::{AcceptLimits, Listening};
 
 #[allow(dead_code)]
-#[path = "../../../../crates/busbar/src/root/doors.rs"]
 mod doors;
 
-/// The loader, as the mounted doors reach it (`super::loader`).
+/// The loader reached by the copied root adapter.
 #[allow(unused_imports)]
 mod loader {
     pub use busbar_plugin_loader::*;
@@ -37,7 +36,9 @@ mod loader {
 
 /// A door, admitted through the one dispatcher under its row's name and opened.
 fn open(key: &str, door: busbar_contract::abi::mechanism::door::DoorFn) -> Arc<dyn FramerDoor> {
-    use loader::dispatch::{kinds::transport::Transport as TransportKind, load_linked, LinkedRow};
+    use busbar_plugin_loader::dispatch::{
+        kinds::transport::Transport as TransportKind, load_linked, LinkedRow,
+    };
     let bind = doors::row_bind(key)
         .unwrap_or_else(|e| panic!("ws-conformance-subject: the `{key}` row has no bind: {e}"));
     let plugin = LinkedRow::of(door)
@@ -78,6 +79,7 @@ async fn send(conn: &mut Connection, stream: u64, bytes: &[u8], text: bool) -> R
     poll_fn(|cx| loop {
         let took = match conn.emit(stream, &bytes[off..], true, text, cx) {
             Ok(n) => n,
+            Err(Failure::Pending) => return Poll::Pending,
             Err(f) => return Poll::Ready(Err(f)),
         };
         off += took;

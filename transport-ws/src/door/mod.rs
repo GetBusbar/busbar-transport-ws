@@ -13,16 +13,18 @@
 //! and when the connection's frames end the stream ends with its `PIECE_END` piece and the answer carries
 //! `YIELD_ENDED`.
 //!
-//! A DIALLED framing's stream opens with its HEAD (HEAD-FIELDS): the far end's switching-protocols
-//! response, the moment it completes the handshake, as ONE `PIECE_FIELDS` frame carrying its status
-//! (`PIECE_HAS_CODE`, `101`, `STATUS_SUCCESS`) and the response's field block, framed even when no
-//! field is left in it; the messages follow it. A block the sink cannot hold whole is cut only at a
-//! line's start or inside a value, the rest marked `PIECE_CONTINUED`.
+//! A DIALLED framing hands up informational response field blocks with `PIECE_INTERIM`, then
+//! the validated `101` head (`STATUS_SUCCESS`) or the refused upgrade's final head without that
+//! flag. Each carries `PIECE_FIELDS` and `PIECE_HAS_CODE`, even when no field is left in it;
+//! messages follow the upgrade head. A block the sink cannot hold whole is cut only at a line's
+//! start or inside a value, the rest marked `PIECE_CONTINUED`; every interim part retains its flag.
 //!
 //! The connector owns the socket and connection security; `locate` tells it where a target is and
 //! whether it asks for security (`wss`). Both sides frame: a dialled framing opens with the upgrade
 //! request, an accepted one answers it, and `adopt` takes over a stream another framer detached
 //! with the upgrade request it held.
+
+mod policy;
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -31,22 +33,27 @@ use zeroize::Zeroize;
 
 use busbar_contract::abi::mechanism::call::{AbiStr, OutHead, Outcome};
 use busbar_contract::abi::mechanism::door::Statement;
-use busbar_contract::abi::mechanism::lifecycle::RefreshIn;
+use busbar_contract::abi::mechanism::extensions;
+use busbar_contract::abi::mechanism::lifecycle::{CancelIn, CancelOut, RefreshIn};
 use busbar_contract::abi::sdk::door::{abi_str, statement};
 use busbar_contract::abi::sdk::life::{self, Held, Life, Refreshed, Refusal};
+use busbar_contract::abi::sdk::transport::policy::Loans;
 use busbar_contract::abi::sdk::transport::{form_codes, settings_reading, DEFAULT_BODY_MAX};
 use busbar_contract::abi::sdk::{Instance, Lent, Out, Safe, SafeSlot};
+use busbar_contract::abi::transport::adopted_session::{
+    AdoptedSession, EXT_ADOPTED_SESSION, SUPPORT_ADOPTED_SESSION,
+};
 use busbar_contract::abi::transport::{
     AcceptIn, AcceptOut, AdoptIn, ArrivalIn, ArrivalOut, BeginIn, Claim, ConnIn, ConnOut, DialIn,
     EmitIn, EncodeIn, FinishIn, FramePiece, FrameSpan, FramerOut, FramerSink, FramingIn, HeadSlots,
     IngestIn, IoOut, ListenIn, ListenOut, LocateIn, LocateOut, Ops, ReadIn, RefuseIn, SettingDecl,
-    ShutIn, TransportTail, WriteIn, CANCEL_NOTHING_MOVED, CLOSE_CAPACITY_EXHAUSTED, CLOSE_DRAIN,
-    CLOSE_PEER_CLOSED, CLOSE_POISONED, CLOSE_REVOKED, CLOSE_TIMEOUT, CLOSE_TRANSPORT_FAILED,
-    EMIT_TEXT, FACT_ACCEPTS, FACT_ADOPTS, FACT_DIALS, FAULT_NONE, FRAME_PIECE_SIZE, FRAMING_STREAM,
-    PIECE_CONTINUED, PIECE_END, PIECE_END_OF_FRAME, PIECE_FIELDS, PIECE_HAS_CODE,
-    PIECE_HAS_RETRY_AFTER, PIECE_STREAM_FAILED, PIECE_TEXT, ROLE_FRAMER, SETTING_COUNT,
-    SIDE_ACCEPT, SIDE_DIAL, STATUS_CALLER_FAULT, STATUS_FAR_END_FAULT, STATUS_NONE, STATUS_OTHER,
-    STATUS_SUCCESS, UNIT0_UPGRADE, YIELD_ENDED, YIELD_MORE,
+    ShutIn, TransportTail, WriteIn, CANCEL_NOTHING_MOVED, CANCEL_PARTIAL, CLOSE_CAPACITY_EXHAUSTED,
+    CLOSE_DRAIN, CLOSE_PEER_CLOSED, CLOSE_POISONED, CLOSE_REVOKED, CLOSE_TIMEOUT,
+    CLOSE_TRANSPORT_FAILED, EMIT_TEXT, FACT_ACCEPTS, FACT_ADOPTS, FACT_DIALS, FAULT_NONE,
+    FRAME_PIECE_SIZE, FRAMING_STREAM, PIECE_CONTINUED, PIECE_END, PIECE_END_OF_FRAME, PIECE_FIELDS,
+    PIECE_HAS_CODE, PIECE_HAS_RETRY_AFTER, PIECE_INTERIM, PIECE_STREAM_FAILED, PIECE_TEXT,
+    ROLE_FRAMER, SETTING_COUNT, SIDE_ACCEPT, SIDE_DIAL, STATUS_CALLER_FAULT, STATUS_FAR_END_FAULT,
+    STATUS_NONE, STATUS_OTHER, STATUS_SUCCESS, UNIT0_UPGRADE, YIELD_ENDED, YIELD_MORE,
 };
 use busbar_contract::ids::StreamId;
 use busbar_contract::transport::registry::DEFAULT_REQUEST_BODY_MAX_BYTES;
@@ -128,9 +135,16 @@ const TAIL: TransportTail = {
 };
 
 /// The door's Statement: the `ws` framer.
-pub const STATEMENT: Statement = statement(KEY, env!("CARGO_PKG_VERSION"), 64)
-    .with_kind_tail(&TAIL)
-    .with_claims(CLAIM_NAMES);
+pub const STATEMENT: Statement = Statement {
+    extensions: EXTENSIONS,
+    ..statement(KEY, env!("CARGO_PKG_VERSION"), 64)
+        .with_kind_tail(&TAIL)
+        .with_claims(CLAIM_NAMES)
+};
+
+busbar_contract::statement_extensions!(EXTENSIONS: [
+    (EXT_ADOPTED_SESSION, SUPPORT_ADOPTED_SESSION),
+]);
 
 /// One frame piece waiting for the host.
 struct Piece {
@@ -151,9 +165,11 @@ struct Piece {
     /// The stream ends WHOLE here (`PIECE_END`): the empty last piece of its frames. An empty
     /// message (`bytes` empty without it) is a message, never the end.
     end: bool,
-    /// The bytes are the stream's HEAD, a field block (`PIECE_FIELDS`): the dialled far end's
-    /// switching response. Never with `text`, `failed` or `end`.
+    /// The bytes are a response field block (`PIECE_FIELDS`), interim or final.
+    /// Never with `text`, `failed` or `end`.
     fields: bool,
+    /// Informational `1xx` other than the upgrade's `101` (`PIECE_INTERIM` on every part).
+    interim: bool,
     /// A full sink cut this field block inside a value: `bytes` open by continuing it
     /// (`PIECE_CONTINUED`).
     continued: bool,
@@ -178,6 +194,7 @@ impl Piece {
             failed: false,
             end: false,
             fields: false,
+            interim: false,
             continued: false,
             status: None,
             retry_after: None,
@@ -202,6 +219,9 @@ impl Piece {
         }
         if self.fields {
             flags |= PIECE_FIELDS;
+            if self.interim {
+                flags |= PIECE_INTERIM;
+            }
             if self.continued {
                 flags |= PIECE_CONTINUED;
             }
@@ -270,6 +290,10 @@ fn take_of(piece: &Piece, rest: &[u8], room: usize, alone: bool) -> usize {
 /// What one framing owes the host and has not been able to hand it.
 #[derive(Default)]
 struct Owed {
+    /// The host-admitted session copied before Adopt's input loan ends.
+    adopted: Option<AdoptedSession>,
+    /// A direct accepted session selects and retains its own listener generation.
+    policy: Option<policy::Admission>,
     /// Bytes owed to the far side. The bytes before `wire_at` are handed over already; the rest
     /// is owed.
     wire: Vec<u8>,
@@ -466,6 +490,9 @@ impl frame::FramerOut for Collect<'_> {
         self.owed.pieces.push_back(Piece {
             text: piece.text && !head,
             fields: head,
+            interim: piece
+                .status_code
+                .is_some_and(|code| (100..200).contains(&code) && code != 101),
             status: piece
                 .status_code
                 .map(|code| (code, class_code(piece.status))),
@@ -694,6 +721,7 @@ struct OpTexts {
     no_framing: &'static str,
     framing_failed: &'static str,
     userinfo: &'static str,
+    wrong_stream: &'static str,
     why: fn(&TransportError) -> &'static str,
 }
 
@@ -707,6 +735,7 @@ macro_rules! op_texts {
                 $op,
                 ": the target carries userinfo; credentials never ride a URL"
             ),
+            wrong_stream: concat!($op, ": the stream is not the inherited session"),
             why: |e| why!(concat!($op, ": "), e),
         }
     };
@@ -750,6 +779,8 @@ fn end_failed(f: &WsFramer, token: u64, owed: &mut Owed, ended_before: bool) {
 fn opening(
     p: &Instance<'_, Held<Ws>>,
     texts: &OpTexts,
+    adopted: Option<AdoptedSession>,
+    policy: Option<policy::Admission>,
     sink: Lent<'_, FramerSink>,
     o: &mut Out<'_, FramerOut>,
     open: impl FnOnce(&WsFramer, &mut Collect<'_>) -> Result<u64, TransportError>,
@@ -758,7 +789,11 @@ fn opening(
         o.error(texts.no_instance);
         return Outcome::Failed;
     };
-    let mut owed = Owed::default();
+    let mut owed = Owed {
+        adopted,
+        policy,
+        ..Owed::default()
+    };
     let mut c = Collect {
         owed: &mut owed,
         now: time(&sink),
@@ -780,15 +815,22 @@ fn opening(
     }
 }
 
+/// Input identity checked before a call changes the framing's protocol state.
+#[derive(Default)]
+struct FramingInput {
+    /// New input, rather than a re-call that only drains.
+    fresh: bool,
+    stream: Option<u64>,
+}
+
 /// Run a framer method on framing `token`, then answer what it produced (and what was owed).
-/// `fresh`: the call carries new input, so it is not a re-call that only drains.
 fn framing(
     p: &Instance<'_, Held<Ws>>,
     texts: &OpTexts,
     token: u64,
     sink: Lent<'_, FramerSink>,
     o: &mut Out<'_, FramerOut>,
-    fresh: bool,
+    input: FramingInput,
     op: impl FnOnce(&WsFramer, &mut Collect<'_>) -> Result<(), TransportError>,
 ) -> Outcome {
     let Some(inst) = p.get().map(Held::life) else {
@@ -804,6 +846,14 @@ fn framing(
         o.error(texts.framing_failed);
         return Outcome::Failed;
     };
+    if input
+        .stream
+        .zip(held.adopted)
+        .is_some_and(|(stream, session)| stream != session.stream)
+    {
+        o.error(texts.wrong_stream);
+        return Outcome::Failed;
+    }
     let mut c = Collect {
         owed: &mut held,
         now: time(&sink),
@@ -817,7 +867,7 @@ fn framing(
         // `YIELD_MORE` (a refusal's close removed the state): it drains, whatever the op said, and
         // the connection is over once it has (`YIELD_ENDED`). An op that carried new input fails
         // instead (its data is not taken).
-        if !alive && !fresh && (!owed.wire_owed().is_empty() || !owed.pieces.is_empty()) {
+        if !alive && !input.fresh && (!owed.wire_owed().is_empty() || !owed.pieces.is_empty()) {
             owed.ended = true;
             fill(owed, sink, o);
             return Outcome::Ready;
@@ -862,6 +912,12 @@ op!(
             return Outcome::Failed;
         }
         let fields = opening_fields(i);
+        let policy = if matches!(side, Side::Accept) {
+            match Loans::from_initial(i.field(|x| &x.head.extensions).bytes()) {
+                Ok(loans) => loans.map(|loans| policy::Admission::new(loans, i.scheme)),
+                Err(error) => return o.fail(Refusal::failed(format!("begin: {error}"))),
+            }
+        } else { None };
         // Only a dial's request carries its opening fields, and a target that is no ws URL is
         // refused for that first (by the open below), whatever the fields.
         if matches!(side, Side::Dial) && crate::transport::split_ws_url(target).is_ok() {
@@ -874,7 +930,7 @@ op!(
                 return Outcome::Failed;
             }
         }
-        opening(&p, &BEGIN, i.field(|x| &x.sink), &mut o, |f, c| {
+        opening(&p, &BEGIN, None, policy, i.field(|x| &x.sink), &mut o, |f, c| {
             f.open_with(side, target, &fields.0, c)
         })
     }
@@ -883,12 +939,26 @@ op!(
 op!(
     /// `adopt`.
     Adopt(AdoptIn => FramerOut) |p, i, o| {
+        if p.get().is_none() {
+            o.error(ADOPT.no_instance);
+            return Outcome::Failed;
+        }
         let Some(side) = side_of(i.side) else {
             o.error("adopt: the side is neither accept nor dial");
             return Outcome::Failed;
         };
+        let adopted = match extensions::get(
+            i.field(|x| &x.head.extensions).bytes(),
+            EXT_ADOPTED_SESSION,
+        ).map(AdoptedSession::decode).transpose() {
+            Ok(session) => session,
+            Err(_) => {
+                o.error("adopt: the inherited session is invalid");
+                return Outcome::Failed;
+            }
+        };
         let leftover = i.leftover();
-        opening(&p, &ADOPT, i.field(|x| &x.sink), &mut o, |f, c| {
+        opening(&p, &ADOPT, adopted, None, i.field(|x| &x.sink), &mut o, |f, c| {
             f.adopt(side, leftover, c)
         })
     }
@@ -897,6 +967,9 @@ op!(
 op!(
     /// `ingest`. A `YIELD_MORE` re-call carries no new bytes: nothing reaches the machine.
     Ingest(IngestIn => FramerOut) |p, i, o| {
+        if let Some(outcome) = policy::ingest(&p, i, &mut o) {
+            return outcome;
+        }
         let bytes = i.bytes();
         let (end, token) = (i.end != 0, i.framing);
         framing(
@@ -905,7 +978,10 @@ op!(
             token,
             i.field(|x| &x.sink),
             &mut o,
-            !bytes.is_empty() || end,
+            FramingInput {
+                fresh: !bytes.is_empty() || end,
+                ..FramingInput::default()
+            },
             |f, c| {
                 if bytes.is_empty() && !end {
                     return Ok(());
@@ -936,8 +1012,14 @@ op!(
             token,
             i.field(|x| &x.sink),
             &mut o,
-            !bytes.is_empty() || eof,
+            FramingInput {
+                fresh: !bytes.is_empty() || eof,
+                stream: Some(i.stream),
+            },
             |f, c| {
+                if c.owed.policy.as_ref().is_some_and(|policy| !policy.admitted()) {
+                    return Err(TransportError::Refused);
+                }
                 if bytes.is_empty() && !eof {
                     return Ok(());
                 }
@@ -953,7 +1035,13 @@ op!(
         let bytes = i.bytes();
         let stream = (i.has_stream != 0).then_some(StreamId(i.stream));
         let (token, status) = (i.framing, i.status);
-        framing(&p, &REFUSE, token, i.field(|x| &x.sink), &mut o, false, |f, c| {
+        framing(&p, &REFUSE, token, i.field(|x| &x.sink), &mut o, FramingInput {
+            stream: stream.map(|s| s.0),
+            ..FramingInput::default()
+        }, |f, c| {
+            let stream = stream.map(|stream| {
+                if c.owed.adopted.is_some() { StreamId(0) } else { stream }
+            });
             f.refusal_with(token, stream, bytes, status, c)
         })
     }
@@ -963,7 +1051,7 @@ op!(
     /// `timer`.
     Timer(FramingIn => FramerOut) |p, i, o| {
         let token = i.framing;
-        framing(&p, &TIMER, token, i.field(|x| &x.sink), &mut o, false, |f, c| {
+        framing(&p, &TIMER, token, i.field(|x| &x.sink), &mut o, FramingInput::default(), |f, c| {
             f.tick(token, c)
         })
     }
@@ -973,7 +1061,7 @@ op!(
     /// `finish`: the framer writes its close, and the framing is gone once what it owes is out.
     Finish(FinishIn => FramerOut) |p, i, o| {
         let (token, reason) = (i.framing, reason_of(i.reason));
-        let out = framing(&p, &FINISH, token, i.field(|x| &x.sink), &mut o, false, |f, c| {
+        let out = framing(&p, &FINISH, token, i.field(|x| &x.sink), &mut o, FramingInput::default(), |f, c| {
             f.close(token, reason, c);
             c.owed.ended = true;
             Ok(())
@@ -1018,10 +1106,12 @@ fn fill(owed: &mut Owed, sink: Lent<'_, FramerSink>, o: &mut Out<'_, FramerOut>)
     let mut frame_len = 0_usize;
     let mut n = 0_usize;
     let mut heads = 0_usize;
+    let adopted_stream = owed.adopted.map(|session| session.stream);
     while n < pieces.cap() {
         let Some(piece) = owed.pieces.front_mut() else {
             break;
         };
+        let stream = adopted_stream.unwrap_or(piece.stream);
         // The head's slots (the dialled side fills `reason`, HTTP/1 as sent) go into the frame
         // buffer ahead of the head's first piece, and ONLY in the answer that also carries that
         // piece (the host reads the phrase beside it, and drops one that arrives alone). A piece
@@ -1060,7 +1150,7 @@ fn fill(owed: &mut Owed, sink: Lent<'_, FramerSink>, o: &mut Out<'_, FramerOut>)
         if let Some(reason) = piece.reason.take().filter(|_| with_reason) {
             frame.extend(&reason);
             slots.push(HeadSlots {
-                stream: piece.stream,
+                stream,
                 reason: FrameSpan {
                     offset: frame_len as u64,
                     len: reason.len() as u64,
@@ -1074,7 +1164,7 @@ fn fill(owed: &mut Owed, sink: Lent<'_, FramerSink>, o: &mut Out<'_, FramerOut>)
         let (code, status_class) = piece.status.unwrap_or((0, STATUS_NONE));
         frame.extend(&rest[..take]);
         pieces.push(FramePiece {
-            stream: piece.stream,
+            stream,
             offset: frame_len as u64,
             len: take as u64,
             code,
@@ -1126,7 +1216,7 @@ busbar_contract::plugin_door! {
         retire: Safe<life::Retire<Ws>>,
         tick: Safe<life::Tick<Ws>>,
         drive: Safe<life::Drive<Ws>>,
-        cancel: Safe<life::Cancel<Ws>>,
+        cancel: Safe<policy::Cancel>,
         release: Safe<life::Release<Ws>>,
         close: Safe<life::Close<Ws>>,
     },

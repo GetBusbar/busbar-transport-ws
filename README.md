@@ -18,6 +18,21 @@ First-party signed kind:transport plugin cdylib: the ws transport, packaged as a
 
 Configured under the `ws` module name.
 
+The settings object accepts `limits.request_body_max_bytes`, a positive integer byte count. It
+bounds both a complete incoming message and an individual frame, and bounds outgoing messages.
+An omitted value uses the contract's default. Refresh changes the ceiling for new framings;
+existing connections retain the ceiling they opened with.
+
+The plugin negotiates no WebSocket extensions, including permessage-deflate. A dial requesting an
+extension, or a server response selecting one, is refused. Accepted upgrades select no subprotocol;
+dials carry the offered subprotocols and require the server's selection to be one of them. The
+host connector supplies sockets and TLS for `wss`; this plugin frames the bytes.
+
+The Autobahn harness's `--selftest` checks synthetic parser fixtures and builds its subject, so it
+requires Node, Cargo and `BUSBAR_CHECKOUT` at the pinned core source. Docker-live control, negative
+control and subject legs run through `testing/conformance/ws.sh` in CI. A negative control counts
+only when Autobahn records the deliberately broken peer's echo corruption, not an unrelated failure.
+
 ## Build
 
 ```bash

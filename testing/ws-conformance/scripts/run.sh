@@ -4,16 +4,15 @@
 #
 # WebSocket conformance harness driver: Autobahn|Testsuite against busbar's ws door, framed by the
 # connector's own listener (the ws-conformance-subject), following the same control-always + subject-armed-or-red shape as
-# `scripts/mcp-conformance.sh`.
+# the other protocol suites.
 #
-# DOCKER-LIVE IS CI-ONLY. This script's `--selftest` mode never touches Docker: it proves the
-# parser (`bin/parse-autobahn-report.mjs`) bites on captured fixture reports and that the
-# arm-state transition (`armed=false` -> never "pass") holds, which is what a local dev box
-# without Docker can prove. `--control` / `--negative-control` / `--subject` run the real
+# DOCKER-LIVE IS CI-ONLY. `--selftest` checks synthetic parser fixtures and builds the subject;
+# it needs Node, Cargo and BUSBAR_CHECKOUT, but no Docker.
+# `--control` / `--negative-control` / `--subject` run the real
 # `crossbario/autobahn-testsuite` `fuzzingclient` image and require Docker; they are what CI runs.
 #
 # MODES
-#   --selftest            prove the parser + arm-state logic bite (no Docker, runs anywhere)
+#   --selftest            check parser fixtures and build the subject (no Docker)
 #   --subject-arm          build the ws-conformance-subject bin and report whether it is ARMED
 #   --control               run Autobahn against the known peer: ws-conformance-reference, a strict
 #                           RFC 6455 echo server on the Rust standard library alone, independent of
@@ -37,16 +36,40 @@ FIXTURES="$ROOT/fixtures"
 REPORTS_DIR="$ROOT/reports"
 
 mode="${1:---selftest}"
+pid=""; log=""; cfg=""; subject_dir=""; scratch_dir=""
+stop_peer() {
+  if [ -n "$pid" ]; then
+    kill "$pid" 2>/dev/null || true
+    wait "$pid" 2>/dev/null || true
+    pid=""
+  fi
+}
+cleanup() {
+  local status=$?
+  stop_peer
+  if [ -n "$log" ] && [ -f "$log" ]; then
+    echo "== $mode peer log ==" >&2
+    cat "$log" >&2 || true
+    rm -f "$log"
+  fi
+  [ -z "$cfg" ] || rm -f "$cfg"
+  [ -z "$subject_dir" ] || rm -rf "$subject_dir"
+  [ -z "$scratch_dir" ] || rm -rf "$scratch_dir"
+  return "$status"
+}
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
-# THE SUBJECT'S BUILD TREE. The subject crate is not a workspace member and mounts busbar's doors.rs by
-# path, so it is built from a tree written at run time (scripts/subject-manifest.sh) against busbar at
+# THE SUBJECT'S BUILD TREE. The subject crate is not a workspace member, so it is built from a
+# tree written at run time (scripts/subject-manifest.sh) against busbar at
 # $BUSBAR_CHECKOUT (the .busbar-ref pin). $WS_SUBJECT_MANIFEST overrides; the tree is built once.
 TARGET_DIR="${CARGO_TARGET_DIR:-$REPO_ROOT/target}"; export CARGO_TARGET_DIR="$TARGET_DIR"
-subject_manifest() {
+prepare_subject() {
   if [ -z "${WS_SUBJECT_MANIFEST:-}" ]; then
-    WS_SUBJECT_MANIFEST="$("$ROOT/scripts/subject-manifest.sh" "$(mktemp -d "${TMPDIR:-/tmp}/ws-subject.XXXXXX")")" || return 1
+    subject_dir="$(mktemp -d "${TMPDIR:-/tmp}/ws-subject.XXXXXX")" || return 1
+    WS_SUBJECT_MANIFEST="$("$ROOT/scripts/subject-manifest.sh" "$subject_dir")" || return 1
   fi
-  echo "$WS_SUBJECT_MANIFEST"
 }
 
 selftest() {
@@ -56,6 +79,7 @@ selftest() {
   echo "== parser against captured fixture reports =="
   local tmp
   tmp="$(mktemp -d)"
+  scratch_dir="$tmp"
 
   # A GOOD report, armed, must render pass.
   if ! node "$PARSER" --report "$FIXTURES/autobahn-report-good.json" --armed true --out "$tmp/good.json"; then
@@ -63,7 +87,7 @@ selftest() {
     return 1
   fi
   local good_status
-  good_status="$(node -e "console.log(JSON.parse(require('fs').readFileSync('$tmp/good.json','utf8')).status)")"
+  good_status="$(node -e "console.log(JSON.parse(require('fs').readFileSync(process.argv[1],'utf8')).status)" "$tmp/good.json")"
   [ "$good_status" = "pass" ] || { echo "FAIL: good fixture rendered status=$good_status, want pass" >&2; return 1; }
   echo "  ok: good fixture -> status=pass"
 
@@ -73,14 +97,14 @@ selftest() {
     return 1
   fi
   local bad_status
-  bad_status="$(node -e "console.log(JSON.parse(require('fs').readFileSync('$tmp/bad.json','utf8')).status)")"
+  bad_status="$(node -e "console.log(JSON.parse(require('fs').readFileSync(process.argv[1],'utf8')).status)" "$tmp/bad.json")"
   [ "$bad_status" = "fail" ] || { echo "FAIL: bad fixture rendered status=$bad_status, want fail" >&2; return 1; }
   echo "  ok: bad fixture -> status=fail"
 
   # UNARMED must never render pass, even over the good report -- the arm-state transition.
   node "$PARSER" --report "$FIXTURES/autobahn-report-good.json" --armed false --out "$tmp/unarmed.json" || true
   local unarmed_status
-  unarmed_status="$(node -e "console.log(JSON.parse(require('fs').readFileSync('$tmp/unarmed.json','utf8')).status)")"
+  unarmed_status="$(node -e "console.log(JSON.parse(require('fs').readFileSync(process.argv[1],'utf8')).status)" "$tmp/unarmed.json")"
   [ "$unarmed_status" = "not-run" ] || { echo "FAIL: unarmed run over a good report rendered status=$unarmed_status, want not-run" >&2; return 1; }
   echo "  ok: unarmed + good report -> status=not-run (NOT pass)"
 
@@ -95,7 +119,8 @@ selftest() {
 }
 
 subject_arm() {
-  if cargo build --manifest-path "$(subject_manifest)" -p ws-conformance-subject; then
+  prepare_subject || return 1
+  if cargo build --manifest-path "$WS_SUBJECT_MANIFEST" -p ws-conformance-subject; then
     if [ -x "$TARGET_DIR/debug/ws-conformance-subject" ]; then
       echo "  ok: ws-conformance-subject built (ARMED)"
       return 0
@@ -117,7 +142,6 @@ run_autobahn() {
     echo "this local environment can only prove the parser and the subject's arm state (see --selftest)." >&2
     return 3
   fi
-  local cfg
   cfg="$(mktemp)"
   sed -e "s/__TAG__/$tag/" -e "s/__AGENT__/$agent/" -e "s/__PORT__/$port/" \
     "$ROOT/config/fuzzingclient.json.tmpl" > "$cfg"
@@ -140,15 +164,14 @@ case "$mode" in
     # THE KNOWN PEER: ws-conformance-reference (subject/src/reference.rs), a strict RFC 6455 echo
     # server on the standard library alone: no busbar crate and no WebSocket library, so it shares
     # nothing with the framer the subject leg grades. Release, as the subject is built.
-    cargo build --release --manifest-path "$(subject_manifest)" -p ws-conformance-subject --bin ws-conformance-reference
+    prepare_subject
+    cargo build --release --manifest-path "$WS_SUBJECT_MANIFEST" -p ws-conformance-subject --bin ws-conformance-reference
     log="$(mktemp)"; "$TARGET_DIR/release/ws-conformance-reference" >"$log" 2>&1 & pid=$!
     port=""
     for _ in $(seq 1 100); do port="$(sed -n 's/^REFERENCE_PORT=//p' "$log")"; [ -n "$port" ] && break; sleep 0.1; done
-    [ -n "$port" ] || { echo "reference echo server never printed REFERENCE_PORT" >&2; cat "$log" >&2; kill "$pid" 2>/dev/null; exit 1; }
+    [ -n "$port" ] || { echo "reference echo server never printed REFERENCE_PORT" >&2; exit 1; }
     rc=0; run_autobahn reference "$port" control || rc=$?
-    kill "$pid" 2>/dev/null || true
-    echo "== reference echo server log ==" >&2
-    cat "$log" >&2 || true
+    stop_peer
     [ "$rc" -eq 3 ] && exit 3
     [ "$rc" -eq 0 ] || exit "$rc"
     node "$PARSER" --report "$REPORTS_DIR/control/index.json" --armed true --commit "${GITHUB_SHA:-local}" --out "$REPORTS_DIR/control/verdict.json"
@@ -158,9 +181,9 @@ case "$mode" in
     log="$(mktemp)"; node "$ROOT/broken/broken-echo-server.mjs" >"$log" 2>&1 & pid=$!
     port=""
     for _ in $(seq 1 50); do port="$(sed -n 's/^BROKEN_PORT=//p' "$log")"; [ -n "$port" ] && break; sleep 0.1; done
-    [ -n "$port" ] || { echo "broken echo server never printed BROKEN_PORT" >&2; kill "$pid" 2>/dev/null; exit 1; }
+    [ -n "$port" ] || { echo "broken echo server never printed BROKEN_PORT" >&2; exit 1; }
     rc=0; run_autobahn broken "$port" negative-control || rc=$?
-    kill "$pid" 2>/dev/null || true
+    stop_peer
     [ "$rc" -eq 3 ] && exit 3
     [ "$rc" -eq 0 ] || { echo "RED: docker exited $rc -- the negative control did not run" >&2; exit "$rc"; }
     # This leg is proven correct when the SUITE catches the defect -- i.e. the parser must find
@@ -184,6 +207,10 @@ case "$mode" in
       echo "RED: the negative control's verdict status is '$nc_status', want fail -- not a graded failure" >&2
       exit 1
     fi
+    if ! node "$ROOT/bin/negative-control.mjs" "$nc_report"; then
+      echo "RED: the report did not catch the broken peer's echo corruption" >&2
+      exit 1
+    fi
     echo "ok: the negative control was correctly graded red"
     ;;
   --subject)
@@ -191,7 +218,8 @@ case "$mode" in
     # RELEASE, as busbar ships: the door runs under the dispatcher's watchdog (1 s per crossing), and
     # an unoptimised framer unmasking Autobahn's 16 MiB messages (case 9.1.6) overruns it, which
     # faults the door for every later connection — a statement about a debug build nobody ships.
-    cargo build --release --manifest-path "$(subject_manifest)" -p ws-conformance-subject
+    prepare_subject
+    cargo build --release --manifest-path "$WS_SUBJECT_MANIFEST" -p ws-conformance-subject
     bin="$TARGET_DIR/release/ws-conformance-subject"
     armed=false
     port=""
@@ -205,7 +233,7 @@ case "$mode" in
       run_autobahn busbar "$port" subject || rc=$?
     fi
     # Every path out: a subject that started but never printed its port is killed too.
-    if [ -n "${pid:-}" ]; then kill "$pid" 2>/dev/null || true; fi
+    stop_peer
     [ "$rc" -eq 3 ] && exit 3
     [ "$rc" -eq 0 ] || { echo "RED: docker exited $rc -- the subject run did not complete" >&2; exit "$rc"; }
     mkdir -p "$REPORTS_DIR/subject"

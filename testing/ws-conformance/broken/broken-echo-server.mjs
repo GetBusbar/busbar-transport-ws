@@ -9,7 +9,7 @@
 //
 // The defect: this peer echoes every message TRUNCATED by one byte, which corrupts UTF-8 text
 // frames and drops the trailing byte of every binary frame -- both of which flip clearly OK
-// Autobahn echo cases (the 1.x / 2.x series) to FAILED.
+// Autobahn echo, UTF-8 and message-size cases (the 1.x / 6.x / 9.x groups) to FAILED.
 //
 // Prints `BROKEN_PORT=<port>` once bound.
 

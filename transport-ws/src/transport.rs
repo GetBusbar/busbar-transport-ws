@@ -23,14 +23,12 @@
 //!   written before the handshake completes is held and goes out, in order, the moment it does.
 //! * A DIALLED connection's head yields its reason phrase as the far end sent it (HTTP/1), for the
 //!   door's head slots ([`WsFramer::ingest_head`]).
-//! * A DIALLED connection's switching-protocols response is the far end's ANSWER (a transport
-//!   always hands the response head up as the stream's first fields frame): the moment
-//!   it completes the handshake it is handed up as ONE frame carrying its status (`101`, a
-//!   success) and its field block ([`head_block`]), ahead of any message, so a far end that has
-//!   answered the upgrade and not yet sent a message has answered. It is the only frame this framer
-//!   states a status on: a message never carries one.
+//! * A DIALLED connection hands up informational HTTP heads without ending the handshake, then
+//!   its validated `101` response (or refused upgrade) with its field block ([`head_block`]), ahead
+//!   of any message. WebSocket messages carry no status.
 //! * A ping is answered with its pong on the next bytes out; a peer's close is answered with the
-//!   peer's own code and ends the frames. A carrier that ends with no closing handshake ends them
+//!   peer's valid code and ends the frames; a forbidden peer code fails the connection with 1002.
+//!   A carrier that ends with no closing handshake ends them
 //!   FAILED (RFC 6455 section 7.1.5, `1006`: not closed cleanly), mid-message or not.
 //! * A close this end starts carries the RFC 6455 code its reason names ([`close_code_for`]).
 //! * Bytes that break the protocol FAIL the connection (RFC 6455 §7.1.7) the way the RFC orders it:
@@ -81,6 +79,10 @@ pub(crate) struct Pipe {
     /// machine's own handshake limit (64 KiB read, or the handshake fails and the state is gone)
     /// plus what the one call that completes the head carries; emptied once the head is read.
     seen: Vec<u8>,
+    /// Consumed informational heads, compacted once per crossing rather than once per head.
+    head_at: usize,
+    /// Original Connection values when only the library's response validator needed normalization.
+    response_connection: Option<Vec<HeaderValue>>,
     /// The test harness's seed is on for this dialled end (`test-seeded`): its frames go out under
     /// the all-zero mask ([`seeded::unmask`]).
     #[cfg(feature = "test-seeded")]
@@ -122,6 +124,9 @@ struct TextScan {
     tail_len: usize,
     /// An invalid byte was read.
     bad: bool,
+    close: bool,
+    close_code: [u8; 2],
+    bad_close: bool,
     /// Switched off: a header the scan cannot follow, or the peer's Close.
     off: bool,
 }
@@ -138,12 +143,6 @@ impl TextScan {
                 match FrameHeader::parse(&mut std::io::Cursor::new(&self.head[..self.head_len])) {
                     Ok(None) => continue,
                     Ok(Some((header, len))) => {
-                        // Nothing after a Close is data (RFC 6455 section 5.5.1): the scan stops
-                        // at one, and the machine reads no further either.
-                        if matches!(header.opcode, OpCode::Control(Control::Close)) {
-                            self.off = true;
-                            continue;
-                        }
                         let breaks = header.rsv1
                             || header.rsv2
                             || header.rsv3
@@ -151,7 +150,7 @@ impl TextScan {
                             || match header.opcode {
                                 OpCode::Data(Data::Continue) => !self.in_message,
                                 OpCode::Data(Data::Text | Data::Binary) => self.in_message,
-                                OpCode::Control(Control::Ping | Control::Pong) => {
+                                OpCode::Control(Control::Ping | Control::Pong | Control::Close) => {
                                     !header.is_final || len > 125
                                 }
                                 OpCode::Data(Data::Reserved(_)) | OpCode::Control(_) => true,
@@ -174,6 +173,7 @@ impl TextScan {
                             }
                         }
                         self.text = self.in_text && matches!(header.opcode, OpCode::Data(_));
+                        self.close = matches!(header.opcode, OpCode::Control(Control::Close));
                         self.fin = header.is_final;
                         self.left = len;
                         self.mask = header.mask;
@@ -188,6 +188,17 @@ impl TextScan {
                     .min(bytes.len());
                 if self.text {
                     self.read_text(&bytes[..n]);
+                } else if self.close {
+                    for &byte in bytes[..n].iter().take(2usize.saturating_sub(self.at)) {
+                        self.close_code[self.at] =
+                            byte ^ self.mask.map_or(0, |mask| mask[self.at % 4]);
+                        self.at += 1;
+                    }
+                    if self.at == 2 {
+                        self.bad_close =
+                            !CloseCode::from(u16::from_be_bytes(self.close_code)).is_allowed();
+                        self.off = true;
+                    }
                 }
                 self.left -= n as u64;
                 bytes = &bytes[n..];
@@ -196,6 +207,9 @@ impl TextScan {
             if self.left == 0 && self.text && self.fin {
                 self.bad |= self.tail_len != 0;
                 self.in_text = false;
+            }
+            if self.left == 0 && self.close {
+                self.off = true;
             }
         }
     }
@@ -244,6 +258,17 @@ impl Read for Pipe {
         buf[a..n].copy_from_slice(&back[..n - a]);
         self.inbound.drain(..n);
         Ok(n)
+    }
+}
+
+impl Pipe {
+    fn discard_heads(&mut self) {
+        if self.head_at != 0 {
+            let remaining = self.seen.split_off(self.head_at);
+            self.seen.zeroize();
+            self.seen = remaining;
+            self.head_at = 0;
+        }
     }
 }
 
@@ -689,6 +714,7 @@ fn content_length(headers: &HeaderMap) -> Result<Option<u64>, ()> {
 /// the status line's text after its code, once the line is whole (`HTTP/1.1 401 Unauthorized` →
 /// `Unauthorized`); `None` before the line ends, or for a line with no phrase.
 pub(crate) fn reason_phrase(seen: &[u8]) -> Option<Vec<u8>> {
+    let seen = status_line_start(seen);
     let end = seen.iter().position(|b| *b == b'\n')?;
     let line = &seen[..end];
     let line = line.strip_suffix(b"\r").unwrap_or(line);
@@ -697,19 +723,69 @@ pub(crate) fn reason_phrase(seen: &[u8]) -> Option<Vec<u8>> {
     parts.next().filter(|r| !r.is_empty()).map(<[u8]>::to_vec)
 }
 
+/// httparse accepts leading empty lines before a response's status line.
+fn status_line_start(mut seen: &[u8]) -> &[u8] {
+    loop {
+        if let Some(rest) = seen.strip_prefix(b"\r\n") {
+            seen = rest;
+        } else if let Some(rest) = seen.strip_prefix(b"\n") {
+            seen = rest;
+        } else {
+            return seen;
+        }
+    }
+}
+
 /// Where a response head ends in `seen`: just past its first empty line, which the protocol
 /// library's parser takes as a bare `\n` or a `\r\n` alike. `None` while the head is not whole.
 fn head_end(seen: &[u8]) -> Option<usize> {
-    (0..seen.len()).find_map(|i| {
-        if seen[i] != b'\n' {
+    let head = status_line_start(seen);
+    let skipped = seen.len() - head.len();
+    (0..head.len()).find_map(|i| {
+        if head[i] != b'\n' {
             return None;
         }
-        match seen[i + 1..] {
-            [b'\n', ..] => Some(i + 2),
-            [b'\r', b'\n', ..] => Some(i + 3),
+        match head[i + 1..] {
+            [b'\n', ..] => Some(skipped + i + 2),
+            [b'\r', b'\n', ..] => Some(skipped + i + 3),
             _ => None,
         }
     })
+}
+
+/// The library currently compares the whole Connection value with Upgrade. RFC 6455 instead
+/// requires that token in the combined field list. Normalize only its verification input; the
+/// original values are restored before filtering the host-facing response fields.
+fn normalized_response(response: &UpgradeResponse, seen: &[u8]) -> Option<Vec<u8>> {
+    let values: Vec<_> = response.headers().get_all("connection").iter().collect();
+    if values.len() == 1 && values[0].as_bytes().eq_ignore_ascii_case(b"Upgrade") {
+        return None;
+    }
+    if !values.iter().any(|value| {
+        value
+            .as_bytes()
+            .split(|byte| *byte == b',')
+            .any(|token| token.trim_ascii().eq_ignore_ascii_case(b"Upgrade"))
+    }) {
+        return None; // The library still refuses a response that does not name Upgrade.
+    }
+    let start = status_line_start(seen);
+    let line = start.get(..start.iter().position(|byte| *byte == b'\n')?)?;
+    let mut normalized = Vec::with_capacity(seen.len());
+    normalized.extend_from_slice(line.strip_suffix(b"\r").unwrap_or(line));
+    normalized.extend_from_slice(b"\r\nConnection: Upgrade\r\n");
+    for (name, value) in response.headers() {
+        if name == "connection" {
+            continue;
+        }
+        normalized.extend_from_slice(name.as_str().as_bytes());
+        normalized.extend_from_slice(b": ");
+        normalized.extend_from_slice(value.as_bytes());
+        normalized.extend_from_slice(b"\r\n");
+    }
+    normalized.extend_from_slice(b"\r\n");
+    normalized.extend_from_slice(seen.get(head_end(seen)?..)?);
+    Some(normalized)
 }
 
 /// A refused upgrade's BODY: frame what the pipe holds, decoded by its transfer coding when it is
@@ -1165,6 +1241,21 @@ impl WsFramer {
             };
             request.headers_mut().append(name, value);
         }
+        // This field is a list, including across repeated lines. The library records offered
+        // subprotocols from only one value, so present the combined list to its validator.
+        let protocols: Vec<_> = request.headers().get_all(SUBPROTOCOL).iter().collect();
+        if protocols.len() > 1 {
+            let mut joined = Vec::new();
+            for value in protocols {
+                if !joined.is_empty() {
+                    joined.extend_from_slice(b", ");
+                }
+                joined.extend_from_slice(value.as_bytes());
+            }
+            let joined =
+                HeaderValue::from_bytes(&joined).map_err(|_| TransportError::HandshakeFailed)?;
+            request.headers_mut().insert(SUBPROTOCOL, joined);
+        }
         #[cfg(feature = "test-seeded")]
         if self.seeded {
             request
@@ -1211,34 +1302,69 @@ impl WsFramer {
                 .map_err(|_| TransportError::HandshakeFailed)?
             {
                 RoundResult::Incomplete(next) => *response = Some(next),
-                RoundResult::WouldBlock(next) => {
+                RoundResult::WouldBlock(mut next) => {
+                    next.get_mut().discard_heads();
                     *response = Some(next);
                     return Ok(false);
                 }
                 RoundResult::StageFinished(StageResult::DoneReading {
-                    result, mut stream, ..
+                    result,
+                    mut stream,
+                    tail,
                 }) => {
                     let code = result.status().as_u16();
                     if !(100..200).contains(&code) || code == 101 {
+                        stream.discard_heads();
+                        if code == 101 && result.headers().contains_key("sec-websocket-extensions")
+                        {
+                            return Err(TransportError::HandshakeFailed);
+                        }
+                        let normalized = (code == 101)
+                            .then(|| normalized_response(&result, &stream.seen))
+                            .flatten();
                         let pipe = mid.get_mut().get_mut();
-                        pipe.inbound = stream.seen.iter().copied().collect();
+                        pipe.response_connection = normalized.as_ref().map(|_| {
+                            result
+                                .headers()
+                                .get_all("connection")
+                                .iter()
+                                .cloned()
+                                .collect()
+                        });
+                        pipe.inbound = normalized
+                            .as_deref()
+                            .unwrap_or(&stream.seen)
+                            .iter()
+                            .copied()
+                            .collect();
                         pipe.seen = std::mem::take(&mut stream.seen);
                         pipe.ended = stream.ended;
                         return Ok(true);
                     }
                     let block = head_block(result.headers());
-                    let reason = reason_phrase(&stream.seen);
+                    let reason = reason_phrase(
+                        stream
+                            .seen
+                            .get(stream.head_at..)
+                            .ok_or(TransportError::HandshakeFailed)?,
+                    );
                     out.frame(Framed {
                         status: Some(status_class(code)),
                         status_code: Some(u32::from(code)),
                         reason: reason.as_deref(),
                         ..Framed::plain(StreamId(0), &block, true)
                     });
-                    let at = head_end(&stream.seen).ok_or(TransportError::HandshakeFailed)?;
-                    let remaining = stream.seen.split_off(at);
-                    stream.seen.zeroize();
-                    stream.seen = remaining;
-                    stream.inbound = stream.seen.iter().copied().collect();
+                    // The parser returned only its read-ahead tail; unread carrier bytes already
+                    // remain in the pipe. Replay that tail, rather than copying the entire suffix
+                    // once for every informational head in a coalesced ingest.
+                    stream.head_at = stream
+                        .seen
+                        .len()
+                        .checked_sub(stream.inbound.len().saturating_add(tail.len()))
+                        .ok_or(TransportError::HandshakeFailed)?;
+                    for byte in tail.into_iter().rev() {
+                        stream.inbound.push_front(byte);
+                    }
                     *response = Some(HandshakeMachine::start_read(stream));
                 }
                 RoundResult::StageFinished(StageResult::DoneWriting(_)) => {
@@ -1294,19 +1420,19 @@ impl WsFramer {
         let mut phase = match phase {
             Phase::Accepting { mid, max } => match mid.handshake() {
                 Ok(mut ws) => {
-                    // The machine refuses any byte it read past the request, but it reads in
-                    // chunks: a request that ends exactly on a chunk's end leaves what followed it
-                    // unread in the pipe, which the session reads and the scan never saw. Only
-                    // with nothing left there does the session start at a frame boundary, and the
-                    // text scan follow its frames from the next call on.
+                    // The machine refuses any byte it read past the request. Bytes left unread
+                    // in the pipe therefore begin at a frame boundary; feed them before the
+                    // session consumes them, carrying any partial frame into the next call.
                     let pipe = ws.get_mut();
                     pipe.seen = Vec::new();
-                    if pipe.inbound.is_empty() {
-                        pipe.scan = Some(TextScan {
-                            masked: true,
-                            ..TextScan::default()
-                        });
-                    }
+                    let mut scan = TextScan {
+                        masked: true,
+                        ..TextScan::default()
+                    };
+                    let (front, back) = pipe.inbound.as_slices();
+                    scan.feed(front);
+                    scan.feed(back);
+                    pipe.scan = Some(scan);
                     Phase::open(ws, Vec::new(), max)
                 }
                 Err(HandshakeError::Interrupted(mid)) => {
@@ -1342,7 +1468,13 @@ impl WsFramer {
                 message,
                 max,
             } => match mid.handshake() {
-                Ok((mut ws, response)) => {
+                Ok((mut ws, mut response)) => {
+                    if let Some(original) = ws.get_mut().response_connection.take() {
+                        response.headers_mut().remove("connection");
+                        for value in original {
+                            response.headers_mut().append("connection", value);
+                        }
+                    }
                     // The far end answered: its switching response is the stream's
                     // head, handed up before anything else, with its status and its field block.
                     // A far end that answered the upgrade and sends nothing more has answered.
@@ -1356,14 +1488,15 @@ impl WsFramer {
                     for m in held {
                         ws.write(m).map_err(|e| read_error(&e))?;
                     }
-                    // The far end may send its first frames with the head: the session starts at a
-                    // frame boundary, and the text scan follows its frames from the next call on,
-                    // only when the head ended exactly at the last byte seen (a call that merely
-                    // ENDS like a head may end inside a frame's payload).
+                    // The far end may send its first frames with the head. Start at the parsed
+                    // head boundary and feed the entire suffix, retaining any partial frame for
+                    // the next call rather than guessing from the call's last bytes.
                     let pipe = ws.get_mut();
                     let seen = shaken.as_ref().map_or(&[][..], |(seen, _)| seen.as_slice());
-                    if head_end(seen) == Some(seen.len()) {
-                        pipe.scan = Some(TextScan::default());
+                    if let Some(at) = head_end(seen) {
+                        let mut scan = TextScan::default();
+                        scan.feed(&seen[at..]);
+                        pipe.scan = Some(scan);
                     }
                     pipe.seen = Vec::new();
                     Phase::open(ws, message, max)
@@ -1472,7 +1605,18 @@ impl WsFramer {
                 // The peer closed: the machine queued the close answer (the peer's own code), and
                 // no frame follows.
                 Ok(Message::Close(_)) => {
-                    ended = true;
+                    // The library normalizes a forbidden peer code into its 1002 reply. Keep
+                    // that protocol failure distinct from a valid peer explicitly closing 1002.
+                    if ws
+                        .get_ref()
+                        .scan
+                        .as_ref()
+                        .is_some_and(|scan| scan.bad_close)
+                    {
+                        *failed = Some(CloseCode::Protocol);
+                    } else {
+                        ended = true;
+                    }
                     break;
                 }
                 Err(WsError::Io(e)) if e.kind() == std::io::ErrorKind::WouldBlock => break,

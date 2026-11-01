@@ -5,7 +5,8 @@
 //!
 //! This crate carries exactly the byte-level behaviour the architecture's ws row names: the
 //! session opens at the upgrade (`Unit0Trigger::Upgrade`), frames after the upgrade carry no
-//! status leg (`STATUS_CLASS = None`), and text/binary WS messages are the frame unit. It carries
+//! status, and text/binary WS messages are the frame unit. Dialled HTTP upgrade response heads
+//! carry their status separately. It carries
 //! no protocol meaning — no verbs, no ids, no JSON. That belongs to whichever plane rides this
 //! transport.
 //!

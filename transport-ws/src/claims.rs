@@ -13,7 +13,7 @@ use busbar_contract::grammar::SelectorForm;
 ///
 /// A ws session opens on an HTTP upgrade request, so an ingress claim over this wire selects on
 /// that request's shape: its path, its fields, and the connection it arrived on. The door renders
-/// its claim rows from this list (`crate::door`); it is stated nowhere else.
+/// its claim rows from this list through the aliases in `crate::meta`.
 pub(crate) const SELECTOR_FORMS: &[SelectorForm] = &[
     SelectorForm::ExactPath,
     SelectorForm::PrefixOneLevel,
