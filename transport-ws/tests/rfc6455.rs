@@ -918,6 +918,27 @@ fn a_message_past_the_settings_ceiling_fails_the_stream_with_1009() {
     assert_eq!(close_code(&server_frames(&closed.wire)), Some(1009));
 }
 
+/// Every frame fits independently; the ceiling still bounds their assembled message.
+#[test]
+fn fragmented_messages_share_the_settings_ceiling() {
+    let mut h = Host::with_settings(br#"{"limits.request_body_max_bytes": 64}"#);
+    let f = h.accept();
+    let first = h.ingest(f, &client(false, 0, BINARY, &[7; 32]));
+    assert!(first.frames.is_empty() && !first.stream_end);
+    let at_limit = h.ingest(f, &client(true, 0, CONTINUATION, &[7; 32]));
+    assert_eq!(at_limit.frames, [(vec![7; 64], OCTETS)]);
+    assert!(!at_limit.stream_end);
+
+    let first = h.ingest(f, &client(false, 0, BINARY, &[7; 32]));
+    assert!(first.frames.is_empty() && !first.stream_end);
+    let (r, over_limit) = h.ingest_answer(f, &client(true, 0, CONTINUATION, &[7; 33]));
+    assert_eq!(r, Outcome::Ready);
+    assert!(over_limit.frames.is_empty(), "no partial message escapes");
+    assert!(over_limit.stream_end && over_limit.ended && over_limit.failed);
+    let closed = h.finish(f, CLOSE_NORMAL);
+    assert_eq!(close_code(&server_frames(&closed.wire)), Some(1009));
+}
+
 /// `validate` refuses a ceiling that is not a count.
 #[test]
 fn validate_refuses_a_non_numeric_ceiling() {

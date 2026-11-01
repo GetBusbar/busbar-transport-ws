@@ -45,9 +45,13 @@ fn client(fin: bool, opcode: u8, payload: &[u8]) -> Vec<u8> {
     let mut f = vec![(u8::from(fin) << 7) | opcode];
     match payload.len() {
         n if n < 126 => f.push(0x80 | n as u8),
-        n => {
+        n if n <= 0xffff => {
             f.push(0x80 | 126);
             f.extend_from_slice(&(n as u16).to_be_bytes());
+        }
+        n => {
+            f.push(0x80 | 127);
+            f.extend_from_slice(&(n as u64).to_be_bytes());
         }
     }
     f.extend_from_slice(&mask);
@@ -155,6 +159,62 @@ fn a_code_point_split_across_fragments_is_still_accepted() {
         frames.extend(out.frames);
     }
     assert_eq!(frames.concat(), bytes);
+}
+
+/// Control payloads are octets even while a text code point is unfinished. Splitting each
+/// extended-length and mask byte must leave that text state intact as well.
+#[test]
+fn split_extended_headers_and_interleaved_controls_preserve_text_state() {
+    for len in [126, 65_536] {
+        let framer = WsFramer::new(0);
+        let state = open(&framer);
+        let mut text = vec![b'a'; len - 1];
+        text.push(0xe1);
+        let first = client(false, TEXT, &text);
+        let header = first.len() - text.len();
+        for byte in &first[..header] {
+            let mut out = Out::default();
+            framer.ingest(state, &[*byte], false, &mut out).unwrap();
+            assert!(!out.ended && out.frames.is_empty());
+        }
+        let mut out = Out::default();
+        framer
+            .ingest(state, &first[header..], false, &mut out)
+            .unwrap();
+        assert!(!out.ended && out.frames.is_empty());
+        for opcode in [0x9, 0xa] {
+            let mut out = Out::default();
+            framer
+                .ingest(state, &client(true, opcode, &[0xff, 0xfe]), false, &mut out)
+                .unwrap();
+            assert!(!out.ended && out.frames.is_empty());
+            if opcode == 0x9 {
+                assert_eq!(out.sent, [0x8a, 2, 0xff, 0xfe], "the ping is answered");
+            }
+        }
+        let mut out = Out::default();
+        framer
+            .ingest(
+                state,
+                &client(true, CONTINUATION, &[0xbd, 0xb5]),
+                false,
+                &mut out,
+            )
+            .unwrap();
+        text.extend_from_slice(&[0xbd, 0xb5]);
+        assert!(!out.ended);
+        assert_eq!(out.frames, [text]);
+    }
+}
+
+#[test]
+fn interleaved_controls_do_not_reset_an_unfinished_text_code_point() {
+    fails_at_last(&[
+        client(false, TEXT, &[0xe1, 0xbd]),
+        client(true, 0x9, &[0xff]),
+        client(true, 0xa, &[0xfe]),
+        client(false, CONTINUATION, b"A"),
+    ]);
 }
 
 /// THE SCAN STARTS ONLY WHERE THE HANDSHAKE ENDED (codeaudit e916fda WS-1): on a dial, the call that
