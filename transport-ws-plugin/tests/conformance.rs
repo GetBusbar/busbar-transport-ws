@@ -30,6 +30,9 @@ use busbar_plugin_loader::dispatch::{
 };
 use busbar_transport_ws_plugin::linked;
 
+#[path = "support/interim.rs"]
+mod interim;
+
 fn z<T>() -> T {
     // SAFETY: every `in`/`out` here is plain C data; all-zero is a valid value of each.
     unsafe { zeroed() }

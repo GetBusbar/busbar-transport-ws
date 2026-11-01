@@ -17,6 +17,8 @@ use std::ffi::c_void;
 use std::io::{Read, Write};
 use std::mem::zeroed;
 use std::panic::{catch_unwind, AssertUnwindSafe};
+#[cfg(target_os = "linux")]
+use std::{fs::File, os::unix::fs::FileExt, sync::OnceLock};
 
 use crate::door::{Begin, Emit, Ingest, Ws};
 use crate::frame::{Framed, FramerOut, HostTime, Side};
@@ -294,38 +296,175 @@ fn a_panic_in_one_framing_leaves_the_others_working() {
 /// back, so a test can see a wipe of memory it can no longer read.
 struct Counting;
 
-/// The watched block's address and size, and the bytes it must not still hold when freed.
+/// An allocation's base, its greatest known initialized prefix, and its secret marker.
 type Watch = (usize, usize, &'static [u8]);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Observation {
+    #[cfg(target_os = "linux")]
+    Wiped,
+    #[cfg(target_os = "linux")]
+    Unwiped,
+    #[cfg(target_os = "linux")]
+    Bounds,
+    #[cfg(target_os = "linux")]
+    MissingReader,
+    #[cfg(target_os = "linux")]
+    ShortRead,
+    #[cfg(target_os = "linux")]
+    ReadError,
+    #[cfg(target_os = "linux")]
+    Reentered,
+    #[cfg(not(target_os = "linux"))]
+    Unsupported,
+}
+
+#[cfg(target_os = "linux")]
+static MEMORY: OnceLock<File> = OnceLock::new();
+
+const SECRET_MAX: usize = 128;
 
 thread_local! {
     static COUNT: Cell<Option<usize>> = const { Cell::new(None) };
     static WATCH: Cell<Option<Watch>> = const { Cell::new(None) };
-    static WATCHED: Cell<Option<bool>> = const { Cell::new(None) };
+    static WATCHED: Cell<Option<Observation>> = const { Cell::new(None) };
+    #[cfg(target_os = "linux")]
+    static READING: Cell<bool> = const { Cell::new(false) };
+    #[cfg(target_os = "linux")]
+    static REENTERED: Cell<bool> = const { Cell::new(false) };
 }
 
-/// Watch the block at `ptr`, `len` bytes, for its free on this thread: [`freed_wiped`] then says
-/// whether `secret` was gone from it.
+/// Watch a live allocation's base and a prefix known to have been initialized, even if its Vec
+/// was subsequently cleared. Register its largest initialized extent, never its capacity. A
+/// repeated registration before free preserves the greater old extent after a shorter reuse.
 pub(crate) fn watch_free(ptr: *const u8, len: usize, secret: &'static [u8]) {
+    assert!(!ptr.is_null() && len >= secret.len());
+    assert!((1..=SECRET_MAX).contains(&secret.len()));
+    #[cfg(target_os = "linux")]
+    MEMORY.get_or_init(|| File::open("/proc/self/mem").expect("open the Linux wipe observer"));
     WATCHED.with(|w| w.set(None));
-    WATCH.with(|w| w.set(Some((ptr as usize, len, secret))));
+    WATCH.with(|w| {
+        let len = match w.get() {
+            Some((address, prior, marker)) => {
+                assert_eq!(
+                    address, ptr as usize,
+                    "the preceding watched allocation has not freed"
+                );
+                assert_eq!(marker, secret);
+                prior.max(len)
+            }
+            None => len,
+        };
+        w.set(Some((ptr as usize, len, secret)));
+    });
 }
 
-/// Whether the watched block was freed (`None`: not yet) with no copy of its secret left in it.
-pub(crate) fn freed_wiped() -> Option<bool> {
-    WATCHED.with(Cell::get)
+/// Require the actual free on every platform and a complete Linux byte observation. Other
+/// platforms have a free/lifecycle receipt only, matching the secret/WebRTC observer boundary.
+pub(crate) fn assert_freed_wiped() {
+    let observed = WATCHED.with(Cell::get);
+    assert!(
+        observed.is_some(),
+        "the watched allocation must actually be freed"
+    );
+    #[cfg(target_os = "linux")]
+    assert_eq!(
+        observed,
+        Some(Observation::Wiped),
+        "complete pre-free OS observation"
+    );
+    #[cfg(not(target_os = "linux"))]
+    {
+        assert_eq!(observed, Some(Observation::Unsupported));
+        eprintln!(
+            "wipe-proof gap: matched free only; physical-byte proof requires the Linux observer"
+        );
+    }
 }
 
-/// The watched block is going back: note whether its secret is gone from it. Allocates nothing.
-fn inspect(ptr: *mut u8) {
+#[cfg(target_os = "linux")]
+fn read_reentered_allocator() -> bool {
+    READING
+        .try_with(|reading| {
+            if reading.get() {
+                let _ = REENTERED.try_with(|flag| flag.set(true));
+                true
+            } else {
+                false
+            }
+        })
+        .unwrap_or(false)
+}
+
+#[cfg(target_os = "linux")]
+fn observe((address, len, secret): Watch, allocation_size: usize) -> Observation {
+    if len > allocation_size || address.checked_add(len).is_none() {
+        return Observation::Bounds;
+    }
+    let Some(memory) = MEMORY.get() else {
+        return Observation::MissingReader;
+    };
+    let Ok(address) = u64::try_from(address) else {
+        return Observation::Bounds;
+    };
+    let mut chunk = [0_u8; 4096 + SECRET_MAX - 1];
+    let (mut offset, mut carried, mut held) = (0, 0, false);
+    while offset < len {
+        let count = (len - offset).min(4096);
+        let Some(at) = address.checked_add(offset as u64) else {
+            return Observation::Bounds;
+        };
+        match memory.read_at(&mut chunk[carried..carried + count], at) {
+            Ok(read) if read == count => {}
+            Ok(_) => return Observation::ShortRead,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => return Observation::ReadError,
+        }
+        let total = carried + count;
+        held |= chunk[..total]
+            .windows(secret.len())
+            .any(|run| run == secret);
+        carried = total.min(secret.len() - 1);
+        chunk.copy_within(total - carried..total, 0);
+        offset += count;
+    }
+    if held {
+        Observation::Unwiped
+    } else {
+        Observation::Wiped
+    }
+}
+
+/// The kernel copies only the registered initialized prefix into initialized stack storage,
+/// before the allocator releases it. No Rust reference is formed to source memory or spare bytes.
+fn inspect(ptr: *mut u8, allocation_size: usize) {
     let _ = WATCH.try_with(|w| {
-        let Some((at, len, secret)) = w.get().filter(|(at, _, _)| *at == ptr as usize) else {
+        let Some(watch) = w.get().filter(|(at, _, _)| *at == ptr as usize) else {
             return;
         };
         w.set(None);
-        // SAFETY: the block is still the caller's (it is freed after this), `len` bytes long.
-        let block = unsafe { std::slice::from_raw_parts(at as *const u8, len) };
-        let held = block.windows(secret.len()).any(|run| run == secret);
-        let _ = WATCHED.try_with(|r| r.set(Some(!held)));
+        #[cfg(target_os = "linux")]
+        let observed = READING
+            .try_with(|reading| {
+                if reading.replace(true) {
+                    return Observation::Reentered;
+                }
+                let _ = REENTERED.try_with(|flag| flag.set(false));
+                let observed = observe(watch, allocation_size);
+                reading.set(false);
+                if REENTERED.try_with(Cell::get).unwrap_or(true) {
+                    Observation::Reentered
+                } else {
+                    observed
+                }
+            })
+            .unwrap_or(Observation::Reentered);
+        #[cfg(not(target_os = "linux"))]
+        let observed = {
+            let _ = (watch, allocation_size);
+            Observation::Unsupported
+        };
+        let _ = WATCHED.try_with(|r| r.set(Some(observed)));
     });
 }
 
@@ -337,21 +476,52 @@ fn bump() {
     });
 }
 
-// SAFETY: every call is `System`'s, unchanged; the counter only bumps a per-thread cell, and the
-// watch only reads a block the caller still owns, before it is freed.
+// SAFETY: allocation/free layouts are forwarded unchanged to System. A watched realloc uses the
+// trait's allocate/copy/free strategy so its old allocation is observed before physical free.
+// The watch only asks the kernel to copy a registered, previously initialized prefix to initialized
+// stack storage, bounded by the allocator's layout. No Rust source-memory reference is formed.
 unsafe impl GlobalAlloc for Counting {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        #[cfg(target_os = "linux")]
+        read_reentered_allocator();
         bump();
         // SAFETY: the caller's layout, passed on.
         unsafe { System.alloc(layout) }
     }
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        inspect(ptr);
+        #[cfg(target_os = "linux")]
+        let reentered = read_reentered_allocator();
+        #[cfg(not(target_os = "linux"))]
+        let reentered = false;
+        if !reentered {
+            inspect(ptr, layout.size());
+        }
         // SAFETY: as allocated above.
         unsafe { System.dealloc(ptr, layout) }
     }
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+        #[cfg(target_os = "linux")]
+        read_reentered_allocator();
         bump();
+        let watched = WATCH
+            .try_with(|w| w.get().is_some_and(|(at, _, _)| at == ptr as usize))
+            .unwrap_or(false);
+        if watched {
+            // SAFETY: GlobalAlloc's caller guarantees this new layout and nonzero size.
+            let next = unsafe { Layout::from_size_align_unchecked(new_size, layout.align()) };
+            // SAFETY: allocate/copy/free is GlobalAlloc's default reallocation strategy. Raw
+            // copying preserves uninitialized bytes without creating a Rust source reference.
+            let grown = unsafe { System.alloc(next) };
+            if !grown.is_null() {
+                unsafe {
+                    std::ptr::copy_nonoverlapping(ptr, grown, layout.size().min(new_size));
+                }
+                unsafe {
+                    self.dealloc(ptr, layout);
+                }
+            }
+            return grown;
+        }
         // SAFETY: as allocated above.
         unsafe { System.realloc(ptr, layout, new_size) }
     }
@@ -639,7 +809,7 @@ fn an_emit_after_the_peers_close_finds_the_connection_closed() {
 /// tests LOW, PL10): the request carries the auth's credential line, and the pipe's write buffer
 /// that held it goes back to the allocator with no copy of it.
 #[test]
-fn the_pipe_that_wrote_the_upgrade_request_is_wiped() {
+fn the_pipe_that_wrote_the_upgrade_request_is_freed_and_wiped_on_linux() {
     const SECRET: &[u8] = b"Bearer sk-start-secret";
     let f = WsFramer::new(0);
     let mut out = Out::default();
@@ -653,12 +823,61 @@ fn the_pipe_that_wrote_the_upgrade_request_is_wiped() {
         .expect("the dial opens");
     assert!(out.wire.windows(SECRET.len()).any(|w| w == SECRET), "sent");
     let (ptr, cap) = f.outbound_block(s).expect("a pipe");
-    assert!(cap >= SECRET.len(), "the block that held the request");
-    watch_free(ptr, cap, SECRET);
-    f.forget(s);
-    assert_eq!(
-        freed_wiped(),
-        Some(true),
-        "no copy of the credential is left in it"
+    // drain sent this exact initialized prefix before clearing the pipe's Vec. Keeping the
+    // sent byte count observes old secret bytes even though the current Vec length is zero.
+    let initialized = out.wire.len();
+    assert!(
+        cap >= initialized,
+        "the block that held the complete request"
     );
+    watch_free(ptr, initialized, SECRET);
+    f.forget(s);
+    assert_freed_wiped();
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn a_wipe_observer_requires_a_real_free_and_complete_read_of_the_initialized_prefix() {
+    use zeroize::Zeroize;
+    const SECRET: &[u8] = b"observer-secret";
+    let mut payload = Vec::with_capacity(16384);
+    payload.resize(8193, b'!');
+    payload[4090..4090 + SECRET.len()].copy_from_slice(SECRET);
+    watch_free(payload.as_ptr(), payload.len(), SECRET);
+    assert_eq!(WATCHED.with(Cell::get), None, "registration is not a free");
+    payload.zeroize();
+    drop(payload);
+    assert_freed_wiped();
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn an_unwiped_old_secret_is_detected_after_clear_and_a_shorter_initialized_reuse() {
+    const SECRET: &[u8] = b"observer-secret";
+    let mut payload = Vec::with_capacity(16384);
+    payload.resize(8193, b'!');
+    payload[4090..4090 + SECRET.len()].copy_from_slice(SECRET);
+    watch_free(payload.as_ptr(), payload.len(), SECRET);
+    payload.clear();
+    payload.extend_from_slice(&[0; 32]);
+    watch_free(payload.as_ptr(), payload.len(), SECRET);
+    // The source read stays bounded to the previously initialized 8193 bytes, including the
+    // marker crossing a read-chunk boundary; never the never-initialized spare capacity.
+    drop(payload);
+    assert_eq!(WATCHED.with(Cell::get), Some(Observation::Unwiped));
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn a_watched_growth_observes_the_actual_old_free_before_the_new_payload_is_wiped() {
+    use zeroize::Zeroize;
+    const SECRET: &[u8] = b"observer-secret";
+    let mut payload = SECRET.to_vec();
+    watch_free(payload.as_ptr(), payload.len(), SECRET);
+    payload.reserve(4096);
+    assert_eq!(WATCHED.with(Cell::get), Some(Observation::Unwiped));
+    watch_free(payload.as_ptr(), payload.len(), SECRET);
+    payload.zeroize();
+    drop(payload);
+    assert_freed_wiped();
 }

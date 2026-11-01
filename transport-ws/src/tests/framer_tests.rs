@@ -15,6 +15,9 @@ use crate::transport::WsFramer;
 use crate::transport::{reason_phrase, retry_after};
 use tungstenite::http::{HeaderMap, HeaderValue};
 
+#[path = "reported_finish_tests.rs"]
+mod reported_finish_tests;
+
 /// What one framer call produced.
 #[derive(Default)]
 struct Out {

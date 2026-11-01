@@ -15,6 +15,9 @@ use busbar_contract::abi::transport::{slot, FramePiece, FramerOut as DoorOut, He
 
 use crate::frame::HostTime;
 
+mod adopted_session_tests;
+mod stream_policy_tests;
+
 /// What [`Poke`] runs on the instance's state.
 type Poked = Box<dyn FnOnce(&Ws)>;
 
@@ -746,15 +749,15 @@ fn a_dialled_heads_reason_reaches_the_head_slots() {
 /// THE WIPE IS SEEN (codeaudit e916fda tests LOW): a queue buffer holding owed opening bytes goes
 /// back to the allocator wiped, both when the queue outgrows it and when the queue drops.
 #[test]
-fn an_opening_buffer_goes_back_wiped() {
-    use crate::faults_tests::{freed_wiped, watch_free};
+fn an_opening_buffer_is_freed_and_wiped_on_linux() {
+    use crate::faults_tests::{assert_freed_wiped, watch_free};
     const SECRET: &[u8] = b"Bearer sk-wipe-me";
     let mut owed = Owed::default();
     owed.push(SECRET, true);
-    watch_free(owed.wire.as_ptr(), owed.wire.capacity(), SECRET);
+    watch_free(owed.wire.as_ptr(), owed.wire.len(), SECRET);
     owed.push(&vec![0x22; 4 * owed.wire.capacity()], false);
-    assert_eq!(freed_wiped(), Some(true), "outgrown, wiped");
-    watch_free(owed.wire.as_ptr(), owed.wire.capacity(), SECRET);
+    assert_freed_wiped();
+    watch_free(owed.wire.as_ptr(), owed.wire.len(), SECRET);
     drop(owed);
-    assert_eq!(freed_wiped(), Some(true), "dropped, wiped");
+    assert_freed_wiped();
 }
