@@ -649,6 +649,55 @@ fn locate_for_a_listener_answers_the_accepting_offer() {
     host.close();
 }
 
+/// Secure dial location crosses the table with its certificate name and ALPN offer. Each
+/// independently short output reports all required sizes, then succeeds with room to retry.
+#[test]
+fn locate_for_a_secure_dial_reports_every_output_and_short_buffer() {
+    use busbar_contract::abi::transport::{LocateIn, LocateOut};
+    let host = Host::open(linked(), (1024, 1024, 4));
+    let target = b"wss://svc.test/stream";
+    for caps in [[0, 64, 16], [64, 0, 16], [64, 64, 0], [64, 64, 16]] {
+        let mut authority = [0_u8; 64];
+        let mut name = [0_u8; 64];
+        let mut alpn = [0_u8; 16];
+        let mut i: LocateIn = z();
+        i.target = AbiStr {
+            ptr: target.as_ptr(),
+            len: target.len(),
+        };
+        i.authority_buf = authority.as_mut_ptr();
+        i.authority_cap = caps[0];
+        i.name_buf = name.as_mut_ptr();
+        i.name_cap = caps[1];
+        i.alpn_buf = alpn.as_mut_ptr();
+        i.alpn_cap = caps[2];
+        let mut o: LocateOut = z();
+        let r = call(host.ops.locate, host.inst, &mut i, &mut o, slot::LOCATE);
+        assert_eq!((o.secure, o.has_name), (1, 1));
+        if caps.contains(&0) {
+            assert_eq!(r, Outcome::Failed);
+            assert_eq!(
+                (o.authority_needed, o.name_needed, o.alpn_needed),
+                (12, 8, 9)
+            );
+            assert_eq!(
+                (o.authority_written, o.name_written, o.alpn_written),
+                (0, 0, 0)
+            );
+        } else {
+            assert_eq!(r, Outcome::Ready);
+            assert_eq!(
+                (o.authority_needed, o.name_needed, o.alpn_needed),
+                (0, 0, 0)
+            );
+            assert_eq!(&authority[..o.authority_written as usize], b"svc.test:443");
+            assert_eq!(&name[..o.name_written as usize], b"svc.test");
+            assert_eq!(&alpn[..o.alpn_written as usize], b"\x08http/1.1");
+        }
+    }
+    host.close();
+}
+
 /// A REFUSED UPGRADE'S WAIT, IN ITS HTTP-DATE FORM, CROSSES THE ABI (RFC 9110 §10.2.3): a `503`
 /// whose `Retry-After` is an IMF-fixdate 120 s after the sink's unix clock (1790000000 s, so
 /// 1790000120 s is Mon, 21 Sep 2026 14:15:20 GMT) is heard as 120 seconds, read against the wall
