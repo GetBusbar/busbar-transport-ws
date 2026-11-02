@@ -478,11 +478,15 @@ fn staged() -> (*mut c_void, u64, Said) {
 fn prewire_success_has_a_typed_inherited_acceptance_marker() {
     let p = instance();
     let ext = prewire_extension();
-    let mut l = Lend::roomy();
+    let mut l = Lend::new(64 * 1024, 64 * 1024, 16, 0);
     let (answer, token) = adopt(p, &ext, UPGRADE, &mut l);
     assert_eq!(answer.outcome, Outcome::Ready);
     assert_eq!(answer.flags & YIELD_ENDED, 0);
     assert!(answer.wire.starts_with(b"HTTP/1.1 101"));
+    assert!(
+        answer.reasons.is_empty(),
+        "the acceptance marker needs no HeadSlots"
+    );
     assert!(l.pieces[..answer.pieces.len()].iter().any(|piece| {
         piece.stream == 37
             && piece.flags & (PIECE_FIELDS | PIECE_HAS_CODE) == PIECE_FIELDS | PIECE_HAS_CODE
@@ -689,5 +693,24 @@ fn prewire_invalid_modes_and_incomplete_handshakes_never_commit() {
         assert_eq!(token, 0);
         assert!(answer.wire.is_empty());
     }
+    shut(p);
+}
+
+#[test]
+fn prewire_opt_out_keeps_legacy_adoption_free_of_empty_application_messages() {
+    let p = instance();
+    let ext = extensions::encode(&[(EXT_ADOPTED_SESSION, &context(37).encode())]);
+    let mut l = Lend::roomy();
+    let (answer, token) = adopt(p, &ext, UPGRADE, &mut l);
+    assert_eq!(answer.outcome, Outcome::Ready);
+    assert!(answer.wire.starts_with(b"HTTP/1.1 101"));
+    assert!(answer.pieces.is_empty());
+    assert!(answer.reasons.is_empty());
+    let payload = ingest(p, token, &masked(b"original"), false, &mut l);
+    assert_eq!(payload.pieces, [(b"original".to_vec(), PIECE_END_OF_FRAME)]);
+    let refused = stream_op(p, token, 37, true, &mut l);
+    assert_eq!(refused.outcome, Outcome::Ready);
+    assert!(refused.wire.starts_with(b"\x82\x02ok"));
+    finish(p, token, &mut l);
     shut(p);
 }
