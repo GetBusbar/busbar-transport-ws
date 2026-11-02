@@ -22,7 +22,8 @@ use busbar_contract::abi::sdk::transport::{
 };
 use busbar_contract::abi::sdk::{Instance, Lent, Out, Safe, SafeSlot};
 use busbar_contract::abi::transport::adopted_session::{
-    AdoptedSession, EXT_ADOPTED_SESSION, SUPPORT_ADOPTED_SESSION,
+    AdoptedSession, EXT_ADOPTED_SESSION, EXT_PREWIRE_SESSION, SUPPORT_ADOPTED_SESSION,
+    SUPPORT_PREWIRE_SESSION,
 };
 use busbar_contract::abi::transport::{
     AcceptIn, AcceptOut, AdoptIn, ArrivalIn, ArrivalOut, BeginIn, Claim, ConnIn, ConnOut, DialIn,
@@ -30,11 +31,12 @@ use busbar_contract::abi::transport::{
     IngestIn, IoOut, ListenIn, ListenOut, LocateIn, LocateOut, Ops, ReadIn, RefuseIn, SettingDecl,
     ShutIn, TransportTail, WriteIn, CANCEL_NOTHING_MOVED, CANCEL_PARTIAL, CLOSE_CAPACITY_EXHAUSTED,
     CLOSE_DRAIN, CLOSE_PEER_CLOSED, CLOSE_POISONED, CLOSE_REVOKED, CLOSE_TIMEOUT,
-    CLOSE_TRANSPORT_FAILED, EMIT_TEXT, FACT_ACCEPTS, FACT_ADOPTS, FACT_DIALS, FAULT_NONE,
-    FRAME_PIECE_SIZE, FRAMING_STREAM, PIECE_CONTINUED, PIECE_END, PIECE_END_OF_FRAME, PIECE_FIELDS,
-    PIECE_HAS_CODE, PIECE_HAS_RETRY_AFTER, PIECE_INTERIM, PIECE_STREAM_FAILED, PIECE_TEXT,
-    ROLE_FRAMER, SETTING_COUNT, SIDE_ACCEPT, SIDE_DIAL, STATUS_CALLER_FAULT, STATUS_FAR_END_FAULT,
-    STATUS_NONE, STATUS_OTHER, STATUS_SUCCESS, UNIT0_UPGRADE, YIELD_ENDED, YIELD_MORE,
+    CLOSE_TRANSPORT_FAILED, EMIT_TEXT, EMIT_TRAILERS, FACT_ACCEPTS, FACT_ADOPTS, FACT_DIALS,
+    FAULT_NONE, FRAME_PIECE_SIZE, FRAMING_STREAM, PIECE_CONTINUED, PIECE_END, PIECE_END_OF_FRAME,
+    PIECE_FIELDS, PIECE_HAS_CODE, PIECE_HAS_RETRY_AFTER, PIECE_INTERIM, PIECE_STREAM_FAILED,
+    PIECE_TEXT, ROLE_FRAMER, SETTING_COUNT, SIDE_ACCEPT, SIDE_DIAL, STATUS_CALLER_FAULT,
+    STATUS_FAR_END_FAULT, STATUS_NONE, STATUS_OTHER, STATUS_SUCCESS, UNIT0_UPGRADE, YIELD_ENDED,
+    YIELD_MORE,
 };
 use busbar_contract::ids::StreamId;
 use busbar_contract::transport::registry::DEFAULT_REQUEST_BODY_MAX_BYTES;
@@ -256,6 +258,8 @@ struct Owed {
     adopted: Option<AdoptedSession>,
     /// A direct accepted session selects and retains its own listener generation.
     policy: Option<policy::Admission>,
+    prewire: Prewire,
+    prewire_marker: bool,
     /// Bytes owed to the far side. The bytes before `wire_at` are handed over already; the rest
     /// is owed.
     wire: Vec<u8>,
@@ -275,6 +279,157 @@ struct Owed {
     ended: bool,
 }
 
+#[derive(Default)]
+enum Prewire {
+    #[default]
+    Legacy,
+    Awaiting,
+    Committed,
+    Http(HttpAnswer),
+}
+
+struct Adoption {
+    session: AdoptedSession,
+    prewire: bool,
+}
+
+struct HttpAnswer {
+    remaining: Option<u64>,
+    chunked: bool,
+    bodyless: bool,
+}
+
+fn answer_fields(block: &[u8]) -> Result<Vec<(&[u8], &[u8])>, TransportError> {
+    use tungstenite::http::{HeaderName, HeaderValue};
+    let fields: Vec<_> = busbar_contract::abi::transport::fields::lines(block).collect();
+    let parsed: usize = fields.iter().map(|(n, v)| n.len() + v.len() + 4).sum();
+    if parsed != block.len() {
+        return Err(TransportError::Framing);
+    }
+    for (name, value) in &fields {
+        HeaderName::from_bytes(name).map_err(|_| TransportError::Framing)?;
+        HeaderValue::from_bytes(value).map_err(|_| TransportError::Framing)?;
+    }
+    Ok(fields)
+}
+
+impl HttpAnswer {
+    fn head(status: u32, block: &[u8], end: bool) -> Result<(Self, Vec<u8>), TransportError> {
+        use tungstenite::http::StatusCode;
+        let code = u16::try_from(status)
+            .ok()
+            .and_then(|status| StatusCode::from_u16(status).ok())
+            .filter(|status| status.as_u16() >= 200)
+            .ok_or(TransportError::Framing)?;
+        let fields = answer_fields(block)?;
+        let mut remaining = None;
+        let mut chunked = false;
+        let mut trailers = false;
+        for (name, value) in fields {
+            if name.eq_ignore_ascii_case(b"content-length") {
+                if value.is_empty() || !value.iter().all(u8::is_ascii_digit) {
+                    return Err(TransportError::Framing);
+                }
+                let count = std::str::from_utf8(value)
+                    .ok()
+                    .and_then(|value| value.parse::<u64>().ok())
+                    .ok_or(TransportError::Framing)?;
+                if remaining.is_some_and(|previous| previous != count) {
+                    return Err(TransportError::Framing);
+                }
+                remaining = Some(count);
+            } else if name.eq_ignore_ascii_case(b"transfer-encoding") {
+                if chunked
+                    || !value
+                        .rsplit(|byte| *byte == b',')
+                        .next()
+                        .is_some_and(|last| last.trim_ascii().eq_ignore_ascii_case(b"chunked"))
+                {
+                    return Err(TransportError::Framing);
+                }
+                chunked = true;
+            } else if name.eq_ignore_ascii_case(b"trailer") {
+                trailers = true;
+            }
+        }
+        if remaining.is_some() && (chunked || trailers) {
+            return Err(TransportError::Framing);
+        }
+        let bodyless = matches!(status, 204 | 304);
+        if end && !bodyless && remaining.is_some_and(|count| count != 0) {
+            return Err(TransportError::Framing);
+        }
+        let mut wire = format!(
+            "HTTP/1.1 {} {}\r\n",
+            code.as_u16(),
+            code.canonical_reason().unwrap_or("")
+        )
+        .into_bytes();
+        wire.extend_from_slice(block);
+        if trailers && !chunked {
+            wire.extend_from_slice(b"transfer-encoding: chunked\r\n");
+            chunked = true;
+        }
+        wire.extend_from_slice(b"\r\n");
+        if end && chunked && !bodyless {
+            wire.extend_from_slice(b"0\r\n\r\n");
+        }
+        Ok((
+            Self {
+                remaining,
+                chunked,
+                bodyless,
+            },
+            wire,
+        ))
+    }
+
+    fn body(&mut self, bytes: &[u8], end: bool, trailers: bool) -> Result<Vec<u8>, TransportError> {
+        if self.bodyless && !bytes.is_empty() {
+            return Err(TransportError::Framing);
+        }
+        if trailers {
+            if !self.chunked || !end {
+                return Err(TransportError::Framing);
+            }
+            for (name, _) in answer_fields(bytes)? {
+                if busbar_contract::abi::transport::fields::HOP_BY_HOP
+                    .iter()
+                    .any(|field| name.eq_ignore_ascii_case(field.as_bytes()))
+                    || name.eq_ignore_ascii_case(b"content-length")
+                {
+                    return Err(TransportError::Framing);
+                }
+            }
+            return Ok([b"0\r\n".as_slice(), bytes, b"\r\n"].concat());
+        }
+        let remaining = self
+            .remaining
+            .map(|left| {
+                left.checked_sub(bytes.len() as u64)
+                    .ok_or(TransportError::Framing)
+            })
+            .transpose()?;
+        if end && remaining.is_some_and(|left| left != 0) {
+            return Err(TransportError::Framing);
+        }
+        self.remaining = remaining;
+        if !self.chunked || self.bodyless {
+            return Ok(bytes.to_vec());
+        }
+        let mut wire = Vec::new();
+        if !bytes.is_empty() {
+            wire.extend_from_slice(format!("{:x}\r\n", bytes.len()).as_bytes());
+            wire.extend_from_slice(bytes);
+            wire.extend_from_slice(b"\r\n");
+        }
+        if end {
+            wire.extend_from_slice(b"0\r\n\r\n");
+        }
+        Ok(wire)
+    }
+}
+
 impl Drop for Owed {
     fn drop(&mut self) {
         if self.secret > self.wire_at {
@@ -291,6 +446,96 @@ const SPARE_MAX: usize = 8;
 const KEEP_BYTES: usize = 256 * 1024;
 
 impl Owed {
+    fn accepted_marker(&mut self, framer: &WsFramer, token: u64) {
+        if matches!(self.prewire, Prewire::Awaiting)
+            && !self.prewire_marker
+            && !self.ended
+            && framer.accepted(token)
+        {
+            self.pieces.push_front(Piece {
+                fields: true,
+                status: Some((101, STATUS_SUCCESS)),
+                ..Piece::plain(0, Vec::new(), true)
+            });
+            self.prewire_marker = true;
+        }
+    }
+
+    fn discard_prewire(&mut self) {
+        self.wire.zeroize();
+        self.wire.clear();
+        self.wire_at = 0;
+        self.secret = 0;
+        for piece in &mut self.pieces {
+            piece.bytes.zeroize();
+            if let Some(reason) = &mut piece.reason {
+                reason.zeroize();
+            }
+        }
+        self.pieces.clear();
+        for spare in &mut self.spare {
+            spare.zeroize();
+        }
+        self.spare.clear();
+    }
+
+    fn prewire_emit(
+        &mut self,
+        framer: &WsFramer,
+        token: u64,
+        status: u32,
+        bytes: &[u8],
+        end: bool,
+        flags: u32,
+    ) -> Result<bool, TransportError> {
+        if matches!(self.prewire, Prewire::Legacy) {
+            return Ok(false);
+        }
+        if let Prewire::Http(answer) = &mut self.prewire {
+            if status != 0 || flags & EMIT_TEXT != 0 || self.ended && (!bytes.is_empty() || end) {
+                return Err(TransportError::Framing);
+            }
+            let wire = answer.body(bytes, end, flags & EMIT_TRAILERS != 0)?;
+            self.push(&wire, false);
+            self.ended |= end;
+            return Ok(true);
+        }
+        if status == 101 && matches!(self.prewire, Prewire::Awaiting) {
+            if !bytes.is_empty()
+                || !end
+                || flags != 0
+                || !self.prewire_marker
+                || !framer.accepted(token)
+            {
+                return Err(TransportError::Framing);
+            }
+            self.prewire = Prewire::Committed;
+            return Ok(true);
+        }
+        if status != 0 {
+            if !matches!(self.prewire, Prewire::Awaiting) || flags != 0 {
+                return Err(TransportError::Framing);
+            }
+            let (answer, wire) = HttpAnswer::head(status, bytes, end)?;
+            self.discard_prewire();
+            framer.forget(token);
+            self.prewire = Prewire::Http(answer);
+            self.push(&wire, false);
+            self.ended = end;
+            return Ok(true);
+        }
+        if flags & EMIT_TRAILERS != 0 {
+            return Err(TransportError::Framing);
+        }
+        if matches!(self.prewire, Prewire::Awaiting) {
+            if !bytes.is_empty() || end {
+                return Err(TransportError::Framing);
+            }
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
     /// The bytes owed to the far side and not handed over yet.
     fn wire_owed(&self) -> &[u8] {
         &self.wire[self.wire_at..]
@@ -737,7 +982,7 @@ fn end_failed(f: &WsFramer, token: u64, owed: &mut Owed, ended_before: bool) {
 fn opening(
     p: &Instance<'_, Held<Ws>>,
     texts: &OpTexts,
-    adopted: Option<AdoptedSession>,
+    adopted: Option<Adoption>,
     policy: Option<policy::Admission>,
     sink: Lent<'_, FramerSink>,
     o: &mut Out<'_, FramerOut>,
@@ -747,9 +992,16 @@ fn opening(
         o.error(texts.no_instance);
         return Outcome::Failed;
     };
+    let prewire = adopted.as_ref().is_some_and(|adopted| adopted.prewire);
     let mut owed = Owed {
-        adopted,
+        adopted: adopted.map(|adopted| adopted.session),
         policy,
+        prewire: if prewire {
+            Prewire::Awaiting
+        } else {
+            Prewire::Legacy
+        },
+        prewire_marker: false,
         wire: Vec::new(),
         wire_at: 0,
         secret: 0,
@@ -765,6 +1017,8 @@ fn opening(
     match open(&inst.framer, &mut c) {
         Ok(token) => {
             o.set(|x| &x.framing, token);
+
+            owed.accepted_marker(&inst.framer, token);
 
             end_failed(&inst.framer, token, &mut owed, false);
             fill(&mut owed, sink, o);
@@ -913,8 +1167,19 @@ op!(
                 return Outcome::Failed;
             }
         };
+        let prewire = match extensions::get(
+            i.field(|x| &x.head.extensions).bytes(),
+            EXT_PREWIRE_SESSION,
+        ) {
+            None => false,
+            Some(value) if value == SUPPORT_PREWIRE_SESSION && adopted.is_some() && matches!(side, Side::Accept) => true,
+            Some(_) => {
+                o.error("adopt: the prewire session mode is invalid");
+                return Outcome::Failed;
+            }
+        };
         let leftover = i.leftover();
-        opening(&p, &ADOPT, adopted, None, i.field(|x| &x.sink), &mut o, |f, c| {
+        opening(&p, &ADOPT, adopted.map(|session| Adoption { session, prewire }), None, i.field(|x| &x.sink), &mut o, |f, c| {
             f.adopt(side, leftover, c)
         })
     }
@@ -950,6 +1215,7 @@ op!(
                     }
                 }
                 end_failed(f, token, c.owed, ended_before);
+                c.owed.accepted_marker(f, token);
                 Ok(())
             },
         )
@@ -959,13 +1225,20 @@ op!(
 op!(
     /// `emit`.
     Emit(EmitIn => FramerOut) |p, i, o| {
-        if i.flags & !EMIT_TEXT != 0 {
+        if i.flags & !(EMIT_TEXT | EMIT_TRAILERS) != 0 || i.flags == EMIT_TEXT | EMIT_TRAILERS {
+            o.error("emit: the ws framer does not support these flags");
+            return Outcome::Refused;
+        }
+        if i.flags & EMIT_TRAILERS != 0 && !p.get()
+            .and_then(|held| held.life().queues().get(&i.framing).cloned())
+            .is_some_and(|slot| slot.lock().is_ok_and(|owed| matches!(owed.prewire, Prewire::Http(_))))
+        {
             o.error("emit: the ws framer does not support these flags");
             return Outcome::Refused;
         }
         let bytes = i.bytes();
         let eof = i.end_of_frame != 0;
-        let (token, text) = (i.framing, i.flags & EMIT_TEXT != 0);
+        let (token, text, status, flags) = (i.framing, i.flags & EMIT_TEXT != 0, i.status, i.flags);
         framing(
             &p,
             &EMIT,
@@ -977,6 +1250,12 @@ op!(
                 stream: Some(i.stream),
             },
             |f, c| {
+                if c.owed.prewire_emit(f, token, status, bytes, eof, flags)? {
+                    return Ok(());
+                }
+                if flags & EMIT_TRAILERS != 0 {
+                    return Err(TransportError::Framing);
+                }
                 if c.owed.policy.as_ref().is_some_and(|policy| !policy.admitted()) {
                     return Err(TransportError::Refused);
                 }
@@ -994,11 +1273,23 @@ op!(
     Refuse(RefuseIn => FramerOut) |p, i, o| {
         let bytes = i.bytes();
         let stream = (i.has_stream != 0).then_some(StreamId(i.stream));
-        let (token, status) = (i.framing, i.status);
+        let (token, status, head_sent) = (i.framing, i.status, i.head_sent != 0);
         framing(&p, &REFUSE, token, i.field(|x| &x.sink), &mut o, FramingInput {
             stream: stream.map(|s| s.0),
             ..FramingInput::default()
         }, |f, c| {
+            if matches!(c.owed.prewire, Prewire::Awaiting) && !head_sent && status >= 200 {
+                let fields = format!("content-length: {}\r\n", bytes.len());
+                c.owed.prewire_emit(f, token, status, fields.as_bytes(), bytes.is_empty(), 0)?;
+                if !bytes.is_empty() {
+                    c.owed.prewire_emit(f, token, 0, bytes, true, 0)?;
+                }
+                return Ok(());
+            }
+            if matches!(c.owed.prewire, Prewire::Http(_)) {
+                c.owed.ended = true;
+                return Ok(());
+            }
             let stream = stream.map(|stream| {
                 if c.owed.adopted.is_some() { StreamId(0) } else { stream }
             });
@@ -1022,6 +1313,12 @@ op!(
     Finish(FinishIn => FramerOut) |p, i, o| {
         let (token, reason) = (i.framing, reason_of(i.reason));
         let out = framing(&p, &FINISH, token, i.field(|x| &x.sink), &mut o, FramingInput::default(), |f, c| {
+            if matches!(c.owed.prewire, Prewire::Awaiting) {
+                c.owed.discard_prewire();
+                f.forget(token);
+                c.owed.ended = true;
+                return Ok(());
+            }
             f.close(token, reason, c);
             c.owed.ended = true;
             Ok(())

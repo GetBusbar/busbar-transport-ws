@@ -1099,6 +1099,17 @@ impl WsFramer {
         self.map().contains_key(&state)
     }
 
+    /// Whether this framing completed its accepted WebSocket handshake.
+    pub(crate) fn accepted(&self, state: u64) -> bool {
+        let Ok(conn) = self.conn(state) else {
+            return false;
+        };
+        let Ok(held) = Self::enter(&conn) else {
+            return false;
+        };
+        matches!(held.as_ref(), Some(Phase::Open { .. }))
+    }
+
     /// How many ingested bytes framing `state` holds unread (a test reads that bytes nobody will
 
     #[cfg(test)]
