@@ -38,11 +38,16 @@ fn call<I, O>(op: Option<Op>, inst: *mut c_void, i: &mut I, o: &mut O, index: u3
         (*ih).op = index;
         (*std::ptr::from_mut(o).cast::<OutHead>()).size = size_of::<O>() as u32;
     }
-    let r = (op.expect("every slot is filled"))(
-        inst,
-        std::ptr::from_ref(i).cast(),
-        std::ptr::from_mut(o).cast(),
-    );
+    // SAFETY: this private harness selects the matching typed ABI frames for each static slot.
+    // The instance is live (or null for lifecycle/static refusal cases), the heads are initialized
+    // above, and every referenced input/output buffer remains borrowed for this crossing.
+    let r = unsafe {
+        (op.expect("every slot is filled"))(
+            inst,
+            std::ptr::from_ref(i).cast(),
+            std::ptr::from_mut(o).cast(),
+        )
+    };
     r.outcome()
 }
 
