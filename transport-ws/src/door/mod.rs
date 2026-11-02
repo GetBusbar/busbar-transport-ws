@@ -353,6 +353,9 @@ impl HttpAnswer {
             return Err(TransportError::Framing);
         }
         let bodyless = matches!(status, 204 | 304);
+        if status == 204 && (remaining.is_some() || chunked) {
+            return Err(TransportError::Framing);
+        }
         if end && !bodyless && remaining.is_some_and(|count| count != 0) {
             return Err(TransportError::Framing);
         }
@@ -363,7 +366,7 @@ impl HttpAnswer {
         )
         .into_bytes();
         wire.extend_from_slice(block);
-        if trailers && !chunked {
+        if trailers && !chunked && !bodyless {
             wire.extend_from_slice(b"transfer-encoding: chunked\r\n");
             chunked = true;
         }
@@ -382,8 +385,12 @@ impl HttpAnswer {
     }
 
     fn body(&mut self, bytes: &[u8], end: bool, trailers: bool) -> Result<Vec<u8>, TransportError> {
-        if self.bodyless && !bytes.is_empty() {
-            return Err(TransportError::Framing);
+        if self.bodyless {
+            return if bytes.is_empty() && !trailers {
+                Ok(Vec::new())
+            } else {
+                Err(TransportError::Framing)
+            };
         }
         if trailers {
             if !self.chunked || !end {
@@ -1265,7 +1272,11 @@ op!(
             ..FramingInput::default()
         }, |f, c| {
             if matches!(c.owed.prewire, Prewire::Awaiting) && !head_sent && status >= 200 {
-                let fields = format!("content-length: {}\r\n", bytes.len());
+                let bodyless = matches!(status, 204 | 304);
+                if bodyless && !bytes.is_empty() {
+                    return Err(TransportError::Framing);
+                }
+                let fields = if bodyless { String::new() } else { format!("content-length: {}\r\n", bytes.len()) };
                 c.owed.prewire_emit(f, token, status, fields.as_bytes(), bytes.is_empty(), 0)?;
                 if !bytes.is_empty() {
                     c.owed.prewire_emit(f, token, 0, bytes, true, 0)?;
