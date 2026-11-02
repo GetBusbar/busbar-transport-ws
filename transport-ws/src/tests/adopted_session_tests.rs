@@ -756,3 +756,87 @@ fn prewire_partial_adoption_marks_acceptance_once_and_blocks_uncommitted_data() 
     finish(p, token, &mut l);
     shut(p);
 }
+
+#[test]
+fn prewire_bodyless_not_modified_preserves_metadata_length_at_empty_completion() {
+    let (p, token, _) = staged();
+    let mut l = Lend::roomy();
+    let head = prewire_emit(
+        p,
+        token,
+        304,
+        b"content-length: 42\r\netag: original\r\n",
+        false,
+        0,
+        &mut l,
+    );
+    assert_eq!(head.outcome, Outcome::Ready);
+    assert!(head
+        .wire
+        .ends_with(b"content-length: 42\r\netag: original\r\n\r\n"));
+    let done = prewire_emit(p, token, 0, &[], true, 0, &mut l);
+    assert_eq!(done.outcome, Outcome::Ready);
+    assert!(done.wire.is_empty());
+    assert_ne!(done.flags & YIELD_ENDED, 0);
+    finish(p, token, &mut l);
+    shut(p);
+}
+
+#[test]
+fn prewire_bodyless_metadata_never_generates_chunk_bytes_or_trailers() {
+    use busbar_contract::abi::transport::EMIT_TRAILERS;
+    for fields in [
+        &b"transfer-encoding: chunked\r\n"[..],
+        &b"trailer: x-final\r\n"[..],
+    ] {
+        let (p, token, _) = staged();
+        let mut l = Lend::roomy();
+        let head = prewire_emit(p, token, 304, fields, false, 0, &mut l);
+        assert_eq!(head.outcome, Outcome::Ready);
+        let line = head.wire.windows(2).position(|v| v == b"\r\n").unwrap();
+        assert_eq!(&head.wire[line + 2..], &[fields, b"\r\n"].concat());
+        let trailers = prewire_emit(p, token, 0, &[], true, EMIT_TRAILERS, &mut l);
+        assert_ne!(trailers.outcome, Outcome::Ready);
+        assert!(trailers.wire.is_empty());
+        let body = prewire_emit(p, token, 0, b"forbidden", true, 0, &mut l);
+        assert_ne!(body.outcome, Outcome::Ready);
+        assert!(body.wire.is_empty());
+        finish(p, token, &mut l);
+        shut(p);
+    }
+}
+
+#[test]
+fn prewire_bodyless_no_content_rejects_framing_headers_before_output() {
+    for fields in [
+        &b"content-length: 0\r\n"[..],
+        &b"content-length: 5\r\n"[..],
+        &b"transfer-encoding: chunked\r\n"[..],
+    ] {
+        let (p, token, _) = staged();
+        let mut l = Lend::roomy();
+        let head = prewire_emit(p, token, 204, fields, true, 0, &mut l);
+        assert_ne!(head.outcome, Outcome::Ready);
+        assert!(head.wire.is_empty());
+        finish(p, token, &mut l);
+        shut(p);
+    }
+}
+
+#[test]
+fn prewire_bodyless_prehead_no_content_refusal_omits_framing_fields() {
+    let (p, token, _) = staged();
+    let mut l = Lend::roomy();
+    let answer = prewire_refuse(p, token, 204, &[], false, &mut l);
+    assert_eq!(answer.outcome, Outcome::Ready);
+    assert_eq!(answer.wire, b"HTTP/1.1 204 No Content\r\n\r\n");
+    assert_ne!(answer.flags & YIELD_ENDED, 0);
+    finish(p, token, &mut l);
+    shut(p);
+    let (p, token, _) = staged();
+    let invalid = prewire_refuse(p, token, 204, b"forbidden", false, &mut l);
+    assert_ne!(invalid.outcome, Outcome::Ready);
+    assert!(invalid.wire.is_empty());
+    finish(p, token, &mut l);
+    shut(p);
+}
