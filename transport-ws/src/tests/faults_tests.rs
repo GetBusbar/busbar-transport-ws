@@ -2,13 +2,6 @@
 // Copyright (C) 2026 Busbar Inc and contributors
 
 //! THE TRANSPORT'S FAULT EDGES, one binary so one run judges them all:
-//!
-//! - the claims the door's Statement admits, held to the transport's own declaration;
-//! - the framer's own face: where a target is and what a dial asks for, how a carrier that ends
-//!   without a closing handshake ends the stream, and that one framing's failure is its alone;
-//! - the door's per-message allocations (THE DESIGN §11.2, "no allocation ... on the hot path"): a
-//!   framing in steady state, one message in and one out per call, adds no allocation beyond the
-//!   door crossing itself and what the protocol library allocates for the message.
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
@@ -37,8 +30,6 @@ use tungstenite::protocol::Role;
 use tungstenite::{Bytes, Message, WebSocket};
 
 const UPGRADE: &[u8] = b"GET /echo HTTP/1.1\r\nHost: svc.test\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n";
-
-// ── the claims ───────────────────────────────────────────────────────────────────────────────────
 
 fn text(s: &AbiStr) -> &'static [u8] {
     if s.len == 0 {
@@ -71,8 +62,7 @@ fn ws_claims_ws_and_wss() {
 }
 
 /// RED (audit: the admitted claim row contradicts the transport's own declaration): every row the
-/// Statement admits states exactly what `meta.rs` declares (THE DESIGN §2, "Each fact is
-/// declared once; anything derivable is derived").
+
 #[test]
 fn every_claim_row_states_the_declaration() {
     const N: usize = meta::SELECTOR_FORMS.len();
@@ -113,8 +103,6 @@ fn every_claim_row_states_the_declaration() {
         );
     }
 }
-
-// ── the framer's face ───────────────────────────────────────────────────────────────────────────
 
 /// What one framer call said.
 #[derive(Default)]
@@ -167,7 +155,7 @@ fn opening(target: &str) -> String {
 }
 
 /// RED (audit: an IPv6-literal target cannot be dialled): `locate` answers the connector an
-/// authority it can read, the IPv6 literal in its brackets (RFC 3986 section 3.2.2).
+
 #[test]
 fn an_ipv6_literal_target_locates_bracketed() {
     let f = WsFramer::new(0);
@@ -183,7 +171,7 @@ fn an_ipv6_literal_target_locates_bracketed() {
 }
 
 /// RED (audit: an IPv6-literal target cannot be dialled): a dial to an IPv6 literal opens, and
-/// its upgrade request names the bracketed host.
+
 #[test]
 fn an_ipv6_literal_target_dials() {
     let request = opening("ws://[::1]:8080/x");
@@ -192,7 +180,7 @@ fn an_ipv6_literal_target_dials() {
 }
 
 /// RED (audit: every dial's Host field gains the default port): the upgrade request's `Host` is
-/// the target's authority as written, a port only where the target spelled one.
+
 #[test]
 fn a_dial_sends_the_host_as_the_target_writes_it() {
     let request = opening("wss://api.example/v1/realtime?model=m");
@@ -206,11 +194,7 @@ fn a_dial_sends_the_host_as_the_target_writes_it() {
 }
 
 /// RED (audit: an abrupt disconnect is reported as a framing failure): a carrier that ends with
-/// no closing handshake (a dropped connection) ends the stream, after every message that arrived
-/// before it, and the op itself succeeds. RED (codeaudit e916fda WS-6; RFC 6455 sections 7.1.4,
-/// 7.1.5: no Close frame is close code 1006, the connection NOT closed cleanly): the stream ends
-/// FAILED, never whole, so the layer above can tell a cut stream from a finished one, mid-message
-/// or not. RED before that fix: it ended whole, like a completed close.
+
 #[test]
 fn a_carrier_end_without_a_close_ends_the_stream_failed() {
     const WHY: &str = "the carrier ended with no WebSocket closing handshake";
@@ -237,7 +221,6 @@ fn a_carrier_end_without_a_close_ends_the_stream_failed() {
     assert!(out.ended);
     assert_eq!(f.failure(s), Some(WHY));
 
-    // Mid-message: the first fragment of a message arrived, then the carrier ended.
     let s = accepted(&f);
     let mut out = Out::default();
     let r = f.ingest(s, &[0x02, 0x82, 0, 0, 0, 0, b'h', b'i'], true, &mut out);
@@ -250,7 +233,7 @@ fn a_carrier_end_without_a_close_ends_the_stream_failed() {
 }
 
 /// RED (audit: one panic poisons every connection of the instance): a panic while one framing
-/// works fails that framing alone; every other framing of the instance carries on.
+
 #[test]
 fn a_panic_in_one_framing_leaves_the_others_working() {
     let f = WsFramer::new(0);
@@ -288,12 +271,8 @@ fn a_panic_in_one_framing_leaves_the_others_working() {
     assert!(matches!(later, Ok(Ok(()))), "and writes");
 }
 
-// ── the allocations ──────────────────────────────────────────────────────────────────────────────
-
 /// Counts every allocation (and reallocation) the CURRENT thread makes while its count is on, so
-/// the tests of this binary running side by side never count each other. It also WATCHES one
-/// block the current thread frees ([`watch_free`]): whether a secret was still in it when it went
-/// back, so a test can see a wipe of memory it can no longer read.
+
 struct Counting;
 
 /// An allocation's base, its greatest known initialized prefix, and its secret marker.
@@ -335,8 +314,7 @@ thread_local! {
 }
 
 /// Watch a live allocation's base and a prefix known to have been initialized, even if its Vec
-/// was subsequently cleared. Register its largest initialized extent, never its capacity. A
-/// repeated registration before free preserves the greater old extent after a shorter reuse.
+
 pub(crate) fn watch_free(ptr: *const u8, len: usize, secret: &'static [u8]) {
     assert!(!ptr.is_null() && len >= secret.len());
     assert!((1..=SECRET_MAX).contains(&secret.len()));
@@ -360,7 +338,7 @@ pub(crate) fn watch_free(ptr: *const u8, len: usize, secret: &'static [u8]) {
 }
 
 /// Require the actual free on every platform and a complete Linux byte observation. Other
-/// platforms have a free/lifecycle receipt only, matching the secret/WebRTC observer boundary.
+
 pub(crate) fn assert_freed_wiped() {
     let observed = WATCHED.with(Cell::get);
     assert!(
@@ -436,7 +414,7 @@ fn observe((address, len, secret): Watch, allocation_size: usize) -> Observation
 }
 
 /// The kernel copies only the registered initialized prefix into initialized stack storage,
-/// before the allocator releases it. No Rust reference is formed to source memory or spare bytes.
+
 fn inspect(ptr: *mut u8, allocation_size: usize) {
     let _ = WATCH.try_with(|w| {
         let Some(watch) = w.get().filter(|(at, _, _)| *at == ptr as usize) else {
@@ -536,7 +514,7 @@ fn z<T>() -> T {
 }
 
 /// The door's own slots, entered as its trampoline enters them but outside it: the count is the
-/// door's and the framer's logic, not the crossing's log capture (whose cost is the SDK's).
+
 struct Host {
     inst: *mut c_void,
     wire: Vec<u8>,
@@ -689,11 +667,9 @@ impl Write for Socket {
 }
 
 /// RED (audit: several copies and allocations per message on the hot path): a framing in steady
-/// state allocates, per message in and per message out, no more than the bare door crossing plus
-/// what the protocol library allocates for that message.
+
 #[test]
 fn a_steady_framing_adds_no_allocation_of_its_own_per_message() {
-    // What the protocol library allocates, alone, to read one such message and to send one.
     let mut ws = WebSocket::from_raw_socket(Socket::default(), Role::Server, None);
     let frame = text_frame();
     let library_in = per_call(&mut ws, &mut |ws| {
@@ -710,7 +686,7 @@ fn a_steady_framing_adds_no_allocation_of_its_own_per_message() {
     });
 
     let mut host = Host::accepted();
-    // The door crossing itself: an ingest that carries nothing.
+
     let crossing = per_call(&mut host, &mut |h| {
         let o = h.ingest(&[]);
         assert_eq!(o.yielded.pieces_len, 0);
@@ -740,9 +716,7 @@ fn a_steady_framing_adds_no_allocation_of_its_own_per_message() {
 }
 
 /// A DRIBBLED UPGRADE ANSWER COSTS NO COPY PER CALL (codeaudit e916fda WS-4): while a dial's
-/// answer head arrives a little per call, the framer reads what the handshake has seen in place;
-/// it copies none of it until the head is whole. RED before the fix: every call cloned everything
-/// seen so far (one allocation per call, quadratic bytes under a dribbling far end).
+
 #[test]
 fn a_dribbled_answer_head_is_not_copied_per_call() {
     let f = WsFramer::new(0);
@@ -766,9 +740,7 @@ fn a_dribbled_answer_head_is_not_copied_per_call() {
 }
 
 /// AN EMIT AFTER THE PEER'S CLOSE FINDS THE CONNECTION CLOSED (codeaudit e916fda WS-13): on a
-/// dialled connection the far end's Close leaves the machine closing, not terminated, and it
-/// refuses a send then (`SendAfterClosing`): the connection closed cleanly, never reset, as an
-/// accepted end (terminated at once) already answers. RED before the fix: it answered `Reset`.
+
 #[test]
 fn an_emit_after_the_peers_close_finds_the_connection_closed() {
     use busbar_contract::transport::wire::TransportError;
@@ -789,7 +761,7 @@ fn an_emit_after_the_peers_close_finds_the_connection_closed() {
     );
     f.ingest(s, answer.as_bytes(), false, &mut out)
         .expect("the upgrade completes");
-    // The far end's (unmasked) Close, 1000.
+
     let mut closed = Out::default();
     f.ingest(s, &[0x88, 0x02, 0x03, 0xe8], false, &mut closed)
         .expect("the far end closes");
@@ -806,8 +778,7 @@ fn an_emit_after_the_peers_close_finds_the_connection_closed() {
 }
 
 /// THE PIPE THAT WROTE A DIAL'S UPGRADE REQUEST IS WIPED ONCE IT IS HANDED OUT (codeaudit e916fda
-/// tests LOW, PL10): the request carries the auth's credential line, and the pipe's write buffer
-/// that held it goes back to the allocator with no copy of it.
+
 #[test]
 fn the_pipe_that_wrote_the_upgrade_request_is_freed_and_wiped_on_linux() {
     const SECRET: &[u8] = b"Bearer sk-start-secret";
@@ -823,8 +794,7 @@ fn the_pipe_that_wrote_the_upgrade_request_is_freed_and_wiped_on_linux() {
         .expect("the dial opens");
     assert!(out.wire.windows(SECRET.len()).any(|w| w == SECRET), "sent");
     let (ptr, cap) = f.outbound_block(s).expect("a pipe");
-    // drain sent this exact initialized prefix before clearing the pipe's Vec. Keeping the
-    // sent byte count observes old secret bytes even though the current Vec length is zero.
+
     let initialized = out.wire.len();
     assert!(
         cap >= initialized,
@@ -861,8 +831,7 @@ fn an_unwiped_old_secret_is_detected_after_clear_and_a_shorter_initialized_reuse
     payload.clear();
     payload.extend_from_slice(&[0; 32]);
     watch_free(payload.as_ptr(), payload.len(), SECRET);
-    // The source read stays bounded to the previously initialized 8193 bytes, including the
-    // marker crossing a read-chunk boundary; never the never-initialized spare capacity.
+
     drop(payload);
     assert_eq!(WATCHED.with(Cell::get), Some(Observation::Unwiped));
 }

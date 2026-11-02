@@ -2,22 +2,6 @@
 // Copyright (C) 2026 Busbar Inc and contributors
 
 //! The WebSocket transport: duplex message frames over an HTTP upgrade.
-//!
-//! This crate carries exactly the byte-level behaviour the architecture's ws row names: the
-//! session opens at the upgrade (`Unit0Trigger::Upgrade`), frames after the upgrade carry no
-//! status, and text/binary WS messages are the frame unit. Dialled HTTP upgrade response heads
-//! carry their status separately. It carries
-//! no protocol meaning — no verbs, no ids, no JSON. That belongs to whichever plane rides this
-//! transport.
-//!
-//! ## One entry: the door
-//!
-//! The crate's one entry is its memory-ABI door (`door::door`), the same table compiled in (a busbar
-//! build's `transport-door` row) and dropped in (the sibling `busbar-transport-ws-plugin` cdylib).
-//! There is no in-process `Transport`: the host's connector owns the socket and connection
-//! security, and frames a ws connection with this door, whether it is accepted on the data
-//! listener's upgrade or dialled over the carrier the connector chooses. No transport encrypts:
-//! TLS is core's connection security, applied host-side and never composed as a layer.
 
 #![deny(unsafe_code)]
 #![deny(missing_docs)]
@@ -29,8 +13,7 @@ mod meta;
 mod transport;
 
 /// The transport axis entry the composition root folds for this wire — its key, the layers it
-/// declares, and its door, which the root builds the wire from (the `transport-door` axis) and
-/// opens on the one connector (the `connector-door` axis).
+
 pub mod linked {
     pub use crate::door::{door, MACRO_DOOR};
 
@@ -50,9 +33,6 @@ mod framer_tests;
 #[path = "tests/utf8_fail_fast_tests.rs"]
 mod utf8_fail_fast_tests;
 
-// The fault edges, with the counting allocator their per-message witness reads (a thread-local
-// count, so the other tests of this binary do not move it). A unit module, so the framer stays
-// the crate's own (its one public entry is its door).
 #[cfg(test)]
 #[allow(unsafe_code)]
 #[path = "tests/faults_tests.rs"]

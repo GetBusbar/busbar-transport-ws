@@ -237,8 +237,7 @@ fn forbidden_peer_close_codes_fail_but_a_real_protocol_close_remains_clean() {
                 (framer, state, opening)
             };
             let mut payload = u16::to_be_bytes(code).to_vec();
-            // This text is also what the library synthesizes for a forbidden code. A valid 1002
-            // with that reason must not be guessed to be an invalid peer code.
+
             payload.extend_from_slice(b"Protocol violation");
             let mut wire = opening;
             wire.extend(frame(1, b"kept", masked));

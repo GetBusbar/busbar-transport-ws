@@ -2,18 +2,11 @@
 // Copyright (C) 2026 Busbar Inc and contributors
 
 //! The claim shapes this transport declares.
-//!
-//! A transport's claim is a SELECTOR FORM: the shape of question a plane may ask of arriving bytes
-//! on this wire. It is a declaration and nothing else — data read once at registration — which is
-//! why it lives beside `meta.rs` rather than inside the connection code that never reads it.
 
 use busbar_contract::grammar::SelectorForm;
 
 /// The forms an INGRESS claim over this wire may take.
-///
-/// A ws session opens on an HTTP upgrade request, so an ingress claim over this wire selects on
-/// that request's shape: its path, its fields, and the connection it arrived on. The door renders
-/// its claim rows from this list through the aliases in `crate::meta`.
+
 pub(crate) const SELECTOR_FORMS: &[SelectorForm] = &[
     SelectorForm::ExactPath,
     SelectorForm::PrefixOneLevel,

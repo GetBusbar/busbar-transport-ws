@@ -118,8 +118,6 @@ impl Admission {
             _reserved: 0,
         };
         let (unit, cause, line) = if let Some(line) = matched {
-            // This framer advertises no auth points. An authenticated HTTP upgrade is admitted
-            // by its accepting HTTP framer and reaches this door with session.adopted instead.
             if line.points != 0 {
                 return Err(Refusal::refused(
                     "ingest: ws offers no inbound authentication points",
@@ -190,7 +188,7 @@ pub(super) fn ingest(
         if admission.ticket.is_none() {
             admission.append(input.bytes());
         }
-        // Tungstenite bounds its handshake at 64 KiB. Do not grow an incomplete head beyond it.
+
         let parsed = Request::try_parse(&admission.opening)
             .map_err(|_| Refusal::failed("ingest: the upgrade request is invalid"))?;
         let Some((head_len, request)) = parsed else {

@@ -2,27 +2,27 @@
 // Copyright (C) 2026 Busbar Inc and contributors
 
 //! THE CONTROL PEER: a strict RFC 6455 echo server on the standard library alone, so the control
-//! leg proves the harness grades a correct peer green BEFORE any busbar verdict is believed.
-//!
-//! INDEPENDENT OF THE SUBJECT. busbar's ws framer is tungstenite's frame codec
-//! (`qa/construction.toml`, `busbar-transport-ws`); this peer links no busbar crate and no
-//! WebSocket library, so a defect the two share cannot grade itself green. Neither third-party
-//! peer tried before was strict: the npm `ws` package is NON-STRICT on 6.4.1-6.4.4 and FAILED on
-//! 9.3.x/9.4.x, and Autobahn's own echoserver is NON-STRICT on 3.2, 3.3, 4.1.3, 4.1.4, 4.2.3,
-//! 4.2.4 and 5.15. This one is written to the suite's strict grades:
-//!
-//! * every frame is handled in order, and an echo is written before the next frame is read, so a
-//!   good message ahead of a bad frame is answered before the connection fails (3.2, 4.x, 5.15);
-//! * text is UTF-8 checked byte by byte AS IT ARRIVES, inside a frame and across fragments, so an
-//!   invalid sequence fails the connection before the rest of the message is sent (6.4.x);
-//! * a failure sends its close code (1002 protocol, 1007 bad UTF-8), half-closes, and drains, so
-//!   nothing it already wrote is lost to a reset.
-//!
-//! It claims what the suite claims, RFC 6455 alone: no permessage-deflate (Autobahn scores
-//! groups 12/13 UNIMPLEMENTED, as for busbar), no message size ceiling (the 9.x cases send up to
-//! 16 MiB), and no pings of its own.
-//!
-//! Prints `REFERENCE_PORT=<port>` on its own line once bound, then serves until killed.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{Shutdown, TcpListener, TcpStream};
@@ -39,7 +39,7 @@ const INVALID_PAYLOAD: u16 = 1007;
 const MAX_HEAD: usize = 16 * 1024;
 
 fn main() {
-    // The accept computation is proven on RFC 6455's own sample before any socket is opened.
+
     assert_eq!(
         accept_key("dGhlIHNhbXBsZSBub25jZQ=="),
         "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=",
@@ -88,7 +88,7 @@ fn serve(stream: TcpStream) {
 }
 
 /// Read the request head and return its `Sec-WebSocket-Key`, or `None` for anything that is not
-/// a version-13 upgrade.
+
 fn read_handshake(reader: &mut impl BufRead) -> Option<String> {
     let mut key = None;
     let mut version_ok = false;
@@ -220,7 +220,7 @@ impl Session {
             };
         }
 
-        // A data frame: a continuation needs an open message, a new message needs none open.
+
         let text = match (opcode, self.open) {
             (0x0, Some(text)) => text,
             (0x0, None) | (_, Some(_)) => return Ok(Some(End::Fail(PROTOCOL_ERROR))),
@@ -233,8 +233,8 @@ impl Session {
             }
         };
 
-        // The payload, taken as it arrives: text is checked chunk by chunk, so an invalid
-        // sequence fails the connection before the rest of the frame is sent.
+
+
         let mut left = len;
         let mut offset = 0usize;
         while left > 0 {
@@ -290,13 +290,13 @@ impl Session {
 }
 
 /// Codes a peer may send in a close frame (RFC 6455 section 7.4, the IANA registry): the defined
-/// codes that are not reserved for local use, and the registered and private ranges.
+
 fn close_code_valid(code: u16) -> bool {
     matches!(code, 1000..=1003 | 1007..=1014 | 3000..=4999)
 }
 
 /// Write the failure's close if there is one, then half-close and drain, so the peer reads
-/// everything written before the socket goes (a close with unread input would reset it).
+
 fn finish(reader: &mut impl Read, writer: &mut TcpStream, end: End) {
     if let End::Fail(code) = end {
         let _ = write_frame(writer, 0x8, &code.to_be_bytes());
@@ -542,7 +542,7 @@ mod tests {
 
     #[test]
     fn utf8_fails_at_the_first_impossible_byte() {
-        // Valid text, split anywhere, is accepted and completes.
+
         let text = "κόσμε\u{10FFFF}".as_bytes();
         for cut in 0..text.len() {
             let mut v = Utf8::default();
@@ -551,12 +551,12 @@ mod tests {
                 "cut {cut}"
             );
         }
-        // A surrogate, an overlong and a code point past U+10FFFF fail on their second byte.
+
         for bad in [[0xED, 0xA0], [0xE0, 0x80], [0xF4, 0x90], [0xC0, 0x80]] {
             let mut v = Utf8::default();
             assert!(!v.feed(&bad), "{bad:02x?}");
         }
-        // A truncated sequence is not complete.
+
         let mut v = Utf8::default();
         assert!(v.feed(&[0xE2, 0x82]) && !v.complete());
     }
@@ -592,9 +592,9 @@ mod tests {
 
     #[test]
     fn a_good_message_ahead_of_a_bad_frame_is_answered_before_the_failure() {
-        // RSV2 set; a reserved data opcode; a reserved control opcode; a continuation with
-        // nothing open; a fragmented ping; a ping over 125 bytes; a one-byte close; a reserved
-        // close code.
+
+
+
         for bad in [
             client_frame(0xA1, b"x"),
             client_frame(0x85, b"x"),
@@ -615,14 +615,14 @@ mod tests {
 
     #[test]
     fn invalid_text_fails_1007_before_the_rest_of_the_frame_arrives() {
-        // The frame claims 100 bytes but only its invalid start is sent: the check must fail on
-        // what arrived, not wait for the rest.
+
+
         let mut f = client_frame(0x81, &[0xCE, 0xBA, 0xED, 0xA0, 0x80]);
         f[1] = 0x80 | 100;
         let (out, end) = session(&f);
         assert!(out.is_empty());
         assert_eq!(end, End::Fail(INVALID_PAYLOAD));
-        // A text message that ends inside a character is 1007 too, and so is a bad close reason.
+
         assert_eq!(
             session(&client_frame(0x81, &[0xE2, 0x82])).1,
             End::Fail(INVALID_PAYLOAD)

@@ -2,10 +2,6 @@
 // Copyright (C) 2026 Busbar Inc and contributors
 
 //! A TEXT MESSAGE THAT TURNS INVALID UTF-8 FAILS THE CONNECTION AT THE BAD BYTE (RFC 6455 section
-//! 8.1; Autobahn 6.4.3 and 6.4.4, graded NON-STRICT when the failure waits for the message or the
-//! frame to complete): across fragments and inside one frame, the frames end failed (close 1007) on
-//! the ingest that carries the first definitely-invalid byte, while a code point split validly
-//! across fragments or chops is still accepted.
 
 use busbar_contract::transport::wire::CloseReason;
 
@@ -77,7 +73,7 @@ fn close_code(framer: &WsFramer, state: u64) -> Option<u16> {
 }
 
 /// Ingest `chops` in order; each must leave the connection alive except the last, which must end
-/// it with 1007 and hand up no frame.
+
 fn fails_at_last(chops: &[Vec<u8>]) {
     let framer = WsFramer::new(0);
     let state = open(&framer);
@@ -97,7 +93,7 @@ fn fails_at_last(chops: &[Vec<u8>]) {
 }
 
 /// RED before the fix: the failure waited for the whole message (Autobahn 6.4.3/6.4.4's
-/// fragmented forms), though the second fragment, not yet final, carries an invalid sequence.
+
 #[test]
 fn an_invalid_byte_in_a_non_final_fragment_fails_before_the_message_ends() {
     fails_at_last(&[
@@ -107,7 +103,7 @@ fn an_invalid_byte_in_a_non_final_fragment_fails_before_the_message_ends() {
 }
 
 /// RED before the fix: the sequence is begun in one fragment and its next byte, in the following
-/// fragment, is not a continuation byte.
+
 #[test]
 fn an_invalid_continuation_across_fragments_fails_at_that_byte() {
     fails_at_last(&[
@@ -117,7 +113,7 @@ fn an_invalid_continuation_across_fragments_fails_at_that_byte() {
 }
 
 /// RED before the fix: one frame, its payload in chops (6.4.3, 6.4.4), fails at the chop that
-/// holds the bad byte, not at the frame's end. F4 90 is invalid at the second byte.
+
 #[test]
 fn an_invalid_byte_inside_one_frame_fails_at_its_chop() {
     let mut payload = "κόσμε".as_bytes().to_vec();
@@ -126,7 +122,7 @@ fn an_invalid_byte_inside_one_frame_fails_at_its_chop() {
     let frame = client(true, TEXT, &payload);
     let head = frame.len() - payload.len();
     let good = head + "κόσμε".len();
-    // 6.4.3: the chop holding the whole bad sequence; 6.4.4: split inside it.
+
     fails_at_last(&[frame[..good].to_vec(), frame[good..good + 4].to_vec()]);
     fails_at_last(&[
         frame[..good].to_vec(),
@@ -136,7 +132,7 @@ fn an_invalid_byte_inside_one_frame_fails_at_its_chop() {
 }
 
 /// A code point split across fragments, and a masked frame header split from its payload, are
-/// valid: nothing fails and the whole message arrives at its end.
+
 #[test]
 fn a_code_point_split_across_fragments_is_still_accepted() {
     let framer = WsFramer::new(0);
@@ -162,7 +158,7 @@ fn a_code_point_split_across_fragments_is_still_accepted() {
 }
 
 /// Control payloads are octets even while a text code point is unfinished. Splitting each
-/// extended-length and mask byte must leave that text state intact as well.
+
 #[test]
 fn split_extended_headers_and_interleaved_controls_preserve_text_state() {
     for len in [126, 65_536] {
@@ -218,17 +214,13 @@ fn interleaved_controls_do_not_reset_an_unfinished_text_code_point() {
 }
 
 /// THE SCAN STARTS ONLY WHERE THE HANDSHAKE ENDED (codeaudit e916fda WS-1): on a dial, the call that
-/// completes the upgrade may carry the start of the far end's first frame, and when that frame's
-/// payload so far ends in CRLFCRLF the call ends with CRLFCRLF though the session is mid-frame. The
-/// rest of the frame is payload, never a frame header, so a valid binary message whose bytes read
-/// like a text header and invalid UTF-8 is handed up whole and the connection lives. RED before the
-/// fix: the scan armed mid-frame, read `81 05` as a text frame and failed the connection with 1007.
+
 #[test]
 fn a_handshake_call_ending_mid_frame_in_crlfcrlf_does_not_arm_the_scan() {
     let mut payload = b"GET / HTTP/1.1\r\nHost: x\r\n\r\n".to_vec();
     let split = payload.len();
     payload.extend_from_slice(&[0x81, 0x05, 0xff, 0xfe, 0xfd, 0xfc, 0xfb]);
-    // The far end's (unmasked) binary frame.
+
     let mut frame = vec![0x82, payload.len() as u8];
     frame.extend_from_slice(&payload);
     let at = 2 + split;
@@ -265,9 +257,7 @@ fn a_handshake_call_ending_mid_frame_in_crlfcrlf_does_not_arm_the_scan() {
 }
 
 /// NOTHING AFTER A CLOSE IS DATA (codeaudit e916fda WS-2; RFC 6455 section 5.5.1): bytes that
-/// follow the peer's Close in the same call are not judged, so a completed closing handshake ends
-/// the stream cleanly whatever trails it. RED before the fix: a text frame of invalid UTF-8 after
-/// the Close turned the clean close into a failed stream.
+
 #[test]
 fn bytes_after_the_peers_close_are_not_judged() {
     let framer = WsFramer::new(0);
@@ -281,9 +271,7 @@ fn bytes_after_the_peers_close_are_not_judged() {
 }
 
 /// A FRAME WHOSE HEADER BREAKS THE PROTOCOL IS THE LIBRARY'S TO FAIL (codeaudit e916fda WS-3; RFC
-/// 6455 sections 5.1, 5.2): an accepted end's frame that is not masked, or one with a reserved bit
-/// and no extension, fails with 1002 when it completes, however invalid the text it carries. RED
-/// before the fix: the scan judged its first payload byte and failed the connection with 1007.
+
 #[test]
 fn a_frame_that_breaks_the_protocol_is_not_judged_as_text() {
     let unmasked = vec![0x81, 0x05, 0xff, 0xfe, 0xfd, 0xfc, 0xfb];
@@ -314,11 +302,7 @@ fn a_frame_that_breaks_the_protocol_is_not_judged_as_text() {
 }
 
 /// AN ACCEPTED SESSION'S SCAN STARTS ONLY WHERE NOTHING FOLLOWED THE REQUEST (codeaudit e916fda WS-1,
-/// review): the handshake reads the request in 4096-byte chunks, so a request ending exactly on a
-/// chunk's end leaves the frame bytes that came with it unread in the pipe, and the machine refuses
-/// nothing. The library reads them as the session opens; the scan never saw them, so it must not
-/// start there. RED before the fix: the scan armed, read the rest of a valid binary frame as a text
-/// frame and failed the connection with 1007.
+
 #[test]
 fn an_accepted_call_with_frame_bytes_after_a_chunk_sized_request_does_not_arm_the_scan() {
     let head = b"GET /echo HTTP/1.1\r\nHost: svc.test\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\nX-Pad: ";
@@ -326,8 +310,7 @@ fn an_accepted_call_with_frame_bytes_after_a_chunk_sized_request_does_not_arm_th
     request.resize(4096 - 4, b'p');
     request.extend_from_slice(b"\r\n\r\n");
     assert_eq!(request.len(), 4096);
-    // A valid masked binary frame (all-zero key), its payload bytes reading like a text header and
-    // invalid UTF-8.
+
     let payload = [0xaa, 0xbb, 0x81, 0x82, 0, 0, 0, 0, 0xff, 0xff];
     let mut frame = vec![0x82, 0x80 | payload.len() as u8, 0, 0, 0, 0];
     frame.extend_from_slice(&payload);
@@ -349,8 +332,7 @@ fn an_accepted_call_with_frame_bytes_after_a_chunk_sized_request_does_not_arm_th
 }
 
 /// THE EARLIER FAULT IS THE ONE STATED (codeaudit e916fda WS-6, review): an invalid text byte and
-/// the carrier's end in the same call fail the connection for the text, which broke first; the end
-/// with no closing handshake came after it. RED before the fix: the end piece blamed the carrier.
+
 #[test]
 fn invalid_text_before_the_carriers_end_is_the_stated_failure() {
     let framer = WsFramer::new(0);
@@ -366,9 +348,7 @@ fn invalid_text_before_the_carriers_end_is_the_stated_failure() {
 }
 
 /// OUT-OF-ORDER FRAMES ARE THE LIBRARY'S TO FAIL TOO (codeaudit e916fda WS-3, review): inside a
-/// text message, a new TEXT frame (the next data frame must continue the message) or a reserved
-/// data opcode breaks the protocol; whatever its payload, the library fails it with 1002 (at its
-/// header, or as it completes), never 1007 from the scan.
+
 #[test]
 fn an_out_of_order_frame_inside_a_text_message_is_not_judged_as_text() {
     for opcode in [TEXT, 0x3] {

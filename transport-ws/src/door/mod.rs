@@ -2,27 +2,6 @@
 // Copyright (C) 2026 Busbar Inc and contributors
 
 //! THE `ws` DOOR: this transport's framer ([`WsFramer`], tungstenite over an in-memory pipe) on the
-//! transport kind's table (`busbar_contract::abi::transport`), compiled in or dropped in through
-//! the one door. Every slot is the SDK's safe surface: the lifecycle is `abi::sdk::life` over
-//! [`Ws`], and each framer op a [`SafeSlot`] over the same state, writing the host's sink through
-//! its lent buffers.
-//!
-//! Each framer op is the framer's own method, answered into the host's sink. What does not fit the
-//! sink waits in the framing's queue and goes out on the `YIELD_MORE` re-call, which carries no new
-//! bytes. A WebSocket connection carries one message stream (stream `0`): each message is a frame,
-//! and when the connection's frames end the stream ends with its `PIECE_END` piece and the answer carries
-//! `YIELD_ENDED`.
-//!
-//! A DIALLED framing hands up informational response field blocks with `PIECE_INTERIM`, then
-//! the validated `101` head (`STATUS_SUCCESS`) or the refused upgrade's final head without that
-//! flag. Each carries `PIECE_FIELDS` and `PIECE_HAS_CODE`, even when no field is left in it;
-//! messages follow the upgrade head. A block the sink cannot hold whole is cut only at a line's
-//! start or inside a value, the rest marked `PIECE_CONTINUED`; every interim part retains its flag.
-//!
-//! The connector owns the socket and connection security; `locate` tells it where a target is and
-//! whether it asks for security (`wss`). Both sides frame: a dialled framing opens with the upgrade
-//! request, an accepted one answers it, and `adopt` takes over a stream another framer detached
-//! with the upgrade request it held.
 
 mod policy;
 
@@ -73,7 +52,7 @@ pub const BODY_MAX_BYTES: &str = "limits.request_body_max_bytes";
 const KEY: &str = meta::KEY;
 
 /// The secured form of the scheme: a `wss` target is a `ws` one whose bytes the connector secures
-/// before they leave (`ws` claims `ws` and `wss`).
+
 pub const SECURE_KEY: &str = "wss";
 
 /// The schemes `ws` claims, by name: the Statement's `claims`, the one place they are stated.
@@ -96,9 +75,7 @@ const EGRESS_SELECTOR_CODES: [u8; crate::claims::EGRESS_SELECTOR_FORMS.len()] =
 const FACTS: [AbiStr; meta::TRANSPORT_FACTS.len()] = strs(meta::TRANSPORT_FACTS);
 
 /// The claim row, rendered from the transport's one declaration (`meta.rs`, `claims.rs`). `ws` and
-/// `wss` are one wire, so both claims carry it. No status numbering and no status leg: frames after
-/// the upgrade carry none. ws opens a unit at the upgrade, and the host reads its upgrade lines off
-/// `unit0_trigger`, never off a layer list.
+
 const ROW: Claim = {
     let mut c = Claim::EMPTY.with_facts(&FACTS);
     c.selector_forms = AbiStr::of_bytes(&SELECTOR_CODES);
@@ -120,11 +97,7 @@ const SETTING_ROWS: [SettingRow; 1] = [SettingRow {
 const SETTINGS: &[SettingDecl] = &setting_decls(&SETTING_ROWS);
 
 /// The op facts are the ops the door serves: the framer begins on the accepting side and on the
-/// dialling side, and adopts a stream another framer detached (`FACT_ACCEPTS`, `FACT_DIALS`,
-/// `FACT_ADOPTS`); it detaches nothing (nothing upgrades out of a WebSocket) and decodes no payload.
-/// The kernel makes the binding's one outbound auth call before `begin`, and the handshake writes
-/// its own lines after it. No transport names another: the carrier is the connector's choice, and
-/// an upgrade reaches this framer by `adopt`, never by composition.
+
 const TAIL: TransportTail = {
     let mut t = TransportTail::EMPTY
         .with_claim_rows(CLAIMS)
@@ -153,34 +126,25 @@ struct Piece {
     stream: u64,
     bytes: Vec<u8>,
     /// The bytes before this offset are handed over already: a piece taken in parts moves nothing
-    /// down, it reads on from here.
     at: usize,
     end_of_frame: bool,
     /// The bytes belong to a text message (`PIECE_TEXT`).
     text: bool,
     /// The stream's end is a FAILURE (`PIECE_STREAM_FAILED`): the far side broke the protocol, sent
-    /// text that is not UTF-8 or a message over the ceiling, sent an upgrade request this end
-    /// refused, or ended a refused upgrade's answer short; the carrier ended with no closing
-    /// handshake; or an op ended the framing's state.
-    /// Only ever the end piece, whose bytes say why; never split.
     failed: bool,
     /// The stream ends WHOLE here (`PIECE_END`): the empty last piece of its frames. An empty
-    /// message (`bytes` empty without it) is a message, never the end.
     end: bool,
     /// The bytes are a response field block (`PIECE_FIELDS`), interim or final.
-    /// Never with `text`, `failed` or `end`.
     fields: bool,
     /// Informational `1xx` other than the upgrade's `101` (`PIECE_INTERIM` on every part).
     interim: bool,
     /// A full sink cut this field block inside a value: `bytes` open by continuing it
-    /// (`PIECE_CONTINUED`).
     continued: bool,
     /// The status the piece states (`PIECE_HAS_CODE`): its number and its class (`STATUS_*`).
     status: Option<(u32, u8)>,
     /// The wait the far end asked for (`PIECE_HAS_RETRY_AFTER`), on a refused upgrade's head.
     retry_after: Option<u64>,
     /// The dialled head's reason phrase, as the far end sent it: stated in the head's slots
-    /// (`HeadSlots::reason`) beside its first piece.
     reason: Option<Vec<u8>>,
 }
 
@@ -250,14 +214,12 @@ fn class_code(class: Option<WireStatusClass>) -> u8 {
 }
 
 /// How much of a field block's `bytes` a sink with `room` may take: all of it when it fits, else
-/// the furthest cut at a line's start or inside a value, so a continued piece always extends a
-/// value (the host refuses any other continuation). `in_value`: the bytes open inside a value.
-/// `0`: no cut fits.
+
 fn field_cut(bytes: &[u8], room: usize, in_value: bool) -> usize {
     if bytes.len() <= room {
         return bytes.len();
     }
-    // 0 = a line's start, 1 = a name, 2 = a value.
+
     let mut at = if in_value { 2 } else { 0 };
     let mut best = 0;
     for (i, &b) in bytes[..room].iter().enumerate() {
@@ -275,9 +237,7 @@ fn field_cut(bytes: &[u8], room: usize, in_value: bool) -> usize {
 }
 
 /// How much of a piece's unhanded `rest` a sink with `room` takes. A field block is cut only where
-/// the host takes a continuation: at a line's start or inside a value. A name longer than the whole
-/// frame buffer (`alone`: nothing else is in the answer) is cut anyway (the host refuses it by
-/// name) rather than never moving.
+
 fn take_of(piece: &Piece, rest: &[u8], room: usize, alone: bool) -> usize {
     if piece.fields {
         match field_cut(rest, room, piece.continued) {
@@ -327,8 +287,7 @@ impl Drop for Owed {
 const SPARE_MAX: usize = 8;
 
 /// The capacity a kept piece buffer holds at most: what one large message grew it past this is
-/// given back, so a framing keeps working-size spares, not its high-water mark (as stdio's
-/// `KEEP_BYTES`). A buffer within it is kept whole, so steady state allocates nothing.
+
 const KEEP_BYTES: usize = 256 * 1024;
 
 impl Owed {
@@ -338,7 +297,7 @@ impl Owed {
     }
 
     /// Owe `bytes` to the far side (`secret`: the framing's opening), never leaving a copy of a
-    /// secret byte behind in a buffer it outgrows.
+
     fn push(&mut self, bytes: &[u8], secret: bool) {
         if self.wire.capacity() - self.wire.len() < bytes.len() {
             let owed = self.wire.len() - self.wire_at;
@@ -358,8 +317,7 @@ impl Owed {
     }
 
     /// Mark the next `n` owed bytes handed to the host, wiping the secret ones in place; once all
-    /// are handed over the buffer empties, and gives back what one large message grew it past
-    /// [`KEEP_BYTES`] (as a kept piece buffer does): a working-size buffer is kept whole.
+
     fn consume(&mut self, n: usize) {
         let end = self.wire_at + n;
         if self.secret > self.wire_at {
@@ -401,8 +359,7 @@ impl Owed {
 type OwedSlot = Arc<Mutex<Owed>>;
 
 /// THE INSTANCE: the framer and what each framing owes. The map's lock is held only to find, add
-/// or remove one framing's queue, never across an op, so framings run side by side and a panic in
-/// one fails that one alone.
+
 pub struct Ws {
     framer: WsFramer,
     owed: Mutex<HashMap<u64, OwedSlot>>,
@@ -420,10 +377,9 @@ const BAD_BODY_MAX: &str =
     "settings: limits.request_body_max_bytes must be a count of bytes above 0";
 
 /// The settings blob read: a JSON object (empty bytes = `{}`) whose every key is one this transport
-/// declares, its ceiling a count above 0.
+
 fn read_settings(bytes: &[u8]) -> Result<usize, Refusal> {
     let object = settings_reading(bytes, &SETTING_ROWS).map_err(|why| {
-        // Retain this transport's established byte-count diagnostic for the SDK's count rule.
         if why.text() == Some("settings: limits.request_body_max_bytes must be a count above 0") {
             Refusal::failed(BAD_BODY_MAX)
         } else {
@@ -432,8 +388,7 @@ fn read_settings(bytes: &[u8]) -> Result<usize, Refusal> {
     })?;
     match object.get(BODY_MAX_BYTES) {
         None => Ok(DEFAULT_REQUEST_BODY_MAX_BYTES),
-        // `WsFramer::new(0)` means the library's inbound default and NO outbound ceiling: refuse
-        // rather than open without one.
+
         Some(x) => x
             .as_u64()
             .and_then(|n| usize::try_from(n).ok())
@@ -443,8 +398,7 @@ fn read_settings(bytes: &[u8]) -> Result<usize, Refusal> {
 }
 
 /// The lifecycle: `validate`, `open` and `refresh` read the settings; a refresh's ceiling applies
-/// to framings begun after it (each framing keeps the ceiling it began under). No framer op pends,
-/// so a cancel finds nothing in flight and nothing moved.
+
 impl Life for Ws {
     const CANCEL: u32 = CANCEL_NOTHING_MOVED;
 
@@ -493,7 +447,6 @@ impl frame::FramerOut for Collect<'_> {
         self.owed.push(bytes, self.opening);
     }
     fn frame(&mut self, piece: Framed<'_>) {
-        // Only response heads carry status; WebSocket messages never do.
         let head = piece.status_code.is_some();
         let bytes = self.owed.buffer(piece.bytes);
         self.owed.pieces.push_back(Piece {
@@ -512,7 +465,6 @@ impl frame::FramerOut for Collect<'_> {
     }
     fn end(&mut self) {
         if !self.owed.ended {
-            // The one stream's frames are over: its empty last piece, then the connection's end.
             self.owed.pieces.push_back(Piece {
                 end: true,
                 ..Piece::plain(0, Vec::new(), true)
@@ -526,8 +478,7 @@ impl frame::FramerOut for Collect<'_> {
 }
 
 /// A dial's opening head fields (`BeginIn::fields`), owned for the one `begin` call: they may carry
-/// the binding's credential (its `Authorization` line), so every byte of this copy is wiped when it
-/// drops, refused or not.
+
 struct OpeningFields(Vec<(String, Vec<u8>)>);
 
 impl Drop for OpeningFields {
@@ -582,7 +533,7 @@ fn reason_of(code: u32) -> CloseReason {
 }
 
 /// The stubs: a framer is not a carrier, so every carrier op is refused, and nothing upgrades out
-/// of a WebSocket.
+
 mod stubs {
     use super::{
         AcceptIn, AcceptOut, ArrivalIn, ArrivalOut, ConnIn, ConnOut, DialIn, FramerOut, FramingIn,
@@ -620,14 +571,13 @@ macro_rules! op {
 }
 
 /// The protocol an accepting listener offers, and a secured dial too: the opening handshake is a
-/// version-1.1 upgrade.
+
 const OFFER: &[u8] = b"\x08http/1.1";
 
 const SMALL: &str = "locate: a host buffer is too small";
 
 /// A dial with an opening field the upgrade request cannot carry (an invalid name, or a value with a
-/// line break or a control byte): neither the field's value (it may be a credential) nor a
-/// handshake that never ran is named.
+
 const BEGIN_UNCARRIABLE: &str =
     "begin: an opening field is not a valid HTTP field, and the upgrade request cannot carry it";
 
@@ -765,8 +715,7 @@ fn carries_userinfo(target: &str) -> bool {
 }
 
 /// A connection the far side FAILED ends its stream failed, not cleanly: the reader is told
-/// (`PIECE_STREAM_FAILED` on the end piece, whose bytes say why), and the close carries the code.
-/// `ended_before`: the connection had ended before the call that queued these pieces.
+
 fn end_failed(f: &WsFramer, token: u64, owed: &mut Owed, ended_before: bool) {
     if ended_before || !owed.ended {
         return;
@@ -777,7 +726,7 @@ fn end_failed(f: &WsFramer, token: u64, owed: &mut Owed, ended_before: bool) {
     if let Some(last) = owed.pieces.back_mut() {
         if last.end {
             last.failed = true;
-            // A failed stream ends failed, never whole as well, and says why.
+
             last.end = false;
             last.bytes.extend_from_slice(why.as_bytes());
         }
@@ -816,7 +765,7 @@ fn opening(
     match open(&inst.framer, &mut c) {
         Ok(token) => {
             o.set(|x| &x.framing, token);
-            // An adopted connection's leftover may already have been refused.
+
             end_failed(&inst.framer, token, &mut owed, false);
             fill(&mut owed, sink, o);
             inst.queues().insert(token, Arc::new(Mutex::new(owed)));
@@ -856,7 +805,6 @@ fn framing(
         return Outcome::Failed;
     };
     let Ok(mut held) = slot.lock() else {
-        // An op on this framing panicked: it is failed, and it alone.
         o.error(texts.framing_failed);
         return Outcome::Failed;
     };
@@ -877,23 +825,17 @@ fn framing(
     let done = op(&inst.framer, &mut c);
     let owed = &mut *held;
     if let Err(e) = done {
-        // A state gone before the op with bytes still owed, and no new input, is a RE-CALL after
-        // `YIELD_MORE` (a refusal's close removed the state): it drains, whatever the op said, and
-        // the connection is over once it has (`YIELD_ENDED`). An op that carried new input fails
-        // instead (its data is not taken).
         if !alive && !input.fresh && (!owed.wire_owed().is_empty() || !owed.pieces.is_empty()) {
             owed.ended = true;
             fill(owed, sink, o);
             return Outcome::Ready;
         }
-        // The framer still holds the framing, or did not hold it before the op: the op alone
-        // failed, whatever is queued, and the queue stays for the next call.
+
         if inst.framer.holds(token) || !alive {
             o.error((texts.why)(&e));
             return Outcome::Failed;
         }
-        // This op ended the state: what it produced still goes out, then the stream ends failed
-        // (its end piece says why) and the connection with it.
+
         if !owed.ended {
             owed.pieces.push_back(Piece {
                 failed: true,
@@ -1130,12 +1072,7 @@ fn fill(owed: &mut Owed, sink: Lent<'_, FramerSink>, o: &mut Out<'_, FramerOut>)
             break;
         };
         let stream = adopted_stream.unwrap_or(piece.stream);
-        // The head's slots (the dialled side fills `reason`, HTTP/1 as sent) go into the frame
-        // buffer ahead of the head's first piece, and ONLY in the answer that also carries that
-        // piece (the host reads the phrase beside it, and drops one that arrives alone). A piece
-        // that does not fit this answer keeps its phrase for the next; one that goes out with no
-        // room or no slot for the phrase goes without it, and so does a head nothing else shares
-        // the answer with and that no cut fits beside its phrase (else it would wait for ever).
+
         let mut with_reason = piece
             .reason
             .as_ref()
@@ -1146,8 +1083,7 @@ fn fill(owed: &mut Owed, sink: Lent<'_, FramerSink>, o: &mut Out<'_, FramerOut>)
             0
         };
         let mut room = frame_cap - frame_len - reason_len;
-        // A failed end piece is never split (its tail would go out as payload): one that does not
-        // fit waits for the next answer; one that does not fit an empty answer is cut to the room.
+
         if piece.failed && piece.bytes.len() - piece.at > room {
             if frame_len > 0 {
                 break;
@@ -1188,11 +1124,10 @@ fn fill(owed: &mut Owed, sink: Lent<'_, FramerSink>, o: &mut Out<'_, FramerOut>)
             code,
             status_class,
             flags: piece.flags(whole),
-            // No fault table: the breaker reads the status by its class, and the far end's wait
-            // from `retry_after_secs`.
+
             fault: FAULT_NONE,
             retry_after_secs: piece.retry_after.unwrap_or(0),
-            // A websocket head declares no body length: never `PIECE_HAS_DECLARED_LEN`.
+
             declared_len: 0,
         });
         frame_len += take;
@@ -1202,7 +1137,6 @@ fn fill(owed: &mut Owed, sink: Lent<'_, FramerSink>, o: &mut Out<'_, FramerOut>)
                 owed.recycle(done.bytes);
             }
         } else {
-            // The rest of a field block opens mid-line unless what was taken ended one.
             if piece.fields {
                 piece.continued = !rest[..take].ends_with(b"\n");
             }

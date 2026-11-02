@@ -2,20 +2,20 @@
 // Copyright (C) 2026 Busbar Inc and contributors
 
 //! THE AUTOBAHN|TESTSUITE SUBJECT: busbar's `ws` door, framed by the connector's own listener,
-//! echoing on loopback.
-//!
-//! Every inbound socket busbar serves is the connector's (`busbar_core_connector::listen`, the one
-//! listener source since INBOUND-LISTEN H5), framed through a transport door admitted by the one
-//! dispatcher, over the carrier that listens and accepts (the `tcp` door, over the host's I/O). This
-//! binary takes exactly that path for the `ws` door — the door (`busbar_transport_ws::door::door`)
-//! admitted and opened by the root's doors module copied from the selected core checkout,
-//! bound with `Listening::bind` over the carrier, each connection
-//! taken with `poll_accept` — and echoes every message back on the stream it came on. The
-//! fuzzingclient sends each case's frames and grades the echo, the handshake, the pings and the
-//! close the framer answers with, so what Autobahn grades is busbar's own RFC 6455 framer.
-//!
-//! Prints `WS_SUBJECT_PORT=<port>` on its own line once bound, then serves until killed. No plane
-//! and no protocol meaning: a testkit binary, not a build of `busbar`, and no product surface.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 use std::future::poll_fn;
 use std::sync::Arc;
@@ -73,7 +73,7 @@ fn carrier() -> busbar_core_connector::compose::Via {
 }
 
 /// Offer one whole message on `stream`, waiting for the socket to take what the write buffer
-/// cannot hold yet.
+
 async fn send(conn: &mut Connection, stream: u64, bytes: &[u8], text: bool) -> Result<(), Failure> {
     let mut off = 0;
     poll_fn(|cx| loop {
@@ -96,12 +96,12 @@ async fn send(conn: &mut Connection, stream: u64, bytes: &[u8], text: bool) -> R
 /// Echo every message on `conn`, whole, on the stream it came on.
 async fn echo(mut conn: Connection) {
     let mut message: Vec<u8> = Vec::new();
-    // A message keeps the type its first frame carried (text or binary); the echo answers in kind.
+
     let mut text = false;
     while let Ok(Some(piece)) = poll_fn(|cx| conn.poll_piece(cx)).await {
-        // A field block (a head) is the handshake's, not a message; a failed stream's piece is
-        // its reason and the stream's end (`PIECE_END`) is no message either. An EMPTY piece is
-        // an empty message, echoed in kind.
+
+
+
         if piece.fields || piece.failed || piece.ends_stream() {
             continue;
         }
@@ -121,7 +121,7 @@ async fn echo(mut conn: Connection) {
 }
 
 fn main() {
-    // One worker: the connector registers every socket on the calling worker's reactor.
+
     let worker = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()

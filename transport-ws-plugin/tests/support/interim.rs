@@ -170,7 +170,6 @@ fn answer(
     assert!(upgrade.starts_with(b"HTTP/1.1 101") && upgrade.ends_with(b"\r\n\r\n"));
     let mut wire = b"HTTP/1.1 100 Continue\r\nX-First: one\r\n\r\nHTTP/1.1 103 Early Hints\r\nX-Hint: a-long-field-value-that-is-split-by-the-small-sink\r\n\r\n".to_vec();
     if final_code == 101 {
-        // The actual accepted door generated the response for this actual dial's key.
         wire.extend_from_slice(&upgrade[..upgrade.len() - 2]);
         wire.extend_from_slice(b"X-Final: accepted\r\n\r\n");
         wire.extend_from_slice(b"\x81\x02ok");
@@ -245,8 +244,6 @@ fn interim_heads_are_flagged_before_the_final_answer_linked_and_dropped() {
     open(&linked);
     open(&dropped);
     for final_code in [101, 200] {
-        // No reason loan isolates the actual producer flag even on the released validator.
-        // Roomy and recalled reason loans also cover the core repeated-head correlation fix.
         for (bytes, pieces, heads) in [(4096, 8, 0), (4096, 8, 8), (32, 1, 1)] {
             assert_eq!(
                 answer(&linked, final_code, bytes, pieces, heads),

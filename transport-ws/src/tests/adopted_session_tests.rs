@@ -222,8 +222,7 @@ fn an_adopted_head_maps_its_slots_and_piece_to_the_same_external_stream() {
     let p = instance();
     let ext = extensions::encode(&[(EXT_ADOPTED_SESSION, &context(37).encode())]);
     let (_, token) = adopt(p, &ext, UPGRADE, &mut Lend::roomy());
-    // Exercise the output adapter's head path on the adopted queue, independently of whether
-    // the accepting WebSocket protocol itself emits a response head as a decoded frame.
+
     poke(p, move |inst| {
         let slot = inst.queues().get(&token).cloned().unwrap();
         let mut owed = slot.lock().unwrap();

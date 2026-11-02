@@ -2,15 +2,6 @@
 // Copyright (C) 2026 Busbar Inc and contributors
 
 //! **ONE `ws` DOOR, BOTH WAYS IN**: the linked door (`busbar_transport_ws::linked::door`) and this
-//! crate's built cdylib (the same door behind the one `export_door!`), each admitted through the
-//! loader's ONE door validation and driven through the ONE dispatcher's crossing, give the same
-//! Statement and the same answers. A dialling framing's bytes are random by design (the handshake
-//! key, every frame's mask), so the comparison is of what each end HEARD, not of the dialler's wire. Run against the busbar rev this repo pins
-//! (`.busbar-ref`).
-//!
-//! THE RED ARMS, same file: the door asked for as another kind is refused, linked (by the door's
-//! own kind) and dropped in (by the stated kind, before `dlopen`). A missing cdylib PANICS: this
-//! test IS the dropped-in door's proof, and never skips.
 
 use std::mem::zeroed;
 use std::sync::Arc;
@@ -39,7 +30,7 @@ fn z<T>() -> T {
 }
 
 /// This crate's built cdylib (uplifted or under `deps`, newest wins). A missing artifact is a
-/// failure, never a skip: this test IS the dropped-in door's proof.
+
 fn cdylib() -> std::path::PathBuf {
     let exe = std::env::current_exe().expect("the test binary has a path");
     let profile = exe
@@ -236,7 +227,7 @@ impl Host {
 }
 
 /// What the exchange left: the upgrade's first lines, what each end heard, whether the far end's
-/// stream ended (its `PIECE_END` piece) and its connection with `YIELD_ENDED`.
+
 type Script = (bool, bool, Vec<Vec<u8>>, Vec<Vec<u8>>, bool, bool);
 
 /// One exchange through the dispatcher: the upgrade, one message each way, the dialled end's close.
@@ -313,8 +304,6 @@ fn the_door_asked_for_as_another_kind_is_refused_both_ways() {
     }
 }
 
-// THE PUBLISHED SUITE (busbar-plugin-loader's `conformance_suite!`): both legs through the one
-// loader, every step at its pinned crossing count, over `conformance.json`.
 busbar_test_kit::conformance_suite! {
     door: busbar_transport_ws_plugin::linked::door,
     cdylib: "busbar_transport_ws_plugin",

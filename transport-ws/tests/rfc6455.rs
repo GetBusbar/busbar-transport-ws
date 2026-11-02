@@ -2,19 +2,6 @@
 // Copyright (C) 2026 Busbar Inc and contributors
 
 //! THE `ws` DOOR AGAINST RFC 6455, AS AUTOBAHN|TESTSUITE GRADES IT: the accepted end of the door,
-//! driven over the transport kind's table exactly as the connector drives it, with a far end that
-//! writes raw client frames (masked, chopped, broken on purpose) and reads the raw frames the door
-//! answers. Each case is one the Autobahn measure of the door failed (CONFORMANCE-RIGS, 2026-10-02):
-//!
-//! * the message KIND: a text message's pieces state `PIECE_TEXT` and a binary one's do not, and an
-//!   `emit` stating `EMIT_TEXT` goes out as a text message, any other as binary (Autobahn 1.1.x,
-//!   5.x, 6.x, 9.x, 10.1.1: "expected text message, got binary");
-//! * the CLOSE: the peer's close code comes back (RFC 6455 §5.5.1), and 1001 is never this end's
-//!   answer to a peer that left;
-//! * a FAILURE after a message: the message is handed up and answered before the close, and the
-//!   close carries the failure's code (Autobahn 3.2-3.4, 4.1.3-5, 4.2.3-5, 5.15: NON-STRICT/FAILED);
-//! * a text payload that is not UTF-8 fails the connection as the bad bytes arrive, not when the
-//!   frame completes (Autobahn 6.4.3, 6.4.4: NON-STRICT).
 
 use std::ffi::c_void;
 use std::mem::{size_of, zeroed};
@@ -30,8 +17,7 @@ use busbar_contract::abi::transport::{
 };
 
 /// A message's kind as this harness names it: what its pieces state (`PIECE_TEXT` or nothing) and
-/// what an `emit` asks for (`EMIT_TEXT` or nothing). The transport ABI states text and nothing
-/// else; absent is binary (ARCHITECT, C19-TAIL U5).
+
 const UTF8: u8 = 1;
 const OCTETS: u8 = 2;
 
@@ -162,10 +148,8 @@ impl Host {
             open.0.extend_from_slice(b);
             if p.flags & PIECE_END_OF_FRAME != 0 {
                 let (bytes, kind) = self.open.take().expect("a frame");
-                // The stream's end is SAID (`PIECE_END`, or `PIECE_STREAM_FAILED` for a failed
-                // one); an empty piece without it is an empty message, its kind stated.
+
                 if p.flags & (PIECE_END | PIECE_STREAM_FAILED) != 0 {
-                    // A clean end carries no message; a failed one carries its reason.
                     assert_eq!(
                         bytes.is_empty(),
                         p.flags & PIECE_STREAM_FAILED == 0,
@@ -296,7 +280,7 @@ const CLOSE: u8 = 0x8;
 const PING: u8 = 0x9;
 
 /// One client frame: masked (with a key that is not zero, so unmasking is exercised), `rsv` the
-/// three reserved bits.
+
 fn client(fin: bool, rsv: u8, opcode: u8, payload: &[u8]) -> Vec<u8> {
     let mask = [0x37, 0xfa, 0x21, 0x3d];
     let mut f = vec![(u8::from(fin) << 7) | (rsv << 4) | opcode];
@@ -350,8 +334,6 @@ fn close_code(frames: &[(u8, Vec<u8>)]) -> Option<u16> {
         .map(|(_, p)| u16::from_be_bytes([p[0], p[1]]))
 }
 
-// ── 1. THE MESSAGE KIND ──────────────────────────────────────────────────────────────────────────
-
 #[test]
 fn a_text_message_is_handed_up_as_utf8_and_a_binary_one_as_octets() {
     let mut h = Host::new();
@@ -368,7 +350,7 @@ fn a_text_message_is_handed_up_as_utf8_and_a_binary_one_as_octets() {
     );
     let said = h.ingest(f, &client(true, 0, BINARY, &[0xfe, 0xff, 0x00]));
     assert_eq!(said.frames, [(vec![0xfe, 0xff, 0x00], OCTETS)]);
-    // A text message in two fragments is one frame.
+
     let mut two = client(false, 0, TEXT, "frag".as_bytes());
     two.extend(client(true, 0, CONTINUATION, "ment".as_bytes()));
     let said = h.ingest(f, &two);
@@ -376,10 +358,7 @@ fn a_text_message_is_handed_up_as_utf8_and_a_binary_one_as_octets() {
 }
 
 /// RED (Autobahn 1.1.1, 6.1.1, 6.1.2, 9.7.1; the stream-end ruling): an EMPTY text message is
-/// handed up as an empty UTF8 message, an empty binary one as an empty OCTETS message, and three
-/// empty fragments of a text message as one empty text message; none of them ends the stream. On
-/// the parent the empty text message lost its kind (`PIECE_TEXT` only on a piece with bytes), so
-/// it was echoed as binary, and an empty piece read as the stream's end.
+
 #[test]
 fn an_empty_message_keeps_its_kind_and_never_ends_the_stream() {
     let mut h = Host::new();
@@ -426,14 +405,14 @@ fn an_emit_sends_the_kind_it_states_and_binary_when_it_states_none() {
     );
     let (_, said) = h.emit(f, OCTETS, &[1, 2, 3]);
     assert_eq!(server_frames(&said.wire), [(BINARY, vec![1, 2, 3])]);
-    // An empty text message.
+
     let (_, said) = h.emit(f, UTF8, b"");
     assert_eq!(server_frames(&said.wire), [(TEXT, Vec::new())]);
-    // Text that is not UTF-8 is refused, and nothing goes out.
+
     let (r, said) = h.emit(f, UTF8, &[0xce, 0xba, 0xe1, 0xbd]);
     assert_eq!(r, Outcome::Failed, "an EMIT_TEXT emit that is not UTF-8");
     assert!(said.wire.is_empty());
-    // The framing still serves.
+
     let (r, said) = h.emit(f, UTF8, "κόσμε".as_bytes());
     assert_eq!(r, Outcome::Ready);
     assert_eq!(
@@ -442,14 +421,12 @@ fn an_emit_sends_the_kind_it_states_and_binary_when_it_states_none() {
     );
 }
 
-// ── 2. THE CLOSE ─────────────────────────────────────────────────────────────────────────────────
-
 #[test]
 fn a_peer_close_is_answered_with_the_peer_code_after_a_message_exchange() {
     for code in [1000_u16, 1001, 3000, 4999] {
         let mut h = Host::new();
         let f = h.accept();
-        // A binary exchange: the close is the subject here, not the kind.
+
         let said = h.ingest(f, &client(true, 0, BINARY, b"Hello"));
         let (bytes, _) = said.frames[0].clone();
         let (_, echo) = h.emit(f, OCTETS, &bytes);
@@ -484,8 +461,7 @@ fn closing_because_the_peer_left_is_an_orderly_close_never_going_away() {
 }
 
 /// A drain closes with 1012 (Service Restart), as predev does. v1.5.5 had no WebSocket at all (no
-/// ws transport, no tungstenite, no oracle cell), so it sent no drain close code; the baseline is
-/// current predev (ARCHITECT ruling 2026-10-02: match 1.5.5, which here is nothing to match).
+
 #[test]
 fn a_drain_closes_with_1012() {
     let mut h = Host::new();
@@ -495,8 +471,7 @@ fn a_drain_closes_with_1012() {
 }
 
 /// Every reason this end closes for puts its own RFC 6455 code on the wire, a distinct one per
-/// reason a peer can act on, and never a reserved code (1005, 1006, 1015); the in-process transport's
-/// battery pinned the same table, which now has one home, the framer.
+
 #[test]
 fn each_close_reason_puts_its_own_code_on_the_wire() {
     for (reason, code) in [
@@ -520,11 +495,8 @@ fn each_close_reason_puts_its_own_code_on_the_wire() {
     }
 }
 
-// ── 3. A FAILURE AFTER A MESSAGE ─────────────────────────────────────────────────────────────────
-
 /// The far side sends `bytes` (a valid message, then a violation) in ONE chop: the message is
-/// handed up, the frames end, the layer above still answers it, and the close carries `code`.
-/// The messages are binary: the order is the subject here, not the kind.
+
 fn answered_then_failed(case: &str, bytes: &[u8], code: u16) {
     let mut h = Host::new();
     let f = h.accept();
@@ -572,22 +544,22 @@ fn answered_then_failed(case: &str, bytes: &[u8], code: u16) {
 #[test]
 fn a_violation_after_a_message_is_answered_after_the_message() {
     let hello = || client(true, 0, BINARY, b"Hello, world!");
-    // Autobahn 3.2: a frame with a reserved bit set.
+
     let mut b = hello();
     b.extend(client(true, 2, BINARY, b"Hello, world!"));
     b.extend(client(true, 0, PING, b""));
     answered_then_failed("3.2 reserved bit", &b, 1002);
-    // Autobahn 4.1.3: a reserved non-control opcode.
+
     let mut b = hello();
     b.extend(client(true, 0, 5, b""));
     b.extend(client(true, 0, PING, b""));
     answered_then_failed("4.1.3 reserved opcode", &b, 1002);
-    // Autobahn 4.2.3: a reserved control opcode.
+
     let mut b = hello();
     b.extend(client(true, 0, 13, b""));
     b.extend(client(true, 0, PING, b""));
     answered_then_failed("4.2.3 reserved control opcode", &b, 1002);
-    // Autobahn 5.15 (shape): a whole message, then a continuation with nothing to continue.
+
     let mut b = client(false, 0, BINARY, b"Hello, ");
     b.extend(client(true, 0, CONTINUATION, b"world!"));
     b.extend(client(false, 0, CONTINUATION, b"fragment3"));
@@ -599,7 +571,7 @@ fn a_violation_after_a_message_is_answered_after_the_message() {
 fn a_violation_alone_ends_the_frames_and_closes_with_1002() {
     let mut h = Host::new();
     let f = h.accept();
-    // Autobahn 3.1: a text frame with RSV1 set, no extension negotiated.
+
     let (r, said) = h.ingest_answer(f, &client(true, 1 << 2, TEXT, b"Hello, world!"));
     assert_eq!(
         r,
@@ -612,13 +584,8 @@ fn a_violation_alone_ends_the_frames_and_closes_with_1002() {
     assert_eq!(close_code(&server_frames(&closed.wire)), Some(1002));
 }
 
-// ── 4. TEXT THAT IS NOT UTF-8 FAILS THE CONNECTION ───────────────────────────────────────────────
-
 /// Autobahn 6.4.3/6.4.4: one text frame sent in chops, an inner chop making it invalid (F4 90 80
-/// 80 is past U+10FFFF). RFC 6455 section 8.1: the connection fails with 1007 on the chop that
-/// carries the first invalid byte (F4 then 90), not when the frame completes, and no frame of the
-/// bad text is handed up. (The protocol library alone judges a frame only as it completes, so the
-/// framer reads the text payload as it arrives; see `TextScan`.)
+
 #[test]
 fn invalid_utf8_inside_one_frame_fails_the_connection_at_the_bad_byte() {
     let part1 = "κόσμε".as_bytes();
@@ -632,8 +599,7 @@ fn invalid_utf8_inside_one_frame_fails_the_connection_at_the_bad_byte() {
     let (a, rest) = frame.split_at(header + part1.len());
     let (b, c) = rest.split_at(part2.len());
     let (b1, b2) = b.split_at(2);
-    // The chop on which the connection must fail: 6.4.3 holds the whole bad sequence, 6.4.4 splits
-    // it after F4 90, whose second byte is already invalid.
+
     for (case, chops, fails_at) in [
         ("6.4.3", vec![a, b, c], 1),
         ("6.4.4", vec![a, b1, b2, c], 1),
@@ -667,14 +633,14 @@ fn a_code_point_split_across_chops_and_fragments_is_valid() {
     let f = h.accept();
     let text = "Hello-µ@ßöäüàá-UTF-8!!";
     let frame = client(true, 0, TEXT, text.as_bytes());
-    // Every byte its own chop: every multi-byte code point is split.
+
     let mut frames = Vec::new();
     for b in &frame {
         let said = h.ingest(f, std::slice::from_ref(b));
         assert!(!said.ended, "a split code point is no failure");
         frames.extend(said.frames);
     }
-    // And fragments of one octet each.
+
     let bytes = text.as_bytes();
     for (k, b) in bytes.iter().enumerate() {
         let opcode = if k == 0 { TEXT } else { CONTINUATION };
@@ -692,32 +658,11 @@ fn a_code_point_split_across_chops_and_fragments_is_valid() {
     assert_eq!(handed, [bytes, bytes], "both arrive whole");
 }
 
-// ── 5. THE 2026-10-06 MEASURE, ONE CELL PER FAILING CASE ─────────────────────────────────────────
-//
-// Autobahn|Testsuite 0.8.2 against busbar's ws-conformance subject (release build, NON-STRICT
-// counted as failing) failed 13 of 517 cases on 2026-10-06. Each cell below sends the case's own
-// frames, as the subject's socket read them, and grades the door's half of the case the way
-// Autobahn grades the echo.
-//
-// * 1.1.1, 1.2.1, 6.1.1, 6.1.2, 9.7.1, 9.8.1 (FAILED): an EMPTY message. RFC 6455 §5.6 lets a data
-//   frame carry no payload, and an empty text message is valid UTF-8 (§8.1), so the echo owes an
-//   empty message of the same kind. On the door before 0f3af6d an empty piece was the stream's end
-//   and an empty text piece stated no `PIECE_TEXT`: the message was never echoed (or echoed as
-//   binary) and the stream was over. The door now ends the stream with `PIECE_END` only.
-// * 3.2, 3.3, 4.1.3, 4.1.4, 4.2.3, 4.2.4, 5.15 (NON-STRICT): a whole text message, then a
-//   violation, in one read. RFC 6455 §7.1.7 fails the connection AT the violation; the message
-//   before it was valid and is answered first. The door hands the message up and ends the frames
-//   failed in the same answer (as here); the connector refused the echo once the frames had ended,
-//   fixed by busbar #510 (`compose::tests::a_message_handed_up_with_the_frames_end_is_still_answered`).
-//   These cells pin the door's half: the message is handed up as TEXT, the echo is still written,
-//   and the close (1002) comes after it, never before.
-
 /// Autobahn's "small text message" (cases 3.x and 4.x).
 const SMALL: &[u8] = b"Hello, world!";
 
 /// The far side sends `chop` (a whole text message `first`, then a violation) in one read. Strict:
-/// `first` is handed up as text, the frames end FAILED, nothing has closed yet, the echo is still
-/// written as text, and the close with 1002 follows it.
+
 fn strict(case: &str, chop: &[u8], first: &[u8]) {
     let mut h = Host::new();
     let f = h.accept();
@@ -804,8 +749,7 @@ fn autobahn_5_15_a_continuation_with_nothing_to_continue_after_a_fragmented_mess
 }
 
 /// The far side sends `frames` (one empty message of `kind`, `rounds` times over, each after the
-/// echo of the one before, as Autobahn waits for it): each is handed up as an empty message of
-/// its kind, never as the stream's end, and its echo is an empty message of the same opcode.
+
 fn empty_echoed(case: &str, frames: &[u8], kind: u8, rounds: usize) {
     let opcode = if kind == UTF8 { TEXT } else { BINARY };
     let mut h = Host::new();
@@ -872,12 +816,10 @@ fn autobahn_9_8_1_a_thousand_empty_binary_messages() {
     empty_echoed("9.8.1", &client(true, 0, BINARY, b""), OCTETS, 1000);
 }
 
-// ── 5. A PING IS ANSWERED, AND THE DEPLOYMENT'S CEILING BOUNDS A MESSAGE ─────────────────────────
-
 const PONG: u8 = 0xa;
 
 /// A client PING with a payload is answered, on the bytes the same call writes, with an unmasked
-/// PONG carrying that payload; the ping hands nothing up and does not end the stream.
+
 #[test]
 fn a_ping_is_answered_with_its_pong() {
     let mut h = Host::new();
@@ -890,7 +832,7 @@ fn a_ping_is_answered_with_its_pong() {
 }
 
 /// `limits.request_body_max_bytes` is the inbound message ceiling: a client message past it ends
-/// the stream FAILED and the close carries 1009 (Message Too Big); one within it is served.
+
 #[test]
 fn a_message_past_the_settings_ceiling_fails_the_stream_with_1009() {
     let mut h = Host::with_settings(br#"{"limits.request_body_max_bytes": 64}"#);

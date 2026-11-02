@@ -2,7 +2,6 @@
 // Copyright (C) 2026 Busbar Inc and contributors
 
 //! The door's answer filling: a dialled head's reason phrase rides only beside its head's first
-//! piece.
 
 use super::*;
 use std::cell::RefCell;
@@ -101,12 +100,7 @@ fn sink(frame: &mut [u8], pieces: &mut [FramePiece], heads: &mut [HeadSlots]) ->
 }
 
 /// A DIALLED HEAD'S REASON GOES ONLY WITH ITS HEAD'S FIRST PIECE, AND NEVER STALLS IT (Q128
-/// transport-ws LOW, reader r52 on 3286006; codeaudit g2 MEDIUM; HEAD-FIELDS). The host re-calls
-/// `YIELD_MORE` with the same frame buffer, so an EMPTY answer that waited for room beside the
-/// phrase would wait for ever: there the head goes WITHOUT its phrase, and the phrase never goes
-/// out alone. Where the answer is not empty (another piece took room ahead of the head) the phrase
-/// waits, and the next answer carries both. With room for both, the phrase rides beside the head's
-/// first piece. RED before the fix: the first answer was 0 pieces with the head still waiting.
+
 #[test]
 fn a_reason_rides_only_beside_its_heads_first_piece() {
     let head = |reason: &[u8]| {
@@ -129,16 +123,12 @@ fn a_reason_rides_only_beside_its_heads_first_piece() {
         (o.yielded.pieces_len, o.yielded.heads_len, phrase)
     };
 
-    // (a) Room for the phrase (12 bytes) and one byte more, in an empty answer: no cut of the field
-    // block fits beside it, so the head goes without it.
     let mut owed = Owed::default();
     owed.pieces.push_back(head(b"Unauthorized"));
     let (pieces, heads, _) = run(&mut owed, 13);
     assert!(pieces >= 1, "the head moves");
     assert_eq!(heads, 0, "without its phrase, which never goes out alone");
 
-    // (b) Another piece took room ahead of the head: nothing of the head fits beside the phrase in
-    // this answer, so both wait, and the next (empty) answer carries them together.
     let mut owed = Owed::default();
     owed.pieces
         .push_back(Piece::plain(1, b"0123456789".to_vec(), true));
@@ -150,7 +140,6 @@ fn a_reason_rides_only_beside_its_heads_first_piece() {
     assert_eq!((pieces, heads), (1, 1));
     assert_eq!(phrase.as_deref(), Some(&b"Unauthorized"[..]));
 
-    // (c) Room for both: the phrase rides beside the head's first piece.
     let mut owed = Owed::default();
     owed.pieces.push_back(head(b"Unauthorized"));
     let (pieces, heads, phrase) = run(&mut owed, 64);
@@ -159,9 +148,7 @@ fn a_reason_rides_only_beside_its_heads_first_piece() {
 }
 
 /// A FRAMING WHOSE OP PANICKED IS GONE ONCE IT IS FINISHED (Q128 transport-ws LOW, reader r52 on
-/// 3286006): the finish answers FAILED without reaching the framer, so the framer's state for it is
-/// dropped there too, and nothing of it is kept for the life of the instance. RED before the fix:
-/// the door's queue went, the framer's state stayed.
+
 #[test]
 fn a_panicked_framing_is_forgotten_by_the_framer_at_its_finish() {
     // SAFETY: plain C data; all-zero is valid.
@@ -190,7 +177,7 @@ fn a_panicked_framing_is_forgotten_by_the_framer_at_its_finish() {
         opened.set(state);
         let slot: OwedSlot = Arc::new(Mutex::new(Owed::default()));
         inst.queues().insert(state, Arc::clone(&slot));
-        // An op on this framing panicked while holding its queue.
+
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let _held = slot.lock();
             panic!("an op panicked");
@@ -223,7 +210,7 @@ fn a_panicked_framing_is_forgotten_by_the_framer_at_its_finish() {
 }
 
 /// Hand `owed` over through a sink of the given caps, one fill at a time, until it is dry: every
-/// answer's wire run and frame pieces (bytes, flags), in order.
+
 fn drain_owed(
     owed: &mut Owed,
     wire_cap: usize,
@@ -254,7 +241,7 @@ fn drain_owed(
 }
 
 /// A LARGE PIECE AND A LARGE WIRE ARE HANDED OVER INTACT, IN ORDER, ACROSS RE-CALLS (codeaudit g2
-/// MEDIUM): several times the sink's caps, with the end of the frame stated on the last piece only.
+
 #[test]
 fn a_large_piece_and_wire_are_handed_over_intact_across_recalls() {
     let message: Vec<u8> = (0..1000_u32).map(|n| (n % 251) as u8).collect();
@@ -280,9 +267,7 @@ fn a_large_piece_and_wire_are_handed_over_intact_across_recalls() {
 }
 
 /// HANDING OVER MOVES NO REMAINDER (codeaudit g2 MEDIUM): a piece taken in parts keeps its buffer
-/// whole, and the wire keeps its length, while the handed-over bytes are wiped in place. RED before
-/// the fix: `drain` and `copy_within` shifted the remainder down on every fill, so the buffers
-/// shrank. This pins the offset mechanism.
+
 #[test]
 fn handing_over_a_large_piece_or_wire_moves_no_remainder() {
     let mut owed = Owed::default();
@@ -320,9 +305,7 @@ fn handing_over_a_large_piece_or_wire_moves_no_remainder() {
 }
 
 /// THE WIRE'S CAPACITY FOLLOWS ITS BACKLOG, NOT ITS THROUGHPUT (codeaudit g2 review): a wire that
-/// never fully drains (each push 101 bytes, each hand-over 100) grows by what is owed, not by
-/// doubling the capacity that handed-over bytes still count in. RED before the fix: the capacity
-/// doubled at every growth, far past the backlog.
+
 #[test]
 fn the_wire_s_capacity_follows_its_backlog_not_its_throughput() {
     let mut owed = Owed::default();
@@ -339,8 +322,7 @@ fn the_wire_s_capacity_follows_its_backlog_not_its_throughput() {
 }
 
 /// A KEPT PIECE BUFFER GIVES BACK WHAT ONE LARGE MESSAGE GREW IT PAST [`KEEP_BYTES`]: a framing in
-/// steady state holds working-size spares, not its high-water mark eight times over. RED before
-/// the fix: a 4 MiB buffer was kept whole.
+
 #[test]
 fn a_kept_piece_buffer_is_bounded() {
     let mut owed = Owed::default();
@@ -357,8 +339,7 @@ fn a_kept_piece_buffer_is_bounded() {
 }
 
 /// ONLY THE OPENING IS WIPED (PL10): the bytes a framing's opening owed (a dialled upgrade request
-/// carries its auth's credential lines) are wiped as they are handed over and when the buffer
-/// outgrows them; the message bytes owed after them are handed over as they are, never wiped.
+
 #[test]
 fn only_the_opening_is_wiped_as_it_is_handed_over() {
     let mut owed = Owed::default();
@@ -369,7 +350,7 @@ fn only_the_opening_is_wiped_as_it_is_handed_over() {
         owed.wire[..30].iter().all(|&b| b == 0),
         "the handed-over opening is wiped"
     );
-    // Outgrowing the buffer copies the 10 opening bytes still owed and wipes the old buffer.
+
     let big = vec![0x22; 4 * owed.wire.capacity()];
     owed.push(&big, false);
     assert_eq!(owed.secret, 10, "the opening bytes still owed stay marked");
@@ -385,9 +366,7 @@ fn only_the_opening_is_wiped_as_it_is_handed_over() {
 }
 
 /// A DRAINED WIRE GIVES BACK WHAT ONE LARGE MESSAGE GREW IT PAST [`KEEP_BYTES`] (codeaudit e916fda
-/// WS-11), as a kept piece buffer does: an idle framing holds a working-size wire buffer, not twice
-/// its largest message. A working-size buffer is kept whole, so steady state allocates nothing.
-/// RED before the fix: the drained wire kept its whole high-water capacity.
+
 #[test]
 fn a_drained_wire_is_bounded() {
     let mut owed = Owed::default();
@@ -409,8 +388,6 @@ fn a_drained_wire_is_bounded() {
         "a working-size buffer is kept whole"
     );
 }
-
-// ── the door's ops, driven as the host drives them (codeaudit e916fda, tests) ───────────────────
 
 /// One answer's lent buffers.
 struct Lend {
@@ -444,7 +421,7 @@ impl Lend {
 }
 
 /// What one answer said: its outcome, its wire bytes, each piece (bytes, flags), each head's
-/// reason phrase, and its yield flags.
+
 struct Said {
     outcome: Outcome,
     wire: Vec<u8>,
@@ -549,7 +526,7 @@ fn begin(
 }
 
 /// `ingest` of `bytes` (`end`: the carrier ended) on framing `token`; no bytes and no end is the
-/// `YIELD_MORE` re-call.
+
 fn ingest(p: *mut c_void, token: u64, bytes: &[u8], end: bool, l: &mut Lend) -> Said {
     // SAFETY: plain C data; all-zero is valid.
     let mut i: IngestIn = unsafe { std::mem::zeroed() };
@@ -620,10 +597,7 @@ fn switching(request: &[u8]) -> Vec<u8> {
 }
 
 /// THE CARRIER'S END REACHES THE MACHINE THROUGH THE DOOR (codeaudit e916fda tests MEDIUM): an
-/// `ingest` that carries no bytes but `end` is no re-call; the framer hears the end and the stream
-/// ends, FAILED with its reason, and the answer says the connection ended (`YIELD_ENDED`). An
-/// accepting framing whose request was cut short by the end has its state ended by the op: the
-/// failed end piece says why, and the connection ends with it.
+
 #[test]
 fn the_carriers_end_reaches_the_machine_through_the_door() {
     let p = instance();
@@ -655,8 +629,7 @@ fn the_carriers_end_reaches_the_machine_through_the_door() {
 }
 
 /// A FINISHED FRAMING IS GONE ONCE WHAT IT OWES IS OUT (codeaudit e916fda tests MEDIUM): a finish
-/// that drains removes the framing's door queue and the framer's state; one that leaves a backlog
-/// (`YIELD_MORE`) keeps the queue until the re-called finish drains it.
+
 #[test]
 fn a_finished_framing_is_gone_once_drained() {
     let p = instance();
@@ -687,8 +660,7 @@ fn a_finished_framing_is_gone_once_drained() {
 }
 
 /// ONLY A DIAL'S OPENING IS MARKED TO BE WIPED, THROUGH THE DOOR (codeaudit e916fda tests MEDIUM,
-/// PL10): the upgrade request `begin` owes (its auth's credential among its lines) is marked secret
-/// in the framing's queue, and the message bytes a later `emit` owes are not.
+
 #[test]
 fn only_a_dials_opening_is_marked_secret_through_the_door() {
     let p = instance();
@@ -728,8 +700,7 @@ fn only_a_dials_opening_is_marked_secret_through_the_door() {
 }
 
 /// A DIALLED HEAD'S REASON REACHES THE HOST'S HEAD SLOTS, BESIDE ITS HEAD (codeaudit e916fda tests
-/// LOW): the far end's refusal head `401 Unauthorized` crosses as one field-block piece with the
-/// phrase in a head slot, the answer passing the kind's head-slot check.
+
 #[test]
 fn a_dialled_heads_reason_reaches_the_head_slots() {
     let p = instance();
@@ -747,7 +718,7 @@ fn a_dialled_heads_reason_reaches_the_head_slots() {
 }
 
 /// THE WIPE IS SEEN (codeaudit e916fda tests LOW): a queue buffer holding owed opening bytes goes
-/// back to the allocator wiped, both when the queue outgrows it and when the queue drops.
+
 #[test]
 fn an_opening_buffer_is_freed_and_wiped_on_linux() {
     use crate::faults_tests::{assert_freed_wiped, watch_free};

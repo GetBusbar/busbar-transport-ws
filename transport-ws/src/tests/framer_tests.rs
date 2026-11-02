@@ -2,10 +2,6 @@
 // Copyright (C) 2026 Busbar Inc and contributors
 
 //! THE DIAL'S OPENING AND ITS MESSAGES (busbar ARCHITECT Q-L5B-WS-DIAL 2026-10-03): a dialled
-//! connection's upgrade request carries the dial's opening head fields (the handshake's own
-//! excepted); a message written before the handshake completes is held and goes out, in order, the
-//! moment it does; a message the emit states text (`EMIT_TEXT`) goes out as a text message, any
-//! other as binary.
 
 use crate::frame::{Framed, FramerOut, HostTime, Side};
 use busbar_contract::transport::wire::WireStatusClass;
@@ -197,7 +193,6 @@ fn a_dial_carries_its_opening_fields_holds_early_messages_and_flags_text() {
     assert_eq!(fields_named(&request, "sec-websocket-key").len(), 1);
     assert_ne!(fields_named(&request, "sec-websocket-key"), ["forged"]);
 
-    // Written before the handshake completed: held, nothing sent.
     let mut early = Out::default();
     framer
         .emit_text(state, br#"{"type":"one"}"#, true, true, &mut early)
@@ -207,7 +202,6 @@ fn a_dial_carries_its_opening_fields_holds_early_messages_and_flags_text() {
         .expect("held");
     assert!(early.sent.is_empty(), "nothing leaves before the handshake");
 
-    // The handshake completes: the held messages go out, in order, text then binary.
     let mut done = Out::default();
     framer
         .ingest(state, &switching(&request), false, &mut done)
@@ -217,9 +211,7 @@ fn a_dial_carries_its_opening_fields_holds_early_messages_and_flags_text() {
         [0x1, 0x2],
         "text, then binary, in order"
     );
-    // RED (HEAD-FIELDS): the switching response is handed up as the stream's head, its status
-    // stated and its fields (every one of them the handshake's own here) dropped, before any
-    // message; on the parent nothing was handed up until the far end spoke.
+
     assert_eq!(done.frames, [Vec::<u8>::new()], "the head, an empty block");
     assert_eq!(
         done.statuses,
@@ -227,25 +219,20 @@ fn a_dial_carries_its_opening_fields_holds_early_messages_and_flags_text() {
         "carrying the switching status"
     );
 
-    // Once open, a flagged message goes out as text at once.
     let mut open = Out::default();
     framer
         .emit_text(state, br#"{"type":"two"}"#, true, true, &mut open)
         .expect("sent");
     assert_eq!(opcodes(&open.sent), [0x1]);
-    // A text message that is not UTF-8 is refused, not sent as something else.
+
     let mut bad = Out::default();
     assert!(framer
         .emit_text(state, b"\xff\xfe", true, true, &mut bad)
         .is_err());
 }
 
-// ── the wire's declarations and its URL reading (from the in-process transport's battery, which
-// left with that transport when the crate went door-only) ──────────────────────────────────────
-
 /// `split_ws_url` on the bracketed-IPv6 shapes. A literal address with an explicit port is the one
-/// case the bracket rule exists to serve, and it must come back as the address without its brackets
-/// and the port the URL spelled — not as an authority that gets a default port stapled onto it.
+
 #[test]
 fn a_bracketed_ipv6_authority_parses_with_and_without_a_port() {
     assert_eq!(
@@ -256,7 +243,7 @@ fn a_bracketed_ipv6_authority_parses_with_and_without_a_port() {
         crate::transport::split_ws_url("ws://[::1]/p").unwrap(),
         (false, "::1".to_string(), 80, "/p".to_string())
     );
-    // The shapes the existing rule already got right stay right.
+
     assert_eq!(
         crate::transport::split_ws_url("ws://host:9000/p").unwrap(),
         (false, "host".to_string(), 9000, "/p".to_string())
@@ -268,7 +255,7 @@ fn a_bracketed_ipv6_authority_parses_with_and_without_a_port() {
 }
 
 /// The authority ends at `?`, `#` or `\` as well as `/`, where the handshake's own parser ends it.
-/// RED on the `/`-only split, which read `ws://host?x=1` as the host `host?x=1`.
+
 #[test]
 fn a_ws_authority_ends_at_a_query_a_fragment_or_a_backslash() {
     assert_eq!(
@@ -287,8 +274,7 @@ fn a_ws_authority_ends_at_a_query_a_fragment_or_a_backslash() {
 }
 
 /// HELD, AND BOUNDED: a dial whose far end never answers cannot grow the framing without end. A
-/// message over the ceiling is refused as a capacity failure, and so is one past the held count.
-/// RED before the bound: both were held.
+
 #[test]
 fn a_dial_holds_early_messages_only_up_to_the_ceiling_and_the_held_count() {
     let framer = WsFramer::new(8);
@@ -322,9 +308,7 @@ fn a_dial_holds_early_messages_only_up_to_the_ceiling_and_the_held_count() {
 }
 
 /// THE FAR END'S REFUSAL OF THE UPGRADE IS ITS ANSWER (THE DESIGN §5, HEAD-FIELDS: the head is
-/// always the first fields piece): a `401` (or `429`, `5xx`) in place of `101` is handed up as ONE
-/// head carrying its status, its class and its fields, and the frames end, so the breaker reads the
-/// status class. RED before the fix: the answer was discarded as a bare handshake failure.
+
 #[test]
 fn a_far_end_that_refuses_the_upgrade_hands_up_its_answer() {
     for (code, class) in [
@@ -357,9 +341,7 @@ fn a_far_end_that_refuses_the_upgrade_hands_up_its_answer() {
 }
 
 /// A REFUSED UPGRADE'S BODY REACHES THE PLANE (Q128 transport-ws LOW): after its head, the far end's
-/// error document is handed up as the stream's body, what came with the head and what arrives
-/// after it, up to its declared `Content-Length`; then the frames end. The head's reason phrase is
-/// taken for the head's slots. RED before the fix: only the head went up, and no reason was kept.
+
 #[test]
 fn a_refused_upgrade_hands_up_its_body_and_its_reason() {
     let framer = WsFramer::new(0);
@@ -397,14 +379,11 @@ fn a_refused_upgrade_hands_up_its_body_and_its_reason() {
 }
 
 /// A REFUSED UPGRADE'S WHOLE BODY, PAST THE MACHINE'S ONE READ (Q128 transport-ws MEDIUM): head and
-/// a body larger than the protocol machine's handshake read arrive in ONE chunk, and every byte of
-/// it is handed up, then the frames end; with no declared length, the body runs to the carrier's
-/// end, and that end is forwarded. RED before the fix: the bytes past the machine's read were
-/// dropped, and a carrier that had already ended never ended the frames.
+
 #[test]
 fn a_refused_upgrade_hands_up_a_large_body_and_the_carrier_end() {
     let body = vec![b'x'; 9000];
-    // Declared length, head and body in one chunk.
+
     let framer = WsFramer::new(0);
     let mut out = Out::default();
     let state = framer
@@ -422,7 +401,7 @@ fn a_refused_upgrade_hands_up_a_large_body_and_the_carrier_end() {
         .expect("the far end answered");
     assert_eq!(heard.frames[1..].concat(), body, "the whole body, once");
     assert!(heard.ended, "the declared length is met: the frames end");
-    // No declared length; the carrier ended with the chunk.
+
     let framer = WsFramer::new(0);
     let mut out = Out::default();
     let state = framer
@@ -439,11 +418,7 @@ fn a_refused_upgrade_hands_up_a_large_body_and_the_carrier_end() {
 }
 
 /// A REFUSED UPGRADE'S CHUNKED BODY IS DECODED BY ITS TRANSFER CODING (Q128 transport-ws LOW, both
-/// readers on a5c9118; RFC 9112 §6.3 and §7.1: `Transfer-Encoding: chunked` overrides any
-/// `Content-Length`, and the body ends at its last chunk): on a kept-alive connection the plane gets
-/// the error document without chunk markers, across pieces split mid-size-line and mid-chunk, and
-/// the frames end at the zero-length chunk and its trailers, not at the carrier's end. RED before
-/// the fix: the chunk-size lines reached the plane, and the frames never ended.
+
 #[test]
 fn a_refused_upgrades_chunked_body_is_decoded_and_ends_at_its_last_chunk() {
     let framer = WsFramer::new(0);
@@ -481,8 +456,7 @@ fn a_refused_upgrades_chunked_body_is_decoded_and_ends_at_its_last_chunk() {
 }
 
 /// THE CEILING HOLDS FOR WHAT AN OPEN CONNECTION WRITES TOO (Q128 transport-ws LOW): a message over
-/// the ceiling, whole or gathered from pieces, is refused as a held one is, and one within it goes
-/// out. RED before the fix: the open path sent any size (the machine bounds only what it reads).
+
 #[test]
 fn an_open_connection_refuses_an_outbound_message_over_the_ceiling() {
     let framer = WsFramer::new(8);
@@ -519,9 +493,7 @@ fn an_open_connection_refuses_an_outbound_message_over_the_ceiling() {
 }
 
 /// A REFUSED PIECE TAKES ITS MESSAGE'S GATHERED PIECES WITH IT ON A DIAL STILL HANDSHAKING (Q128
-/// transport-ws LOW, reader r52 on 3286006), as the open path drops them: the next message is held
-/// alone, not glued to the refused one's front. RED before the fix: the refused message's first
-/// pieces stayed gathered, so a next message within the ceiling read as over it.
+
 #[test]
 fn a_refused_piece_on_a_dial_drops_its_gathered_pieces() {
     let framer = WsFramer::new(8);
@@ -545,9 +517,7 @@ fn a_refused_piece_on_a_dial_drops_its_gathered_pieces() {
 }
 
 /// THE DIALLED HEAD'S ORDER IS PINNED (Q128 transport-ws LOW, reader r51 on 3286006): the request
-/// line, the machine's handshake lines in their fixed order, then the opening fields (in the
-/// request map's own order, a repeated name's lines together and in their order); an opening field
-/// of a handshake name is not copied. The doc at `HANDSHAKE_FIELDS` states this order.
+
 #[test]
 fn the_dialled_heads_order_is_pinned() {
     let framer = WsFramer::new(0);
@@ -580,7 +550,7 @@ fn the_dialled_heads_order_is_pinned() {
         ],
         "the handshake's lines lead: {request}"
     );
-    // Then the opening fields, each line once, a repeated name's lines together.
+
     let mut rest = names[5..].to_vec();
     let auth_at = rest
         .iter()
@@ -604,8 +574,7 @@ fn the_dialled_heads_order_is_pinned() {
 }
 
 /// A REFUSED UPGRADE'S BODY CUT SHORT BY THE CARRIER ENDS FAILED (Q128 transport-ws LOW, reader r51
-/// on 3286006): a carrier that ends before the declared `Content-Length` (or before the last chunk)
-/// ends the frames failed, not whole. RED before the fix: a short body read as a whole one.
+
 #[test]
 fn a_refused_upgrades_short_body_ends_failed() {
     for (head, body) in [
@@ -632,7 +601,7 @@ fn a_refused_upgrades_short_body_ends_failed() {
         assert!(heard.ended, "{head}: the frames end");
         assert!(framer.failed(state), "{head}: a short body ends failed");
     }
-    // A body the carrier's end does not cut is whole.
+
     let framer = WsFramer::new(0);
     let mut out = Out::default();
     let state = framer
@@ -651,9 +620,7 @@ fn a_refused_upgrades_short_body_ends_failed() {
 }
 
 /// A MALFORMED CHUNKED CODING ENDS FAILED (Q128 transport-ws MEDIUM, reader r162 on 0769fe6): a
-/// refused upgrade's chunked body whose chunk-size is not hex, or whose chunk data is not followed
-/// by its line end, is not a whole body: the frames end, failed. RED before the fix: the decoder
-/// stopped there and the body read as whole and cleanly ended.
+
 #[test]
 fn a_malformed_chunked_body_ends_failed() {
     for body in [
@@ -680,14 +647,13 @@ fn a_malformed_chunked_body_ends_failed() {
 }
 
 /// A REFUSED UPGRADE'S `Retry-After` IS READ IN BOTH OF RFC 9110's FORMS (Q128 transport-ws LOW,
-/// reader r72 on f876543), as the http framer reads it: delay-seconds, and an IMF-fixdate as the
-/// seconds left until it (`0` once past). RED before the fix: the HTTP-date form was dropped.
+
 #[test]
 fn a_retry_after_is_read_in_both_forms() {
     let mut h = HeaderMap::new();
     h.insert("retry-after", HeaderValue::from_static("7"));
     assert_eq!(retry_after(&h, 0), Some(7));
-    // 1445412480 = Wed, 21 Oct 2015 07:28:00 GMT.
+
     h.insert(
         "retry-after",
         HeaderValue::from_static("Wed, 21 Oct 2015 07:28:00 GMT"),
@@ -699,8 +665,7 @@ fn a_retry_after_is_read_in_both_forms() {
 }
 
 /// A REFUSED UPGRADE WITH A STATUS THAT CARRIES NO BODY ENDS AT ITS HEAD (Q128 transport-ws LOW,
-/// reader r72 on f876543; RFC 9112 §6.3: 1xx, 204 and 304 carry none), on a kept-alive carrier.
-/// RED before the fix: the frames waited for the carrier to close.
+
 #[test]
 fn a_bodiless_refusal_ends_at_its_head() {
     for answer in [
@@ -760,9 +725,7 @@ fn close_code(wire: &[u8]) -> Option<u16> {
 }
 
 /// A REFUSAL CLOSES WITH THE CODE ITS NEUTRAL STATUS MAPS TO (the plane seam: a neutral status the
-/// transport maps to its wire): 401/403 policy (1008), 413 too big (1009), 429/503 try again later
-/// (1013), another 5xx internal error (1011), none stated normal (1000). RED before the fix: every
-/// refusal closed 1000.
+
 #[test]
 fn a_refusal_closes_with_the_code_its_status_maps_to() {
     for (status, code) in [
@@ -792,9 +755,7 @@ fn a_refusal_closes_with_the_code_its_status_maps_to() {
 }
 
 /// A TEXT MESSAGE HELD WHILE THE DIAL'S HANDSHAKE RUNS IS CHECKED AT THE CALL, as the open
-/// connection checks it: bytes that are not UTF-8 fail the write, before they are held, so a bad
-/// message never tears the connection down later with the good ones queued ahead of it. RED before
-/// the fix: the held message was accepted and failed only at the replay.
+
 #[test]
 fn a_held_text_message_that_is_not_utf8_fails_at_the_call() {
     let framer = WsFramer::new(0);
@@ -812,7 +773,7 @@ fn a_held_text_message_that_is_not_utf8_fails_at_the_call() {
             .is_err(),
         "not UTF-8: refused at the call"
     );
-    // The connection lives on: the handshake completes and the good message goes out.
+
     let request = String::from_utf8(out.sent.clone()).unwrap();
     let mut done = Out::default();
     framer
@@ -843,8 +804,7 @@ fn first_data_payload(wire: &[u8]) -> Option<(u8, Vec<u8>)> {
 }
 
 /// A REFUSAL GOES OUT AS ITS OWN MESSAGE (codeaudit r1 g1): pieces of an unfinished outbound message
-/// are dropped, not glued to the refusal's front. RED before the fix: the first data frame carried
-/// the half reply followed by the refusal.
+
 #[test]
 fn a_refusal_is_not_glued_onto_a_gathered_partial_message() {
     let framer = WsFramer::new(0);
@@ -868,9 +828,7 @@ fn a_refusal_is_not_glued_onto_a_gathered_partial_message() {
 }
 
 /// A BARE-LF RESPONSE HEAD IS READ AS THE PROTOCOL LIBRARY READS IT (codeaudit r1 g1): the status
-/// line ends at the first line feed, and the head at the first empty line, so the reason phrase is
-/// just the phrase and the body that arrived with the head is handed up. RED before the fix: the
-/// reason phrase spanned header lines and the body was dropped.
+
 #[test]
 fn a_bare_lf_response_head_is_read_whole() {
     assert_eq!(
@@ -910,7 +868,7 @@ fn refused_with(wire: &[u8], carrier_ended: bool) -> (WsFramer, u64, Out) {
 }
 
 /// `Retry-After` delay-seconds is 1*DIGIT (RFC 9110 §10.2.3): a signed number is not one. RED before
-/// the fix: `+30` read as 30.
+
 #[test]
 fn a_signed_retry_after_is_not_delay_seconds() {
     let mut h = HeaderMap::new();
@@ -921,7 +879,7 @@ fn a_signed_retry_after_is_not_delay_seconds() {
 }
 
 /// A chunk-size is 1*HEXDIG (RFC 9112 §7.1): a signed one is malformed. RED before the fix: `+5`
-/// was read as a chunk of 5.
+
 #[test]
 fn a_signed_chunk_size_is_malformed() {
     let (framer, state, heard) = refused_with(
@@ -933,8 +891,7 @@ fn a_signed_chunk_size_is_malformed() {
 }
 
 /// A `Content-Length` is 1*DIGIT, and every value stated must agree (RFC 9110 §8.6, RFC 9112 §6.3):
-/// otherwise the body is failed at once, not read as close-delimited. RED before the fix: `+5` read
-/// as 5, a conflict took the first value, a list was not read.
+
 #[test]
 fn an_invalid_or_conflicting_content_length_ends_failed() {
     for head in [
@@ -949,7 +906,7 @@ fn an_invalid_or_conflicting_content_length_ends_failed() {
         assert!(heard.ended, "{head:?}: the frames end");
         assert!(framer.failed(state), "{head:?}: ends failed");
     }
-    // Agreeing values are one length.
+
     for head in [
         "Content-Length: 5, 5\r\n",
         "Content-Length: 5\r\nContent-Length: 5\r\n",
@@ -962,7 +919,7 @@ fn an_invalid_or_conflicting_content_length_ends_failed() {
 }
 
 /// A `Transfer-Encoding` whose final coding is not `chunked` leaves the body to run to the carrier's
-/// end, `Content-Length` ignored (RFC 9112 §6.3). RED before the fix: the length was honoured.
+
 #[test]
 fn a_non_chunked_transfer_encoding_overrides_content_length() {
     let (framer, state, heard) = refused_with(
@@ -974,8 +931,7 @@ fn a_non_chunked_transfer_encoding_overrides_content_length() {
 }
 
 /// AFTER THE PEER'S CLOSE, WHAT ARRIVES IS NOBODY'S (codeaudit r1 g1): the frames ended, the machine
-/// no longer reads, so later bytes are not kept. RED before the fix: they were appended to the
-/// pipe's inbound without end.
+
 #[test]
 fn nothing_is_kept_after_the_peers_close() {
     let upgrade = b"GET /echo HTTP/1.1\r\nHost: svc.test\r\nUpgrade: websocket\r\n\
@@ -989,7 +945,7 @@ fn nothing_is_kept_after_the_peers_close() {
     framer
         .ingest(state, upgrade, false, &mut out)
         .expect("the upgrade is answered");
-    // A client's masked (all-zero key) close frame.
+
     let mut closed = Out::default();
     framer
         .ingest(state, &[0x88, 0x80, 0, 0, 0, 0], false, &mut closed)
@@ -1005,9 +961,7 @@ fn nothing_is_kept_after_the_peers_close() {
 }
 
 /// AN UPGRADE ANSWERED WITH ANOTHER 2XX IS NO SUCCESS (codeaudit e916fda WS-5; RFC 6455 section
-/// 4.1: any status but `101` fails the handshake): a far end that answers `200` (a plain web server,
-/// an SPA fallback) never upgraded, so its head states no success to the breaker or the plane; it
-/// is a refused upgrade outside the three classes. RED before the fix: `200` was stated `Success`.
+
 #[test]
 fn an_upgrade_answered_with_another_2xx_is_no_success() {
     for code in [200, 204, 206] {
@@ -1022,10 +976,7 @@ fn an_upgrade_answered_with_another_2xx_is_no_success() {
 }
 
 /// A DIAL'S SUBPROTOCOL RIDES ITS UPGRADE AND THE ANSWER IS HELD TO IT (codeaudit e916fda WS-7; RFC
-/// 6455 sections 1.9, 4.1): the plane's `Sec-WebSocket-Protocol` opening field goes out on the
-/// upgrade request; an answer selecting one of the offered subprotocols opens, its selection handed
-/// up in the head, and an answer selecting another fails the handshake. RED before the fix: the
-/// field was silently dropped.
+
 #[test]
 fn a_dials_subprotocol_rides_the_upgrade_and_the_answer_is_held_to_it() {
     let fields = vec![(
@@ -1058,8 +1009,7 @@ fn a_dials_subprotocol_rides_the_upgrade_and_the_answer_is_held_to_it() {
 }
 
 /// THE SCHEME IS READ WHATEVER ITS CASE (codeaudit e916fda WS-8; RFC 3986 section 3.1, as the
-/// contract's own URL reader reads it): `WSS://` and `Ws://` are `wss` and `ws` targets, and a dial
-/// to one opens. RED before the fix: they were refused as not a ws or wss URL.
+
 #[test]
 fn the_scheme_is_read_whatever_its_case() {
     assert_eq!(
@@ -1081,9 +1031,7 @@ fn the_scheme_is_read_whatever_its_case() {
 }
 
 /// A FRAMER WITH NO CEILING PUTS NONE ON WHAT IT WRITES (codeaudit e916fda WS-9): `new(0)` is the
-/// library's inbound default and no outbound ceiling, on an open connection as on a dialling one.
-/// RED before the fix: an open connection read the library's 64 MiB default back as its outbound
-/// ceiling and refused a larger message the dialling path held.
+
 #[test]
 fn no_ceiling_means_no_outbound_ceiling_on_an_open_connection() {
     let framer = WsFramer::new(0);
@@ -1104,9 +1052,7 @@ fn no_ceiling_means_no_outbound_ceiling_on_an_open_connection() {
 }
 
 /// A SHIPPED DIAL IS RANDOM WHERE RFC 6455 SAYS SO (codeaudit e916fda tests MEDIUM): its handshake
-/// key is fresh per dial (section 4.1) and every frame it writes is masked with a fresh key
-/// (section 5.3), the payload readable under it. Built UNSEEDED, so it runs the shipped path even
-/// when the workspace's tests unify the harness's `test-seeded` feature onto this crate.
+
 #[test]
 fn a_shipped_dial_sends_a_fresh_key_and_masks_every_frame() {
     let open = || {
@@ -1147,8 +1093,7 @@ fn a_shipped_dial_sends_a_fresh_key_and_masks_every_frame() {
 }
 
 /// A CHUNK-SIZE LINE PAST ITS BOUND ENDS THE BODY FAILED (codeaudit e916fda tests LOW): a refused
-/// upgrade's chunked body whose size line runs on past `CHUNK_LINE_MAX` with no line end is
-/// malformed; the frames end there, failed, and the decoder holds no more of it.
+
 #[test]
 fn a_chunk_line_past_its_bound_ends_the_body_failed() {
     let mut wire = b"HTTP/1.1 401 Unauthorized\r\nTransfer-Encoding: chunked\r\n\r\n".to_vec();
