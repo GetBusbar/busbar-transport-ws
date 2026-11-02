@@ -53,7 +53,7 @@ fn claims() -> (Vec<String>, &'static [Claim]) {
     (names, rows)
 }
 
-/// RED (audit: `wss` is not claimed): THE DESIGN §5, "ws claims `ws` and `wss`".
+/// The transport claims both `ws` and `wss`.
 #[test]
 fn ws_claims_ws_and_wss() {
     let (names, rows) = claims();
@@ -61,7 +61,7 @@ fn ws_claims_ws_and_wss() {
     assert_eq!(rows.len(), names.len(), "one row per claim");
 }
 
-/// RED (audit: the admitted claim row contradicts the transport's own declaration): every row the
+/// Every claim row agrees with the transport's declaration.
 
 #[test]
 fn every_claim_row_states_the_declaration() {
@@ -154,7 +154,7 @@ fn opening(target: &str) -> String {
     String::from_utf8_lossy(&out.wire).into_owned()
 }
 
-/// RED (audit: an IPv6-literal target cannot be dialled): `locate` answers the connector an
+/// IPv6 literal targets locate with bracketed addresses.
 
 #[test]
 fn an_ipv6_literal_target_locates_bracketed() {
@@ -170,7 +170,7 @@ fn an_ipv6_literal_target_locates_bracketed() {
     assert_eq!(at.authority, "svc.test:80", "a name is never bracketed");
 }
 
-/// RED (audit: an IPv6-literal target cannot be dialled): a dial to an IPv6 literal opens, and
+/// An IPv6 literal target opens a dial with the expected request and Host field.
 
 #[test]
 fn an_ipv6_literal_target_dials() {
@@ -179,7 +179,7 @@ fn an_ipv6_literal_target_dials() {
     assert!(request.contains("\r\nHost: [::1]:8080\r\n"), "{request}");
 }
 
-/// RED (audit: every dial's Host field gains the default port): the upgrade request's `Host` is
+/// A dial sends the Host field as stated in its target.
 
 #[test]
 fn a_dial_sends_the_host_as_the_target_writes_it() {
@@ -193,7 +193,7 @@ fn a_dial_sends_the_host_as_the_target_writes_it() {
     assert!(request.contains("\r\nHost: svc.test:8080\r\n"), "{request}");
 }
 
-/// RED (audit: an abrupt disconnect is reported as a framing failure): a carrier that ends with
+/// A carrier ending without a close frame fails the stream.
 
 #[test]
 fn a_carrier_end_without_a_close_ends_the_stream_failed() {
@@ -232,7 +232,7 @@ fn a_carrier_end_without_a_close_ends_the_stream_failed() {
     assert_eq!(f.failure(s), Some(WHY));
 }
 
-/// RED (audit: one panic poisons every connection of the instance): a panic while one framing
+/// A panic in one framing leaves other framings usable.
 
 #[test]
 fn a_panic_in_one_framing_leaves_the_others_working() {
@@ -666,7 +666,7 @@ impl Write for Socket {
     }
 }
 
-/// RED (audit: several copies and allocations per message on the hot path): a framing in steady
+/// Steady-state framing adds no allocation of its own per message.
 
 #[test]
 fn a_steady_framing_adds_no_allocation_of_its_own_per_message() {
@@ -715,7 +715,7 @@ fn a_steady_framing_adds_no_allocation_of_its_own_per_message() {
     );
 }
 
-/// A DRIBBLED UPGRADE ANSWER COSTS NO COPY PER CALL (codeaudit e916fda WS-4): while a dial's
+/// A response head arriving in small pieces is not copied on every call.
 
 #[test]
 fn a_dribbled_answer_head_is_not_copied_per_call() {
@@ -739,7 +739,7 @@ fn a_dribbled_answer_head_is_not_copied_per_call() {
     assert!(per < 0.25, "a dribbled call costs {per} allocations");
 }
 
-/// AN EMIT AFTER THE PEER'S CLOSE FINDS THE CONNECTION CLOSED (codeaudit e916fda WS-13): on a
+/// Emit after the peer's close reports the connection closed.
 
 #[test]
 fn an_emit_after_the_peers_close_finds_the_connection_closed() {
@@ -777,7 +777,7 @@ fn an_emit_after_the_peers_close_finds_the_connection_closed() {
     assert_eq!(r, Err(TransportError::Closed));
 }
 
-/// THE PIPE THAT WROTE A DIAL'S UPGRADE REQUEST IS WIPED ONCE IT IS HANDED OUT (codeaudit e916fda
+/// The pipe containing a dial's upgrade request is freed and wiped after handover on Linux.
 
 #[test]
 fn the_pipe_that_wrote_the_upgrade_request_is_freed_and_wiped_on_linux() {

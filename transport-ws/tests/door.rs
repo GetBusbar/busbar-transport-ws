@@ -359,7 +359,7 @@ fn client_message(opcode: u8, payload: &[u8]) -> Vec<u8> {
     m
 }
 
-/// RED (C19-TAIL U5): a TEXT message arrives as text (`PIECE_TEXT` on every piece of it) and a
+/// Text and binary messages retain their kind on every piece.
 
 fn text_and_binary(label: &str, ops: &'static Ops, caps: (usize, usize, usize)) {
     let mut host = Host::open(ops, caps);
@@ -388,7 +388,7 @@ fn text_and_binary(label: &str, ops: &'static Ops, caps: (usize, usize, usize)) 
     host.close();
 }
 
-/// RED (C19-TAIL U5 write): a message emitted with `EMIT_TEXT` goes out under the TEXT opcode (the
+/// Emitting with `EMIT_TEXT` writes a message with the text opcode.
 
 fn written_as_text(label: &str, ops: &'static Ops, caps: (usize, usize, usize)) {
     let mut host = Host::open(ops, caps);
@@ -484,7 +484,7 @@ fn switching(request: &[u8], extra: &str) -> Vec<u8> {
     .into_bytes()
 }
 
-/// RED (HEAD-FIELDS, `BUSBAR-1.6.0.md` l.736: a transport always hands the response head up as the
+/// A silent upgrade still reports its response head through the host's head slots.
 
 fn a_silent_upgrade_is_answered(label: &str, ops: &'static Ops, caps: (usize, usize, usize)) {
     let mut host = Host::open(ops, caps);
@@ -605,7 +605,7 @@ fn the_ws_claim_opens_at_the_upgrade_and_composes_over_nothing() {
     assert_eq!(tail.composes_over_len, 0);
 }
 
-/// A REFUSED UPGRADE'S WAIT CROSSES THE ABI (THE DESIGN §1: the breaker applies to every plane
+/// A refused upgrade's `Retry-After` reaches the host through the ABI.
 
 #[test]
 fn a_refused_upgrade_s_retry_after_reaches_the_host() {
@@ -622,7 +622,7 @@ fn a_refused_upgrade_s_retry_after_reaches_the_host() {
     host.close();
 }
 
-/// BEGIN REFUSES A TARGET THAT IS NOT TEXT, as `locate` does (codeaudit g2 LOW): it never dials a
+/// Begin refuses a target that is not text.
 
 #[test]
 fn begin_refuses_a_target_that_is_not_text() {
@@ -645,7 +645,7 @@ fn begin_refuses_a_target_that_is_not_text() {
     host.close();
 }
 
-/// LOCATE ANSWERS AN ACCEPTING LISTENER'S OFFER (codeaudit g2 LOW; `LocateIn::accept`): a listener
+/// Locate returns the accepting listener's protocol offer.
 
 #[test]
 fn locate_for_a_listener_answers_the_accepting_offer() {
@@ -741,7 +741,7 @@ fn a_refused_upgrade_s_retry_after_http_date_reaches_the_host() {
     host.close();
 }
 
-/// A BODY CEILING OF ZERO IS REFUSED, NOT OPENED WITHOUT AN OUTBOUND CEILING (codeaudit g5 LOW):
+/// Validate and open refuse a zero message ceiling.
 
 #[test]
 fn a_zero_message_ceiling_is_refused_by_validate_and_open() {
@@ -1173,7 +1173,7 @@ fn settings_that_are_not_a_json_object_are_refused() {
     assert_eq!(validate(b"{}").0, Outcome::Ready);
 }
 
-/// A KEY THE TRANSPORT DOES NOT DECLARE IS REFUSED BY NAME. RED before the fix: it was ignored.
+/// An undeclared setting is refused by name.
 #[test]
 fn an_undeclared_setting_is_refused() {
     let settings = br#"{"limits.request_body_max_bytes": 5, "nope": 1}"#;
@@ -1183,7 +1183,7 @@ fn an_undeclared_setting_is_refused() {
     }
 }
 
-/// A CEILING THAT IS NOT A COUNT ABOVE 0 SAYS THE CANONICAL TEXT. RED before the fix: a value of
+/// An invalid message ceiling returns the canonical explanation.
 
 #[test]
 fn a_bad_message_ceiling_says_the_canonical_text() {
@@ -1355,7 +1355,7 @@ fn a_carrier_op_is_refused_by_name() {
     host.close();
 }
 
-/// AN OP ON NO INSTANCE FAILS BY NAME, never reading through a NULL instance. RED before the fix:
+/// An operation without an instance fails by name without reading through a null pointer.
 
 #[test]
 fn an_op_with_no_instance_fails_by_name() {
@@ -1446,7 +1446,7 @@ fn an_op_with_no_instance_fails_by_name() {
     );
 }
 
-/// A FRAMING THE DOOR DOES NOT HOLD IS NAMED BY ITS OP. RED before the fix: "no such framing".
+/// An operation on an unknown framing names the failed operation.
 #[test]
 fn an_unknown_framing_fails_by_op() {
     let mut host = Host::open(linked(), (1024, 1024, 4));
@@ -1462,7 +1462,7 @@ fn an_unknown_framing_fails_by_op() {
     host.close();
 }
 
-/// A TARGET CARRYING USERINFO IS REFUSED SAYING SO, and the text repeats no byte of it. RED before
+/// A target carrying userinfo is refused without repeating any of its bytes.
 
 #[test]
 fn locate_refuses_a_target_carrying_userinfo() {
@@ -1594,7 +1594,7 @@ fn begin_with_fields(
     (r == Outcome::Failed).then(|| said(&o.head.error))
 }
 
-/// AN EXTENSION IS REFUSED IN WORDS (codeaudit e916fda WS-7; RFC 6455 section 9): this end
+/// A dial requesting an extension is refused with an explanation.
 
 #[test]
 fn a_dial_asking_for_an_extension_is_refused_in_words() {
@@ -1611,7 +1611,7 @@ fn a_dial_asking_for_an_extension_is_refused_in_words() {
     host.close();
 }
 
-/// THE TAIL STATES THE OPS THE DOOR SERVES (codeaudit e916fda WS-10; `FACT_ACCEPTS`: "a tail that
+/// The tail declares the operations the door serves.
 
 #[test]
 fn the_tail_states_the_ops_the_door_serves() {
@@ -1622,7 +1622,7 @@ fn the_tail_states_the_ops_the_door_serves() {
     assert_eq!(tail.facts, FACT_ACCEPTS | FACT_DIALS | FACT_ADOPTS);
 }
 
-/// AN OPENING FIELD THE UPGRADE CANNOT CARRY IS REFUSED AS SUCH (codeaudit e916fda WS-14): a field
+/// An opening field the upgrade cannot carry is refused with an explanation.
 
 #[test]
 fn an_opening_field_the_upgrade_cannot_carry_is_refused_as_such() {
@@ -1638,7 +1638,7 @@ fn an_opening_field_the_upgrade_cannot_carry_is_refused_as_such() {
     host.close();
 }
 
-/// A DIALLING END ADOPTS NOTHING (codeaudit e916fda WS-15): a stream handed over takes the upgrade
+/// A dialing end refuses to adopt a stream.
 
 #[test]
 fn a_dialling_end_adopts_nothing() {
@@ -1659,7 +1659,7 @@ fn a_dialling_end_adopts_nothing() {
     host.close();
 }
 
-/// THE FIELD CHECKS ARE A DIAL'S, AND A BAD TARGET STILL SAYS SO FIRST (codeaudit e916fda WS-7,
+/// Opening-field checks apply to dials, and a bad target is reported before field errors.
 
 #[test]
 fn the_field_checks_are_a_dials_and_a_bad_target_says_so_first() {

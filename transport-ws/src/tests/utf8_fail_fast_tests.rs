@@ -92,7 +92,7 @@ fn fails_at_last(chops: &[Vec<u8>]) {
     assert_eq!(close_code(&framer, state), Some(1007));
 }
 
-/// RED before the fix: the failure waited for the whole message (Autobahn 6.4.3/6.4.4's
+/// An invalid byte in a nonfinal fragment fails before the complete message arrives.
 
 #[test]
 fn an_invalid_byte_in_a_non_final_fragment_fails_before_the_message_ends() {
@@ -102,7 +102,7 @@ fn an_invalid_byte_in_a_non_final_fragment_fails_before_the_message_ends() {
     ]);
 }
 
-/// RED before the fix: the sequence is begun in one fragment and its next byte, in the following
+/// An invalid continuation across fragments fails at the invalid byte.
 
 #[test]
 fn an_invalid_continuation_across_fragments_fails_at_that_byte() {
@@ -112,7 +112,7 @@ fn an_invalid_continuation_across_fragments_fails_at_that_byte() {
     ]);
 }
 
-/// RED before the fix: one frame, its payload in chops (6.4.3, 6.4.4), fails at the chop that
+/// An invalid byte inside a frame fails when the input chunk containing it arrives.
 
 #[test]
 fn an_invalid_byte_inside_one_frame_fails_at_its_chop() {
@@ -213,7 +213,7 @@ fn interleaved_controls_do_not_reset_an_unfinished_text_code_point() {
     ]);
 }
 
-/// THE SCAN STARTS ONLY WHERE THE HANDSHAKE ENDED (codeaudit e916fda WS-1): on a dial, the call that
+/// Text scanning starts at the handshake boundary rather than a delimiter inside frame data.
 
 #[test]
 fn a_handshake_call_ending_mid_frame_in_crlfcrlf_does_not_arm_the_scan() {
@@ -256,7 +256,7 @@ fn a_handshake_call_ending_mid_frame_in_crlfcrlf_does_not_arm_the_scan() {
     assert!(!framer.failed(state));
 }
 
-/// NOTHING AFTER A CLOSE IS DATA (codeaudit e916fda WS-2; RFC 6455 section 5.5.1): bytes that
+/// Bytes arriving after the peer's close are not judged as data.
 
 #[test]
 fn bytes_after_the_peers_close_are_not_judged() {
@@ -270,7 +270,7 @@ fn bytes_after_the_peers_close_are_not_judged() {
     assert_eq!(framer.failure(state), None, "cleanly");
 }
 
-/// A FRAME WHOSE HEADER BREAKS THE PROTOCOL IS THE LIBRARY'S TO FAIL (codeaudit e916fda WS-3; RFC
+/// Protocol-invalid frame headers are left to the protocol library rather than judged as text.
 
 #[test]
 fn a_frame_that_breaks_the_protocol_is_not_judged_as_text() {
@@ -301,7 +301,7 @@ fn a_frame_that_breaks_the_protocol_is_not_judged_as_text() {
     }
 }
 
-/// AN ACCEPTED SESSION'S SCAN STARTS ONLY WHERE NOTHING FOLLOWED THE REQUEST (codeaudit e916fda WS-1,
+/// An accepted request followed by frame bytes preserves the correct text-scan boundary.
 
 #[test]
 fn an_accepted_call_with_frame_bytes_after_a_chunk_sized_request_does_not_arm_the_scan() {
@@ -331,7 +331,7 @@ fn an_accepted_call_with_frame_bytes_after_a_chunk_sized_request_does_not_arm_th
     assert_eq!(rest.frames, [payload.to_vec()], "the binary message, whole");
 }
 
-/// THE EARLIER FAULT IS THE ONE STATED (codeaudit e916fda WS-6, review): an invalid text byte and
+/// Invalid text received before the carrier ends remains the reported failure.
 
 #[test]
 fn invalid_text_before_the_carriers_end_is_the_stated_failure() {
@@ -347,7 +347,7 @@ fn invalid_text_before_the_carriers_end_is_the_stated_failure() {
     );
 }
 
-/// OUT-OF-ORDER FRAMES ARE THE LIBRARY'S TO FAIL TOO (codeaudit e916fda WS-3, review): inside a
+/// Out-of-order frames are left to the protocol library rather than judged as text.
 
 #[test]
 fn an_out_of_order_frame_inside_a_text_message_is_not_judged_as_text() {

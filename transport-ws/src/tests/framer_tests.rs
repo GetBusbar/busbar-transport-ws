@@ -305,7 +305,7 @@ fn a_dial_holds_early_messages_only_up_to_the_ceiling_and_the_held_count() {
     assert!(early.sent.is_empty(), "nothing leaves before the handshake");
 }
 
-/// THE FAR END'S REFUSAL OF THE UPGRADE IS ITS ANSWER (THE DESIGN §5, HEAD-FIELDS: the head is
+/// A refused upgrade hands the far end's response up unchanged.
 
 #[test]
 fn a_far_end_that_refuses_the_upgrade_hands_up_its_answer() {
@@ -338,7 +338,7 @@ fn a_far_end_that_refuses_the_upgrade_hands_up_its_answer() {
     }
 }
 
-/// A REFUSED UPGRADE'S BODY REACHES THE PLANE (Q128 transport-ws LOW): after its head, the far end's
+/// A refused upgrade hands the far end's response body and reason up to the plane.
 
 #[test]
 fn a_refused_upgrade_hands_up_its_body_and_its_reason() {
@@ -376,7 +376,7 @@ fn a_refused_upgrade_hands_up_its_body_and_its_reason() {
     assert_eq!(got, body.to_vec(), "the whole error document, once");
 }
 
-/// A REFUSED UPGRADE'S WHOLE BODY, PAST THE MACHINE'S ONE READ (Q128 transport-ws MEDIUM): head and
+/// A refused upgrade hands up the complete large body and the carrier's end.
 
 #[test]
 fn a_refused_upgrade_hands_up_a_large_body_and_the_carrier_end() {
@@ -415,7 +415,7 @@ fn a_refused_upgrade_hands_up_a_large_body_and_the_carrier_end() {
     assert!(heard.ended, "the carrier ended: the frames end");
 }
 
-/// A REFUSED UPGRADE'S CHUNKED BODY IS DECODED BY ITS TRANSFER CODING (Q128 transport-ws LOW, both
+/// A refused upgrade's chunked body is decoded and ends at its last chunk.
 
 #[test]
 fn a_refused_upgrades_chunked_body_is_decoded_and_ends_at_its_last_chunk() {
@@ -453,7 +453,7 @@ fn a_refused_upgrades_chunked_body_is_decoded_and_ends_at_its_last_chunk() {
     );
 }
 
-/// THE CEILING HOLDS FOR WHAT AN OPEN CONNECTION WRITES TOO (Q128 transport-ws LOW): a message over
+/// An open connection refuses an outbound message exceeding its ceiling.
 
 #[test]
 fn an_open_connection_refuses_an_outbound_message_over_the_ceiling() {
@@ -490,7 +490,7 @@ fn an_open_connection_refuses_an_outbound_message_over_the_ceiling() {
     assert!(!ok.sent.is_empty(), "the message went out");
 }
 
-/// A REFUSED PIECE TAKES ITS MESSAGE'S GATHERED PIECES WITH IT ON A DIAL STILL HANDSHAKING (Q128
+/// A refused piece releases its message's gathered pieces while the dial is handshaking.
 
 #[test]
 fn a_refused_piece_on_a_dial_drops_its_gathered_pieces() {
@@ -514,7 +514,7 @@ fn a_refused_piece_on_a_dial_drops_its_gathered_pieces() {
         .expect("a next message within the ceiling is held alone");
 }
 
-/// THE DIALLED HEAD'S ORDER IS PINNED (Q128 transport-ws LOW, reader r51 on 3286006): the request
+/// A dialed request head preserves its field order.
 
 #[test]
 fn the_dialled_heads_order_is_pinned() {
@@ -571,7 +571,7 @@ fn the_dialled_heads_order_is_pinned() {
     );
 }
 
-/// A REFUSED UPGRADE'S BODY CUT SHORT BY THE CARRIER ENDS FAILED (Q128 transport-ws LOW, reader r51
+/// A refused upgrade's body cut short by the carrier fails the stream.
 
 #[test]
 fn a_refused_upgrades_short_body_ends_failed() {
@@ -617,7 +617,7 @@ fn a_refused_upgrades_short_body_ends_failed() {
     assert!(heard.ended && !framer.failed(state));
 }
 
-/// A MALFORMED CHUNKED CODING ENDS FAILED (Q128 transport-ws MEDIUM, reader r162 on 0769fe6): a
+/// A malformed chunked response body fails the stream.
 
 #[test]
 fn a_malformed_chunked_body_ends_failed() {
@@ -644,7 +644,7 @@ fn a_malformed_chunked_body_ends_failed() {
     }
 }
 
-/// A REFUSED UPGRADE'S `Retry-After` IS READ IN BOTH OF RFC 9110's FORMS (Q128 transport-ws LOW,
+/// `Retry-After` is read in both RFC 9110 forms: delay-seconds and HTTP-date.
 
 #[test]
 fn a_retry_after_is_read_in_both_forms() {
@@ -662,7 +662,7 @@ fn a_retry_after_is_read_in_both_forms() {
     assert_eq!(retry_after(&h, 0), None);
 }
 
-/// A REFUSED UPGRADE WITH A STATUS THAT CARRIES NO BODY ENDS AT ITS HEAD (Q128 transport-ws LOW,
+/// A refused upgrade with a bodiless status ends at its response head.
 
 #[test]
 fn a_bodiless_refusal_ends_at_its_head() {
@@ -801,7 +801,7 @@ fn first_data_payload(wire: &[u8]) -> Option<(u8, Vec<u8>)> {
     None
 }
 
-/// A REFUSAL GOES OUT AS ITS OWN MESSAGE (codeaudit r1 g1): pieces of an unfinished outbound message
+/// A refusal is sent as its own message rather than appended to a partial outbound message.
 
 #[test]
 fn a_refusal_is_not_glued_onto_a_gathered_partial_message() {
@@ -825,7 +825,7 @@ fn a_refusal_is_not_glued_onto_a_gathered_partial_message() {
     assert_eq!(payload, b"refused".to_vec());
 }
 
-/// A BARE-LF RESPONSE HEAD IS READ AS THE PROTOCOL LIBRARY READS IT (codeaudit r1 g1): the status
+/// The protocol library reads a bare-LF response head as a complete head.
 
 #[test]
 fn a_bare_lf_response_head_is_read_whole() {
@@ -865,7 +865,7 @@ fn refused_with(wire: &[u8], carrier_ended: bool) -> (WsFramer, u64, Out) {
     (framer, state, heard)
 }
 
-/// `Retry-After` delay-seconds is 1*DIGIT (RFC 9110 §10.2.3): a signed number is not one. RED before
+/// `Retry-After` delay-seconds follows RFC 9110's `1*DIGIT` grammar without a sign.
 
 #[test]
 fn a_signed_retry_after_is_not_delay_seconds() {
@@ -876,7 +876,7 @@ fn a_signed_retry_after_is_not_delay_seconds() {
     assert_eq!(retry_after(&h, 0), Some(30));
 }
 
-/// A chunk-size is 1*HEXDIG (RFC 9112 §7.1): a signed one is malformed. RED before the fix: `+5`
+/// Chunk sizes follow RFC 9112's `1*HEXDIG` grammar without a sign.
 
 #[test]
 fn a_signed_chunk_size_is_malformed() {
@@ -928,7 +928,7 @@ fn a_non_chunked_transfer_encoding_overrides_content_length() {
     assert_eq!(heard.frames[1..].concat(), b"okmore".to_vec());
 }
 
-/// AFTER THE PEER'S CLOSE, WHAT ARRIVES IS NOBODY'S (codeaudit r1 g1): the frames ended, the machine
+/// No further input is retained after the peer's close.
 
 #[test]
 fn nothing_is_kept_after_the_peers_close() {
@@ -958,7 +958,7 @@ fn nothing_is_kept_after_the_peers_close() {
     }
 }
 
-/// AN UPGRADE ANSWERED WITH ANOTHER 2XX IS NO SUCCESS (codeaudit e916fda WS-5; RFC 6455 section
+/// A successful WebSocket upgrade requires status 101, as RFC 6455 specifies.
 
 #[test]
 fn an_upgrade_answered_with_another_2xx_is_no_success() {
@@ -973,7 +973,7 @@ fn an_upgrade_answered_with_another_2xx_is_no_success() {
     }
 }
 
-/// A DIAL'S SUBPROTOCOL RIDES ITS UPGRADE AND THE ANSWER IS HELD TO IT (codeaudit e916fda WS-7; RFC
+/// A dial requests its subprotocol in the upgrade and checks the response against it.
 
 #[test]
 fn a_dials_subprotocol_rides_the_upgrade_and_the_answer_is_held_to_it() {
@@ -1006,7 +1006,7 @@ fn a_dials_subprotocol_rides_the_upgrade_and_the_answer_is_held_to_it() {
     }
 }
 
-/// THE SCHEME IS READ WHATEVER ITS CASE (codeaudit e916fda WS-8; RFC 3986 section 3.1, as the
+/// URI schemes are read without case sensitivity, as RFC 3986 requires.
 
 #[test]
 fn the_scheme_is_read_whatever_its_case() {
@@ -1028,7 +1028,7 @@ fn the_scheme_is_read_whatever_its_case() {
     assert_eq!(fields_named(&request, "host"), ["api.example"]);
 }
 
-/// A FRAMER WITH NO CEILING PUTS NONE ON WHAT IT WRITES (codeaudit e916fda WS-9): `new(0)` is the
+/// `new(0)` places no outbound ceiling on an open connection.
 
 #[test]
 fn no_ceiling_means_no_outbound_ceiling_on_an_open_connection() {
@@ -1049,7 +1049,7 @@ fn no_ceiling_means_no_outbound_ceiling_on_an_open_connection() {
     assert!(sent.sent.len() > big.len(), "the message goes out");
 }
 
-/// A SHIPPED DIAL IS RANDOM WHERE RFC 6455 SAYS SO (codeaudit e916fda tests MEDIUM): its handshake
+/// A shipped dial sends a fresh handshake key and masks every frame as RFC 6455 requires.
 
 #[test]
 fn a_shipped_dial_sends_a_fresh_key_and_masks_every_frame() {
@@ -1090,7 +1090,7 @@ fn a_shipped_dial_sends_a_fresh_key_and_masks_every_frame() {
     );
 }
 
-/// A CHUNK-SIZE LINE PAST ITS BOUND ENDS THE BODY FAILED (codeaudit e916fda tests LOW): a refused
+/// A chunk-size line exceeding its bound fails the body.
 
 #[test]
 fn a_chunk_line_past_its_bound_ends_the_body_failed() {

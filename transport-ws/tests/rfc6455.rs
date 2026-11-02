@@ -357,7 +357,7 @@ fn a_text_message_is_handed_up_as_utf8_and_a_binary_one_as_octets() {
     assert_eq!(said.frames, [(b"fragment".to_vec(), UTF8)]);
 }
 
-/// RED (Autobahn 1.1.1, 6.1.1, 6.1.2, 9.7.1; the stream-end ruling): an EMPTY text message is
+/// An empty message retains its kind and does not end the stream.
 
 #[test]
 fn an_empty_message_keeps_its_kind_and_never_ends_the_stream() {
@@ -460,7 +460,7 @@ fn closing_because_the_peer_left_is_an_orderly_close_never_going_away() {
     );
 }
 
-/// A drain closes with 1012 (Service Restart), as predev does. v1.5.5 had no WebSocket at all (no
+/// A drain closes with 1012 (Service Restart), matching the predev WebSocket transport.
 
 #[test]
 fn a_drain_closes_with_1012() {

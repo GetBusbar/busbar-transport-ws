@@ -99,7 +99,7 @@ fn sink(frame: &mut [u8], pieces: &mut [FramePiece], heads: &mut [HeadSlots]) ->
     s
 }
 
-/// A DIALLED HEAD'S REASON GOES ONLY WITH ITS HEAD'S FIRST PIECE, AND NEVER STALLS IT (Q128
+/// A response reason accompanies only its head's first piece and never stalls that piece.
 
 #[test]
 fn a_reason_rides_only_beside_its_heads_first_piece() {
@@ -147,7 +147,7 @@ fn a_reason_rides_only_beside_its_heads_first_piece() {
     assert_eq!(phrase.as_deref(), Some(&b"Unauthorized"[..]));
 }
 
-/// A FRAMING WHOSE OP PANICKED IS GONE ONCE IT IS FINISHED (Q128 transport-ws LOW, reader r52 on
+/// Finishing a framing whose operation panicked removes it from the framer.
 
 #[test]
 fn a_panicked_framing_is_forgotten_by_the_framer_at_its_finish() {
@@ -240,7 +240,7 @@ fn drain_owed(
     panic!("a re-call never ran dry");
 }
 
-/// A LARGE PIECE AND A LARGE WIRE ARE HANDED OVER INTACT, IN ORDER, ACROSS RE-CALLS (codeaudit g2
+/// Large pieces and wire output are handed over intact and in order across recalls.
 
 #[test]
 fn a_large_piece_and_wire_are_handed_over_intact_across_recalls() {
@@ -266,7 +266,7 @@ fn a_large_piece_and_wire_are_handed_over_intact_across_recalls() {
     assert!(owed.wire.is_empty() && owed.pieces.is_empty());
 }
 
-/// HANDING OVER MOVES NO REMAINDER (codeaudit g2 MEDIUM): a piece taken in parts keeps its buffer
+/// Partial handover retains the buffer without moving its remainder.
 
 #[test]
 fn handing_over_a_large_piece_or_wire_moves_no_remainder() {
@@ -304,7 +304,7 @@ fn handing_over_a_large_piece_or_wire_moves_no_remainder() {
     assert!(owed.wire[100..].iter().all(|&b| b == 0xAA));
 }
 
-/// THE WIRE'S CAPACITY FOLLOWS ITS BACKLOG, NOT ITS THROUGHPUT (codeaudit g2 review): a wire that
+/// Wire capacity follows its backlog rather than total throughput.
 
 #[test]
 fn the_wire_s_capacity_follows_its_backlog_not_its_throughput() {
@@ -365,7 +365,7 @@ fn only_the_opening_is_wiped_as_it_is_handed_over() {
     );
 }
 
-/// A DRAINED WIRE GIVES BACK WHAT ONE LARGE MESSAGE GREW IT PAST [`KEEP_BYTES`] (codeaudit e916fda
+/// A drained wire releases capacity grown beyond `KEEP_BYTES`.
 
 #[test]
 fn a_drained_wire_is_bounded() {
@@ -596,7 +596,7 @@ fn switching(request: &[u8]) -> Vec<u8> {
     .into_bytes()
 }
 
-/// THE CARRIER'S END REACHES THE MACHINE THROUGH THE DOOR (codeaudit e916fda tests MEDIUM): an
+/// The carrier's end reaches the framing machine through the plugin door.
 
 #[test]
 fn the_carriers_end_reaches_the_machine_through_the_door() {
@@ -628,7 +628,7 @@ fn the_carriers_end_reaches_the_machine_through_the_door() {
     shut(p);
 }
 
-/// A FINISHED FRAMING IS GONE ONCE WHAT IT OWES IS OUT (codeaudit e916fda tests MEDIUM): a finish
+/// A finished framing is removed once its owed output drains.
 
 #[test]
 fn a_finished_framing_is_gone_once_drained() {
@@ -659,7 +659,7 @@ fn a_finished_framing_is_gone_once_drained() {
     shut(p);
 }
 
-/// ONLY A DIAL'S OPENING IS MARKED TO BE WIPED, THROUGH THE DOOR (codeaudit e916fda tests MEDIUM,
+/// Only a dial's opening is marked secret through the door.
 
 #[test]
 fn only_a_dials_opening_is_marked_secret_through_the_door() {
@@ -699,7 +699,7 @@ fn only_a_dials_opening_is_marked_secret_through_the_door() {
     shut(p);
 }
 
-/// A DIALLED HEAD'S REASON REACHES THE HOST'S HEAD SLOTS, BESIDE ITS HEAD (codeaudit e916fda tests
+/// A dialed response head's reason reaches the host's head slots.
 
 #[test]
 fn a_dialled_heads_reason_reaches_the_head_slots() {
@@ -717,7 +717,7 @@ fn a_dialled_heads_reason_reaches_the_head_slots() {
     shut(p);
 }
 
-/// THE WIPE IS SEEN (codeaudit e916fda tests LOW): a queue buffer holding owed opening bytes goes
+/// An opening buffer is freed and wiped on Linux.
 
 #[test]
 fn an_opening_buffer_is_freed_and_wiped_on_linux() {
