@@ -460,7 +460,7 @@ fn closing_because_the_peer_left_is_an_orderly_close_never_going_away() {
     );
 }
 
-/// A drain closes with 1012 (Service Restart), matching the predev WebSocket transport.
+/// A drain closes with 1012 (Service Restart), matching predev; v1.5.5 had no WebSocket transport.
 
 #[test]
 fn a_drain_closes_with_1012() {
