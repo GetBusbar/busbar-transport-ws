@@ -798,9 +798,16 @@ fn opening(
         o.error(texts.no_instance);
         return Outcome::Failed;
     };
-    let mut owed = Owed::default();
-    owed.adopted = adopted;
-    owed.policy = policy;
+    let mut owed = Owed {
+        adopted,
+        policy,
+        wire: Vec::new(),
+        wire_at: 0,
+        secret: 0,
+        pieces: VecDeque::new(),
+        spare: Vec::new(),
+        ended: false,
+    };
     let mut c = Collect {
         owed: &mut owed,
         now: time(&sink),

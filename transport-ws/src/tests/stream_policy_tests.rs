@@ -315,16 +315,13 @@ fn cancelling_a_direct_upgrade_opening_retires_its_buffer_and_framing() {
     let door = crate::door::door();
     // SAFETY: this linked door owns its static transport table.
     let ops = unsafe { &*(*door).ops().cast::<Ops>() };
-    // SAFETY: the live instance owns this outstanding ticket.
     assert_eq!(
-        unsafe {
-            (ops.head.cancel.unwrap())(
-                host.instance,
-                std::ptr::from_ref(&input).cast(),
-                std::ptr::from_mut(&mut out).cast(),
-            )
-            .outcome()
-        },
+        (ops.head.cancel.unwrap())(
+            host.instance,
+            std::ptr::from_ref(&input).cast(),
+            std::ptr::from_mut(&mut out).cast(),
+        )
+        .outcome(),
         Outcome::Ready
     );
     assert_eq!(out.disposition, CANCEL_PARTIAL);
