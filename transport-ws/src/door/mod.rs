@@ -299,7 +299,9 @@ struct HttpAnswer {
     bodyless: bool,
 }
 
-fn answer_fields(block: &[u8]) -> Result<Vec<(&[u8], &[u8])>, TransportError> {
+type AnswerField<'a> = (&'a [u8], &'a [u8]);
+
+fn answer_fields(block: &[u8]) -> Result<Vec<AnswerField<'_>>, TransportError> {
     use tungstenite::http::{HeaderName, HeaderValue};
     let fields: Vec<_> = busbar_contract::abi::transport::fields::lines(block).collect();
     let parsed: usize = fields.iter().map(|(n, v)| n.len() + v.len() + 4).sum();

@@ -714,3 +714,45 @@ fn prewire_opt_out_keeps_legacy_adoption_free_of_empty_application_messages() {
     finish(p, token, &mut l);
     shut(p);
 }
+
+#[test]
+fn prewire_partial_adoption_marks_acceptance_once_and_blocks_uncommitted_data() {
+    let (p, token, _) = staged();
+    let mut l = Lend::roomy();
+    let early = prewire_emit(p, token, 0, b"early", true, 0, &mut l);
+    assert_ne!(early.outcome, Outcome::Ready);
+    assert!(early.wire.is_empty());
+    finish(p, token, &mut l);
+    shut(p);
+
+    let p = instance();
+    let ext = prewire_extension();
+    let split = UPGRADE.len() / 2;
+    let mut l = Lend::new(64 * 1024, 64 * 1024, 16, 0);
+    let (pending, token) = adopt(p, &ext, &UPGRADE[..split], &mut l);
+    assert_eq!(pending.outcome, Outcome::Ready);
+    assert!(pending.wire.is_empty());
+    assert!(pending.pieces.is_empty());
+    let accepted = ingest(p, token, &UPGRADE[split..], false, &mut l);
+    assert_eq!(accepted.outcome, Outcome::Ready);
+    assert_eq!(accepted.reasons.len(), 0);
+    assert_eq!(accepted.pieces.len(), 1);
+    assert_eq!(l.pieces[0].stream, 37);
+    assert_eq!(l.pieces[0].code, 101);
+    assert_eq!(l.pieces[0].status_class, STATUS_SUCCESS);
+    assert_eq!(
+        l.pieces[0].flags,
+        PIECE_FIELDS | PIECE_HAS_CODE | PIECE_END_OF_FRAME
+    );
+    assert!(accepted.wire.starts_with(b"HTTP/1.1 101"));
+    let again = ingest(p, token, &[], false, &mut l);
+    assert!(again.wire.is_empty());
+    assert!(again.pieces.is_empty());
+    let commit = prewire_emit(p, token, 101, &[], true, 0, &mut l);
+    assert_eq!(commit.outcome, Outcome::Ready);
+    assert!(commit.wire.is_empty());
+    let message = prewire_emit(p, token, 0, b"ok", true, 0, &mut l);
+    assert_eq!(message.wire, b"\x82\x02ok");
+    finish(p, token, &mut l);
+    shut(p);
+}
