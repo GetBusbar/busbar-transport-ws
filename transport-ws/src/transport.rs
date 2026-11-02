@@ -521,22 +521,41 @@ pub(crate) fn asks_extension(fields: &[(String, Vec<u8>)]) -> bool {
         .any(|(name, _)| name.eq_ignore_ascii_case("sec-websocket-extensions"))
 }
 
-/// The answer's head as a field block (`busbar_contract::abi::transport::fields`): the switching
-/// response's fields as the parsed head holds them (`HeaderMap`: names in the order they first
-/// appear, a repeated name's values together under its first appearance, in their own order), names
-/// lower-case, each value on its own line. Hop-by-hop fields (and every field a `connection` field
-/// names) never enter it, nor do the handshake's own fields ([`rides_upgrade`]'s refusals:
-/// `content-length` among them, and every `sec-websocket-*` field but `sec-websocket-protocol`,
-/// which answer this hop's handshake and nothing above it; the subprotocol the far end selected is
-/// the layer above's). No field left is the EMPTY block, still handed up: an empty head is a head.
-fn head_block(headers: &HeaderMap) -> Vec<u8> {
+/// The answer's validated head as a field block, in its original wire order. HeaderMap groups
+/// repeated values and does not promise a cross-name order, so the original parsed head supplies
+/// only the name sequence; every emitted value still comes from the protocol parser's HeaderMap.
+/// Hop-by-hop, Connection-nominated and handshake-only fields never enter the block. An empty
+/// block is still a response head.
+fn head_block(headers: &HeaderMap, seen: &[u8]) -> Result<Vec<u8>, TransportError> {
     let nominated: Vec<&[u8]> = headers
         .get_all("connection")
         .iter()
         .map(HeaderValue::as_bytes)
         .collect();
+    let head = status_line_start(seen);
+    let first_line = head
+        .iter()
+        .position(|byte| *byte == b'\n')
+        .ok_or(TransportError::HandshakeFailed)?;
+    let mut occurrences = HashMap::<HeaderName, usize>::new();
     let mut block = Vec::new();
-    for (name, value) in headers {
+    for line in head[first_line + 1..].split(|byte| *byte == b'\n') {
+        if line.is_empty() || line == b"\r" {
+            break;
+        }
+        let colon = line
+            .iter()
+            .position(|byte| *byte == b':')
+            .ok_or(TransportError::HandshakeFailed)?;
+        let name =
+            HeaderName::from_bytes(&line[..colon]).map_err(|_| TransportError::HandshakeFailed)?;
+        let occurrence = occurrences.entry(name.clone()).or_default();
+        let value = headers
+            .get_all(&name)
+            .iter()
+            .nth(*occurrence)
+            .ok_or(TransportError::HandshakeFailed)?;
+        *occurrence += 1;
         let name = name.as_str();
         if !rides_upgrade(name) || hop_by_hop(name, nominated.iter().copied()) {
             continue;
@@ -546,7 +565,7 @@ fn head_block(headers: &HeaderMap) -> Vec<u8> {
         block.extend_from_slice(value.as_bytes());
         block.extend_from_slice(LINE_END);
     }
-    block
+    Ok(block)
 }
 
 /// One message as the protocol machine sends it.
@@ -1419,7 +1438,7 @@ impl WsFramer {
                         pipe.ended = stream.ended;
                         return Ok(true);
                     }
-                    let block = head_block(result.headers());
+                    let block = head_block(result.headers(), &stream.seen[stream.head_at..])?;
                     let reason = reason_phrase(
                         stream
                             .seen
@@ -1601,7 +1620,10 @@ impl WsFramer {
                     // The far end answered: its switching response is the stream's
                     // head, handed up before anything else, with its status and its field block.
                     // A far end that answered the upgrade and sends nothing more has answered.
-                    let block = head_block(response.headers());
+                    let block = head_block(
+                        response.headers(),
+                        shaken.as_ref().map_or(&[][..], |(seen, _)| seen.as_slice()),
+                    )?;
                     out.frame(Framed {
                         status: Some(WireStatusClass::Success),
                         status_code: Some(u32::from(response.status().as_u16())),
@@ -1652,7 +1674,10 @@ impl WsFramer {
                 Err(HandshakeError::Failure(WsError::Http(response))) => {
                     let reason = shaken.as_ref().and_then(|(seen, _)| reason_phrase(seen));
                     let code = response.status().as_u16();
-                    let block = head_block(response.headers());
+                    let block = head_block(
+                        response.headers(),
+                        shaken.as_ref().map_or(&[][..], |(seen, _)| seen.as_slice()),
+                    )?;
                     out.frame(Framed {
                         status: Some(status_class(code)),
                         status_code: Some(u32::from(code)),
