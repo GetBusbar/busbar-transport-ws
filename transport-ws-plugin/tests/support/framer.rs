@@ -179,6 +179,7 @@ struct Yielded {
     wire: Vec<u8>,
     /// Whole frames (their last piece carried `PIECE_END_OF_FRAME`), and the piece flags seen.
     frames: Vec<Vec<u8>>,
+    pieces: Vec<FramePiece>,
     /// A frame begun and not ended.
     partial: Vec<u8>,
     /// Frame bytes answered with no piece (what `detach` hands back).
@@ -208,6 +209,7 @@ impl Yielded {
             self.raw.extend_from_slice(&sink.frame[..frame_len]);
         }
         for p in &sink.pieces[..pieces] {
+            self.pieces.push(*p);
             let at = p.offset as usize;
             let bytes = sink
                 .frame
@@ -950,7 +952,48 @@ fn exercise(p: &Plugin<Transport>, d: &busbar_plugin_loader::dispatch::Dispatche
             let label = "refuse";
             let want = want;
             let before = count(&p);
-            let value = (|| pump(&p, token, Op::Refuse(&bytes), &mut tight).line())();
+            let mut yielded = pump(&p, token, Op::Refuse(&bytes), &mut tight);
+            // refusal_with closes the local WebSocket and calls FramerOut::end(). The
+            // resulting empty END piece is the stream boundary, not a content frame.
+            // Pin its complete shape before comparing the unchanged no-content golden.
+            let [terminal] = yielded.pieces.as_slice() else {
+                panic!(
+                    "refusal must yield exactly its terminal boundary: {:?}",
+                    yielded.pieces
+                );
+            };
+            assert_eq!(
+                (
+                    terminal.stream,
+                    terminal.offset,
+                    terminal.len,
+                    terminal.flags,
+                    terminal.code,
+                    terminal.status_class,
+                    terminal.fault,
+                    terminal.retry_after_secs,
+                    terminal.declared_len
+                ),
+                (
+                    0,
+                    0,
+                    0,
+                    busbar_contract::abi::transport::PIECE_END | PIECE_END_OF_FRAME,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0
+                ),
+                "the refusal has exactly one empty terminal piece, with no content or status"
+            );
+            assert_eq!(
+                yielded.frames,
+                vec![Vec::<u8>::new()],
+                "only the terminal boundary completes a frame"
+            );
+            yielded.frames.clear();
+            let value = yielded.line();
             assert_eq!(
                 count(&p) - before,
                 sinkfuls(wire.len(), TIGHT_WIRE),
