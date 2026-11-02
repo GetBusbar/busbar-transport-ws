@@ -15,7 +15,6 @@ pub(crate) const SELECTOR_FORMS: &[SelectorForm] = claims::SELECTOR_FORMS;
 /// The selector forms evaluated when dialling out.
 pub(crate) const EGRESS_SELECTOR_FORMS: &[SelectorForm] = claims::EGRESS_SELECTOR_FORMS;
 /// None: no transport names another. The carrier is the
-
 pub(crate) const COMPOSES_OVER: &[&str] = &[];
 /// A WebSocket carries a session, and the session caches its principal.
 pub(crate) const SESSION: bool = true;

@@ -88,7 +88,6 @@ fn serve(stream: TcpStream) {
 }
 
 /// Read the request head and return its `Sec-WebSocket-Key`, or `None` for anything that is not
-
 fn read_handshake(reader: &mut impl BufRead) -> Option<String> {
     let mut key = None;
     let mut version_ok = false;
@@ -290,13 +289,11 @@ impl Session {
 }
 
 /// Codes a peer may send in a close frame (RFC 6455 section 7.4, the IANA registry): the defined
-
 fn close_code_valid(code: u16) -> bool {
     matches!(code, 1000..=1003 | 1007..=1014 | 3000..=4999)
 }
 
 /// Write the failure's close if there is one, then half-close and drain, so the peer reads
-
 fn finish(reader: &mut impl Read, writer: &mut TcpStream, end: End) {
     if let End::Fail(code) = end {
         let _ = write_frame(writer, 0x8, &code.to_be_bytes());

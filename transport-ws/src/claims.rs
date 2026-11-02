@@ -6,7 +6,6 @@
 use busbar_contract::grammar::SelectorForm;
 
 /// The forms an INGRESS claim over this wire may take.
-
 pub(crate) const SELECTOR_FORMS: &[SelectorForm] = &[
     SelectorForm::ExactPath,
     SelectorForm::PrefixOneLevel,

@@ -62,7 +62,6 @@ fn ws_claims_ws_and_wss() {
 }
 
 /// Every claim row agrees with the transport's declaration.
-
 #[test]
 fn every_claim_row_states_the_declaration() {
     const N: usize = meta::SELECTOR_FORMS.len();
@@ -155,7 +154,6 @@ fn opening(target: &str) -> String {
 }
 
 /// IPv6 literal targets locate with bracketed addresses.
-
 #[test]
 fn an_ipv6_literal_target_locates_bracketed() {
     let f = WsFramer::new(0);
@@ -171,7 +169,6 @@ fn an_ipv6_literal_target_locates_bracketed() {
 }
 
 /// An IPv6 literal target opens a dial with the expected request and Host field.
-
 #[test]
 fn an_ipv6_literal_target_dials() {
     let request = opening("ws://[::1]:8080/x");
@@ -180,7 +177,6 @@ fn an_ipv6_literal_target_dials() {
 }
 
 /// A dial sends the Host field as stated in its target.
-
 #[test]
 fn a_dial_sends_the_host_as_the_target_writes_it() {
     let request = opening("wss://api.example/v1/realtime?model=m");
@@ -194,7 +190,6 @@ fn a_dial_sends_the_host_as_the_target_writes_it() {
 }
 
 /// A carrier ending without a close frame fails the stream.
-
 #[test]
 fn a_carrier_end_without_a_close_ends_the_stream_failed() {
     const WHY: &str = "the carrier ended with no WebSocket closing handshake";
@@ -233,7 +228,6 @@ fn a_carrier_end_without_a_close_ends_the_stream_failed() {
 }
 
 /// A panic in one framing leaves other framings usable.
-
 #[test]
 fn a_panic_in_one_framing_leaves_the_others_working() {
     let f = WsFramer::new(0);
@@ -272,7 +266,6 @@ fn a_panic_in_one_framing_leaves_the_others_working() {
 }
 
 /// Counts every allocation (and reallocation) the CURRENT thread makes while its count is on, so
-
 struct Counting;
 
 /// An allocation's base, its greatest known initialized prefix, and its secret marker.
@@ -314,7 +307,6 @@ thread_local! {
 }
 
 /// Watch a live allocation's base and a prefix known to have been initialized, even if its Vec
-
 pub(crate) fn watch_free(ptr: *const u8, len: usize, secret: &'static [u8]) {
     assert!(!ptr.is_null() && len >= secret.len());
     assert!((1..=SECRET_MAX).contains(&secret.len()));
@@ -338,7 +330,6 @@ pub(crate) fn watch_free(ptr: *const u8, len: usize, secret: &'static [u8]) {
 }
 
 /// Require the actual free on every platform and a complete Linux byte observation. Other
-
 pub(crate) fn assert_freed_wiped() {
     let observed = WATCHED.with(Cell::get);
     assert!(
@@ -414,7 +405,6 @@ fn observe((address, len, secret): Watch, allocation_size: usize) -> Observation
 }
 
 /// The kernel copies only the registered initialized prefix into initialized stack storage,
-
 fn inspect(ptr: *mut u8, allocation_size: usize) {
     let _ = WATCH.try_with(|w| {
         let Some(watch) = w.get().filter(|(at, _, _)| *at == ptr as usize) else {
@@ -514,7 +504,6 @@ fn z<T>() -> T {
 }
 
 /// The door's own slots, entered as its trampoline enters them but outside it: the count is the
-
 struct Host {
     inst: *mut c_void,
     wire: Vec<u8>,
@@ -667,7 +656,6 @@ impl Write for Socket {
 }
 
 /// Steady-state framing adds no allocation of its own per message.
-
 #[test]
 fn a_steady_framing_adds_no_allocation_of_its_own_per_message() {
     let mut ws = WebSocket::from_raw_socket(Socket::default(), Role::Server, None);
@@ -716,7 +704,6 @@ fn a_steady_framing_adds_no_allocation_of_its_own_per_message() {
 }
 
 /// A response head arriving in small pieces is not copied on every call.
-
 #[test]
 fn a_dribbled_answer_head_is_not_copied_per_call() {
     let f = WsFramer::new(0);
@@ -740,7 +727,6 @@ fn a_dribbled_answer_head_is_not_copied_per_call() {
 }
 
 /// Emit after the peer's close reports the connection closed.
-
 #[test]
 fn an_emit_after_the_peers_close_finds_the_connection_closed() {
     use busbar_contract::transport::wire::TransportError;
@@ -778,7 +764,6 @@ fn an_emit_after_the_peers_close_finds_the_connection_closed() {
 }
 
 /// The pipe containing a dial's upgrade request is freed and wiped after handover on Linux.
-
 #[test]
 fn the_pipe_that_wrote_the_upgrade_request_is_freed_and_wiped_on_linux() {
     const SECRET: &[u8] = b"Bearer sk-start-secret";

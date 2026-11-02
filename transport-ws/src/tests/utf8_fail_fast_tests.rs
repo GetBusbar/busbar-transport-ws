@@ -73,7 +73,6 @@ fn close_code(framer: &WsFramer, state: u64) -> Option<u16> {
 }
 
 /// Ingest `chops` in order; each must leave the connection alive except the last, which must end
-
 fn fails_at_last(chops: &[Vec<u8>]) {
     let framer = WsFramer::new(0);
     let state = open(&framer);
@@ -93,7 +92,6 @@ fn fails_at_last(chops: &[Vec<u8>]) {
 }
 
 /// An invalid byte in a nonfinal fragment fails before the complete message arrives.
-
 #[test]
 fn an_invalid_byte_in_a_non_final_fragment_fails_before_the_message_ends() {
     fails_at_last(&[
@@ -103,7 +101,6 @@ fn an_invalid_byte_in_a_non_final_fragment_fails_before_the_message_ends() {
 }
 
 /// An invalid continuation across fragments fails at the invalid byte.
-
 #[test]
 fn an_invalid_continuation_across_fragments_fails_at_that_byte() {
     fails_at_last(&[
@@ -113,7 +110,6 @@ fn an_invalid_continuation_across_fragments_fails_at_that_byte() {
 }
 
 /// An invalid byte inside a frame fails when the input chunk containing it arrives.
-
 #[test]
 fn an_invalid_byte_inside_one_frame_fails_at_its_chop() {
     let mut payload = "κόσμε".as_bytes().to_vec();
@@ -132,7 +128,6 @@ fn an_invalid_byte_inside_one_frame_fails_at_its_chop() {
 }
 
 /// A code point split across fragments, and a masked frame header split from its payload, are
-
 #[test]
 fn a_code_point_split_across_fragments_is_still_accepted() {
     let framer = WsFramer::new(0);
@@ -158,7 +153,6 @@ fn a_code_point_split_across_fragments_is_still_accepted() {
 }
 
 /// Control payloads are octets even while a text code point is unfinished. Splitting each
-
 #[test]
 fn split_extended_headers_and_interleaved_controls_preserve_text_state() {
     for len in [126, 65_536] {
@@ -214,7 +208,6 @@ fn interleaved_controls_do_not_reset_an_unfinished_text_code_point() {
 }
 
 /// Text scanning starts at the handshake boundary rather than a delimiter inside frame data.
-
 #[test]
 fn a_handshake_call_ending_mid_frame_in_crlfcrlf_does_not_arm_the_scan() {
     let mut payload = b"GET / HTTP/1.1\r\nHost: x\r\n\r\n".to_vec();
@@ -257,7 +250,6 @@ fn a_handshake_call_ending_mid_frame_in_crlfcrlf_does_not_arm_the_scan() {
 }
 
 /// Bytes arriving after the peer's close are not judged as data.
-
 #[test]
 fn bytes_after_the_peers_close_are_not_judged() {
     let framer = WsFramer::new(0);
@@ -271,7 +263,6 @@ fn bytes_after_the_peers_close_are_not_judged() {
 }
 
 /// Protocol-invalid frame headers are left to the protocol library rather than judged as text.
-
 #[test]
 fn a_frame_that_breaks_the_protocol_is_not_judged_as_text() {
     let unmasked = vec![0x81, 0x05, 0xff, 0xfe, 0xfd, 0xfc, 0xfb];
@@ -302,7 +293,6 @@ fn a_frame_that_breaks_the_protocol_is_not_judged_as_text() {
 }
 
 /// An accepted request followed by frame bytes preserves the correct text-scan boundary.
-
 #[test]
 fn an_accepted_call_with_frame_bytes_after_a_chunk_sized_request_does_not_arm_the_scan() {
     let head = b"GET /echo HTTP/1.1\r\nHost: svc.test\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\nX-Pad: ";
@@ -332,7 +322,6 @@ fn an_accepted_call_with_frame_bytes_after_a_chunk_sized_request_does_not_arm_th
 }
 
 /// Invalid text received before the carrier ends remains the reported failure.
-
 #[test]
 fn invalid_text_before_the_carriers_end_is_the_stated_failure() {
     let framer = WsFramer::new(0);
@@ -348,7 +337,6 @@ fn invalid_text_before_the_carriers_end_is_the_stated_failure() {
 }
 
 /// Out-of-order frames are left to the protocol library rather than judged as text.
-
 #[test]
 fn an_out_of_order_frame_inside_a_text_message_is_not_judged_as_text() {
     for opcode in [TEXT, 0x3] {

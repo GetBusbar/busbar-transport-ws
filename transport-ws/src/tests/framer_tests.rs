@@ -230,7 +230,6 @@ fn a_dial_carries_its_opening_fields_holds_early_messages_and_flags_text() {
 }
 
 /// `split_ws_url` on the bracketed-IPv6 shapes. A literal address with an explicit port is the one
-
 #[test]
 fn a_bracketed_ipv6_authority_parses_with_and_without_a_port() {
     assert_eq!(
@@ -253,7 +252,6 @@ fn a_bracketed_ipv6_authority_parses_with_and_without_a_port() {
 }
 
 /// The authority ends at `?`, `#` or `\` as well as `/`, where the handshake's own parser ends it.
-
 #[test]
 fn a_ws_authority_ends_at_a_query_a_fragment_or_a_backslash() {
     assert_eq!(
@@ -272,7 +270,6 @@ fn a_ws_authority_ends_at_a_query_a_fragment_or_a_backslash() {
 }
 
 /// HELD, AND BOUNDED: a dial whose far end never answers cannot grow the framing without end. A
-
 #[test]
 fn a_dial_holds_early_messages_only_up_to_the_ceiling_and_the_held_count() {
     let framer = WsFramer::new(8);
@@ -306,7 +303,6 @@ fn a_dial_holds_early_messages_only_up_to_the_ceiling_and_the_held_count() {
 }
 
 /// A refused upgrade hands the far end's response up unchanged.
-
 #[test]
 fn a_far_end_that_refuses_the_upgrade_hands_up_its_answer() {
     for (code, class) in [
@@ -339,7 +335,6 @@ fn a_far_end_that_refuses_the_upgrade_hands_up_its_answer() {
 }
 
 /// A refused upgrade hands the far end's response body and reason up to the plane.
-
 #[test]
 fn a_refused_upgrade_hands_up_its_body_and_its_reason() {
     let framer = WsFramer::new(0);
@@ -377,7 +372,6 @@ fn a_refused_upgrade_hands_up_its_body_and_its_reason() {
 }
 
 /// A refused upgrade hands up the complete large body and the carrier's end.
-
 #[test]
 fn a_refused_upgrade_hands_up_a_large_body_and_the_carrier_end() {
     let body = vec![b'x'; 9000];
@@ -416,7 +410,6 @@ fn a_refused_upgrade_hands_up_a_large_body_and_the_carrier_end() {
 }
 
 /// A refused upgrade's chunked body is decoded and ends at its last chunk.
-
 #[test]
 fn a_refused_upgrades_chunked_body_is_decoded_and_ends_at_its_last_chunk() {
     let framer = WsFramer::new(0);
@@ -454,7 +447,6 @@ fn a_refused_upgrades_chunked_body_is_decoded_and_ends_at_its_last_chunk() {
 }
 
 /// An open connection refuses an outbound message exceeding its ceiling.
-
 #[test]
 fn an_open_connection_refuses_an_outbound_message_over_the_ceiling() {
     let framer = WsFramer::new(8);
@@ -491,7 +483,6 @@ fn an_open_connection_refuses_an_outbound_message_over_the_ceiling() {
 }
 
 /// A refused piece releases its message's gathered pieces while the dial is handshaking.
-
 #[test]
 fn a_refused_piece_on_a_dial_drops_its_gathered_pieces() {
     let framer = WsFramer::new(8);
@@ -515,7 +506,6 @@ fn a_refused_piece_on_a_dial_drops_its_gathered_pieces() {
 }
 
 /// A dialed request head preserves its field order.
-
 #[test]
 fn the_dialled_heads_order_is_pinned() {
     let framer = WsFramer::new(0);
@@ -572,7 +562,6 @@ fn the_dialled_heads_order_is_pinned() {
 }
 
 /// A refused upgrade's body cut short by the carrier fails the stream.
-
 #[test]
 fn a_refused_upgrades_short_body_ends_failed() {
     for (head, body) in [
@@ -618,7 +607,6 @@ fn a_refused_upgrades_short_body_ends_failed() {
 }
 
 /// A malformed chunked response body fails the stream.
-
 #[test]
 fn a_malformed_chunked_body_ends_failed() {
     for body in [
@@ -645,7 +633,6 @@ fn a_malformed_chunked_body_ends_failed() {
 }
 
 /// `Retry-After` is read in both RFC 9110 forms: delay-seconds and HTTP-date.
-
 #[test]
 fn a_retry_after_is_read_in_both_forms() {
     let mut h = HeaderMap::new();
@@ -663,7 +650,6 @@ fn a_retry_after_is_read_in_both_forms() {
 }
 
 /// A refused upgrade with a bodiless status ends at its response head.
-
 #[test]
 fn a_bodiless_refusal_ends_at_its_head() {
     for answer in [
@@ -723,7 +709,6 @@ fn close_code(wire: &[u8]) -> Option<u16> {
 }
 
 /// A REFUSAL CLOSES WITH THE CODE ITS NEUTRAL STATUS MAPS TO (the plane seam: a neutral status the
-
 #[test]
 fn a_refusal_closes_with_the_code_its_status_maps_to() {
     for (status, code) in [
@@ -753,7 +738,6 @@ fn a_refusal_closes_with_the_code_its_status_maps_to() {
 }
 
 /// A TEXT MESSAGE HELD WHILE THE DIAL'S HANDSHAKE RUNS IS CHECKED AT THE CALL, as the open
-
 #[test]
 fn a_held_text_message_that_is_not_utf8_fails_at_the_call() {
     let framer = WsFramer::new(0);
@@ -802,7 +786,6 @@ fn first_data_payload(wire: &[u8]) -> Option<(u8, Vec<u8>)> {
 }
 
 /// A refusal is sent as its own message rather than appended to a partial outbound message.
-
 #[test]
 fn a_refusal_is_not_glued_onto_a_gathered_partial_message() {
     let framer = WsFramer::new(0);
@@ -826,7 +809,6 @@ fn a_refusal_is_not_glued_onto_a_gathered_partial_message() {
 }
 
 /// The protocol library reads a bare-LF response head as a complete head.
-
 #[test]
 fn a_bare_lf_response_head_is_read_whole() {
     assert_eq!(
@@ -866,7 +848,6 @@ fn refused_with(wire: &[u8], carrier_ended: bool) -> (WsFramer, u64, Out) {
 }
 
 /// `Retry-After` delay-seconds follows RFC 9110's `1*DIGIT` grammar without a sign.
-
 #[test]
 fn a_signed_retry_after_is_not_delay_seconds() {
     let mut h = HeaderMap::new();
@@ -877,7 +858,6 @@ fn a_signed_retry_after_is_not_delay_seconds() {
 }
 
 /// Chunk sizes follow RFC 9112's `1*HEXDIG` grammar without a sign.
-
 #[test]
 fn a_signed_chunk_size_is_malformed() {
     let (framer, state, heard) = refused_with(
@@ -889,7 +869,6 @@ fn a_signed_chunk_size_is_malformed() {
 }
 
 /// A `Content-Length` is 1*DIGIT, and every value stated must agree (RFC 9110 §8.6, RFC 9112 §6.3):
-
 #[test]
 fn an_invalid_or_conflicting_content_length_ends_failed() {
     for head in [
@@ -917,7 +896,6 @@ fn an_invalid_or_conflicting_content_length_ends_failed() {
 }
 
 /// A `Transfer-Encoding` whose final coding is not `chunked` leaves the body to run to the carrier's
-
 #[test]
 fn a_non_chunked_transfer_encoding_overrides_content_length() {
     let (framer, state, heard) = refused_with(
@@ -929,7 +907,6 @@ fn a_non_chunked_transfer_encoding_overrides_content_length() {
 }
 
 /// No further input is retained after the peer's close.
-
 #[test]
 fn nothing_is_kept_after_the_peers_close() {
     let upgrade = b"GET /echo HTTP/1.1\r\nHost: svc.test\r\nUpgrade: websocket\r\n\
@@ -959,7 +936,6 @@ fn nothing_is_kept_after_the_peers_close() {
 }
 
 /// A successful WebSocket upgrade requires status 101, as RFC 6455 specifies.
-
 #[test]
 fn an_upgrade_answered_with_another_2xx_is_no_success() {
     for code in [200, 204, 206] {
@@ -974,7 +950,6 @@ fn an_upgrade_answered_with_another_2xx_is_no_success() {
 }
 
 /// A dial requests its subprotocol in the upgrade and checks the response against it.
-
 #[test]
 fn a_dials_subprotocol_rides_the_upgrade_and_the_answer_is_held_to_it() {
     let fields = vec![(
@@ -1007,7 +982,6 @@ fn a_dials_subprotocol_rides_the_upgrade_and_the_answer_is_held_to_it() {
 }
 
 /// URI schemes are read without case sensitivity, as RFC 3986 requires.
-
 #[test]
 fn the_scheme_is_read_whatever_its_case() {
     assert_eq!(
@@ -1029,7 +1003,6 @@ fn the_scheme_is_read_whatever_its_case() {
 }
 
 /// `new(0)` places no outbound ceiling on an open connection.
-
 #[test]
 fn no_ceiling_means_no_outbound_ceiling_on_an_open_connection() {
     let framer = WsFramer::new(0);
@@ -1050,7 +1023,6 @@ fn no_ceiling_means_no_outbound_ceiling_on_an_open_connection() {
 }
 
 /// A shipped dial sends a fresh handshake key and masks every frame as RFC 6455 requires.
-
 #[test]
 fn a_shipped_dial_sends_a_fresh_key_and_masks_every_frame() {
     let open = || {
@@ -1091,7 +1063,6 @@ fn a_shipped_dial_sends_a_fresh_key_and_masks_every_frame() {
 }
 
 /// A chunk-size line exceeding its bound fails the body.
-
 #[test]
 fn a_chunk_line_past_its_bound_ends_the_body_failed() {
     let mut wire = b"HTTP/1.1 401 Unauthorized\r\nTransfer-Encoding: chunked\r\n\r\n".to_vec();

@@ -352,7 +352,6 @@ fn exchange(label: &str, ops: &'static Ops, caps: (usize, usize, usize)) -> Vec<
 }
 
 /// One client message as the wire carries it: FIN, `opcode`, masked with the all-zero key (so the
-
 fn client_message(opcode: u8, payload: &[u8]) -> Vec<u8> {
     let mut m = vec![0x80 | opcode, 0x80 | payload.len() as u8, 0, 0, 0, 0];
     m.extend_from_slice(payload);
@@ -360,7 +359,6 @@ fn client_message(opcode: u8, payload: &[u8]) -> Vec<u8> {
 }
 
 /// Text and binary messages retain their kind on every piece.
-
 fn text_and_binary(label: &str, ops: &'static Ops, caps: (usize, usize, usize)) {
     let mut host = Host::open(ops, caps);
     let mut dial = host.begin(SIDE_DIAL, "ws://svc.test/stream");
@@ -389,7 +387,6 @@ fn text_and_binary(label: &str, ops: &'static Ops, caps: (usize, usize, usize)) 
 }
 
 /// Emitting with `EMIT_TEXT` writes a message with the text opcode.
-
 fn written_as_text(label: &str, ops: &'static Ops, caps: (usize, usize, usize)) {
     let mut host = Host::open(ops, caps);
     let mut dial = host.begin(SIDE_DIAL, "ws://svc.test/stream");
@@ -464,7 +461,6 @@ fn unsupported_emit_flags_refuse_through_the_real_door_and_leave_the_session_usa
 }
 
 /// The far end's switching answer to the upgrade request `request`, its own fields `extra`
-
 fn switching(request: &[u8], extra: &str) -> Vec<u8> {
     let request = String::from_utf8_lossy(request);
     let key = request
@@ -485,7 +481,6 @@ fn switching(request: &[u8], extra: &str) -> Vec<u8> {
 }
 
 /// A silent upgrade still reports its response head through the host's head slots.
-
 fn a_silent_upgrade_is_answered(label: &str, ops: &'static Ops, caps: (usize, usize, usize)) {
     let mut host = Host::open(ops, caps);
     let mut dial = host.begin(SIDE_DIAL, "ws://svc.test/stream");
@@ -554,7 +549,6 @@ fn a_silent_far_end_that_answered_the_upgrade_is_answered_through_the_door() {
 }
 
 /// The accepting end's own switching answer, carried to the dialled end: its head crosses EMPTY
-
 #[test]
 fn an_upgrade_answered_with_no_field_left_is_an_empty_head() {
     let ops = linked();
@@ -606,7 +600,6 @@ fn the_ws_claim_opens_at_the_upgrade_and_composes_over_nothing() {
 }
 
 /// A refused upgrade's `Retry-After` reaches the host through the ABI.
-
 #[test]
 fn a_refused_upgrade_s_retry_after_reaches_the_host() {
     let mut host = Host::open(linked(), (64 * 1024, 64 * 1024, 64));
@@ -623,7 +616,6 @@ fn a_refused_upgrade_s_retry_after_reaches_the_host() {
 }
 
 /// Begin refuses a target that is not text.
-
 #[test]
 fn begin_refuses_a_target_that_is_not_text() {
     let mut host = Host::open(linked(), (64 * 1024, 64 * 1024, 64));
@@ -646,7 +638,6 @@ fn begin_refuses_a_target_that_is_not_text() {
 }
 
 /// Locate returns the accepting listener's protocol offer.
-
 #[test]
 fn locate_for_a_listener_answers_the_accepting_offer() {
     use busbar_contract::abi::transport::{LocateIn, LocateOut};
@@ -672,7 +663,6 @@ fn locate_for_a_listener_answers_the_accepting_offer() {
 }
 
 /// Secure dial location crosses the table with its certificate name and ALPN offer. Each
-
 #[test]
 fn locate_for_a_secure_dial_reports_every_output_and_short_buffer() {
     use busbar_contract::abi::transport::{LocateIn, LocateOut};
@@ -721,7 +711,6 @@ fn locate_for_a_secure_dial_reports_every_output_and_short_buffer() {
 }
 
 /// A REFUSED UPGRADE'S WAIT, IN ITS HTTP-DATE FORM, CROSSES THE ABI (RFC 9110 §10.2.3): a `503`
-
 #[test]
 fn a_refused_upgrade_s_retry_after_http_date_reaches_the_host() {
     let mut host = Host::open(linked(), (64 * 1024, 64 * 1024, 64));
@@ -742,7 +731,6 @@ fn a_refused_upgrade_s_retry_after_http_date_reaches_the_host() {
 }
 
 /// Validate and open refuse a zero message ceiling.
-
 #[test]
 fn a_zero_message_ceiling_is_refused_by_validate_and_open() {
     use busbar_contract::abi::mechanism::call::Blob;
@@ -819,7 +807,6 @@ fn a_refused_open_says_why() {
 }
 
 /// An accepted framing whose far end broke the protocol (a reserved opcode), on a host whose frame
-
 fn broken_accept(frame_cap: usize) -> (Host, End) {
     let mut host = Host::open(linked(), (64 * 1024, frame_cap, 8));
     let mut dial = host.begin(SIDE_DIAL, "ws://svc.test/stream");
@@ -831,7 +818,6 @@ fn broken_accept(frame_cap: usize) -> (Host, End) {
 }
 
 /// THE FAILED END PIECE CARRIES THE REASON: the bytes of the piece that ends a stream the far end
-
 #[test]
 fn a_failed_stream_s_end_piece_says_why() {
     let (host, accept) = broken_accept(64 * 1024);
@@ -844,7 +830,6 @@ fn a_failed_stream_s_end_piece_says_why() {
 }
 
 /// A FAILED PIECE IS NEVER SPLIT: a frame buffer smaller than its reason hands it as ONE piece,
-
 #[test]
 fn a_failed_piece_is_never_handed_as_payload() {
     let (host, accept) = broken_accept(5);
@@ -855,7 +840,6 @@ fn a_failed_piece_is_never_handed_as_payload() {
 }
 
 /// AN OVER-CEILING EMIT FAILS THE OP, NOT THE CONNECTION, WHATEVER IS QUEUED: with pieces still
-
 #[test]
 fn a_refused_emit_with_a_backlog_fails_the_op_and_keeps_the_connection() {
     let mut host = Host::open(linked(), (64 * 1024, 3, 1));
@@ -905,7 +889,6 @@ const REFUSED_WHY: &[u8] =
     b"the upgrade request is not a WebSocket opening handshake this end can accept";
 
 /// What the accepted end said after being refused: answered on the wire, the stream ended FAILED
-
 fn assert_answered(end: &End, status_line: &str) {
     let wire = String::from_utf8_lossy(&end.wire);
     assert!(wire.starts_with(status_line), "the wire answers: {wire:?}");
@@ -923,7 +906,6 @@ fn assert_answered(end: &End, status_line: &str) {
 }
 
 /// A REQUEST FOR A VERSION THIS END DOES NOT SPEAK IS ANSWERED 426 with the version it does (RFC
-
 #[test]
 fn a_refused_upgrade_request_is_answered() {
     for (request, status) in [
@@ -945,7 +927,6 @@ fn a_refused_upgrade_request_is_answered() {
 }
 
 /// THE SAME REFUSAL THROUGH ADOPT: the request is the connection's leftover; `adopt` answers READY
-
 #[test]
 fn an_adopted_connection_whose_leftover_is_refused_is_answered() {
     for (request, status) in [
@@ -976,7 +957,6 @@ fn an_adopted_connection_whose_leftover_is_refused_is_answered() {
 }
 
 /// AN OP ON A FRAMING THAT WAS ALREADY GONE FAILS THE OP: after a successful `refuse` the state is
-
 #[test]
 fn an_op_after_a_refuse_fails_and_does_not_end_the_stream_again() {
     let mut host = Host::open(linked(), (64 * 1024, 64 * 1024, 8));
@@ -1009,7 +989,6 @@ fn an_op_after_a_refuse_fails_and_does_not_end_the_stream_again() {
 }
 
 /// A RE-CALLED `refuse` DRAINS: the contract re-calls the same op after READY with `YIELD_MORE`.
-
 #[test]
 fn a_re_called_refuse_hands_over_the_whole_refusal_and_the_close() {
     let mut host = Host::open(linked(), (16, 64 * 1024, 8));
@@ -1042,7 +1021,6 @@ fn a_re_called_refuse_hands_over_the_whole_refusal_and_the_close() {
 }
 
 /// NEW INPUT ON A FRAMING A REFUSAL ALREADY CLOSED IS NOT SWALLOWED BY THE DRAIN: an emit with
-
 #[test]
 fn an_emit_after_a_refuse_with_a_backlog_fails_and_the_backlog_still_drains() {
     let mut host = Host::open(linked(), (16, 64 * 1024, 8));
@@ -1117,7 +1095,6 @@ fn validate(settings: &[u8]) -> (Outcome, String) {
 }
 
 /// `open` over `settings`, a reason buffer lent: its outcome and its text (the instance, if one
-
 fn open_with(settings: &[u8]) -> (Outcome, String) {
     use busbar_contract::abi::mechanism::call::Blob;
     let mut buf = [0_u8; 256];
@@ -1155,7 +1132,6 @@ fn open_with(settings: &[u8]) -> (Outcome, String) {
 }
 
 /// SETTINGS ARE A JSON OBJECT: a number, an array or a string is refused, by `validate` and `open`.
-
 #[test]
 fn settings_that_are_not_a_json_object_are_refused() {
     for settings in [&b"5"[..], b"[]", b"\"x\"", b"not json"] {
@@ -1184,7 +1160,6 @@ fn an_undeclared_setting_is_refused() {
 }
 
 /// An invalid message ceiling returns the canonical explanation.
-
 #[test]
 fn a_bad_message_ceiling_says_the_canonical_text() {
     for value in ["0", "-1", "\"8\"", "1.5", "null", "true"] {
@@ -1227,7 +1202,6 @@ fn pair(host: &mut Host) -> (End, End) {
 }
 
 /// REFRESH RE-READS THE SETTINGS: a bad blob is refused with the validate texts and the old ceiling
-
 #[test]
 fn refresh_rereads_the_settings_for_framings_begun_after_it() {
     let mut host = Host::open(linked(), (64 * 1024, 64 * 1024, 64));
@@ -1270,7 +1244,6 @@ fn refresh_rereads_the_settings_for_framings_begun_after_it() {
 }
 
 /// A CARRIER OP IS REFUSED BY NAME: the ws framer serves none of them, and says which op it was
-
 #[test]
 fn a_carrier_op_is_refused_by_name() {
     use busbar_contract::abi::transport::{
@@ -1356,7 +1329,6 @@ fn a_carrier_op_is_refused_by_name() {
 }
 
 /// An operation without an instance fails by name without reading through a null pointer.
-
 #[test]
 fn an_op_with_no_instance_fails_by_name() {
     use busbar_contract::abi::mechanism::lifecycle::RefreshIn;
@@ -1463,7 +1435,6 @@ fn an_unknown_framing_fails_by_op() {
 }
 
 /// A target carrying userinfo is refused without repeating any of its bytes.
-
 #[test]
 fn locate_refuses_a_target_carrying_userinfo() {
     use busbar_contract::abi::transport::{LocateIn, LocateOut};
@@ -1492,7 +1463,6 @@ fn locate_refuses_a_target_carrying_userinfo() {
 }
 
 /// AN UNDECLARED KEY WITH NOWHERE TO PUT ITS NAME SAYS SO IN THE SDK'S WORDS: `validate` and `open`
-
 #[test]
 fn an_undeclared_key_with_no_reason_buffer_says_the_reason_was_not_kept() {
     use busbar_contract::abi::mechanism::call::Blob;
@@ -1535,7 +1505,6 @@ fn an_undeclared_key_with_no_reason_buffer_says_the_reason_was_not_kept() {
 }
 
 /// A RELEASE OF A LEASE THE INSTANCE NEVER HANDED OUT IS REFUSED, in the lifecycle SDK's words
-
 #[test]
 fn a_release_of_a_lease_never_handed_out_is_refused() {
     use busbar_contract::abi::mechanism::lifecycle::ReleaseIn;
@@ -1559,7 +1528,6 @@ fn a_release_of_a_lease_never_handed_out_is_refused() {
 }
 
 /// `begin` dialling `target` with `fields` (name, value); the refusal's text, or `None` once it
-
 fn begin_with_fields(
     host: &mut Host,
     target: &'static str,
@@ -1595,7 +1563,6 @@ fn begin_with_fields(
 }
 
 /// A dial requesting an extension is refused with an explanation.
-
 #[test]
 fn a_dial_asking_for_an_extension_is_refused_in_words() {
     let mut host = Host::open(linked(), (64 * 1024, 64 * 1024, 64));
@@ -1612,7 +1579,6 @@ fn a_dial_asking_for_an_extension_is_refused_in_words() {
 }
 
 /// The tail declares the operations the door serves.
-
 #[test]
 fn the_tail_states_the_ops_the_door_serves() {
     use busbar_contract::abi::transport::{TransportTail, FACT_ACCEPTS, FACT_ADOPTS, FACT_DIALS};
@@ -1623,7 +1589,6 @@ fn the_tail_states_the_ops_the_door_serves() {
 }
 
 /// An opening field the upgrade cannot carry is refused with an explanation.
-
 #[test]
 fn an_opening_field_the_upgrade_cannot_carry_is_refused_as_such() {
     const WHY: &str = "begin: an opening field is not a valid HTTP field, and the upgrade request cannot carry it";
@@ -1639,7 +1604,6 @@ fn an_opening_field_the_upgrade_cannot_carry_is_refused_as_such() {
 }
 
 /// A dialing end refuses to adopt a stream.
-
 #[test]
 fn a_dialling_end_adopts_nothing() {
     let mut host = Host::open(linked(), (64 * 1024, 64 * 1024, 8));
@@ -1660,7 +1624,6 @@ fn a_dialling_end_adopts_nothing() {
 }
 
 /// Opening-field checks apply to dials, and a bad target is reported before field errors.
-
 #[test]
 fn the_field_checks_are_a_dials_and_a_bad_target_says_so_first() {
     let mut host = Host::open(linked(), (64 * 1024, 64 * 1024, 64));

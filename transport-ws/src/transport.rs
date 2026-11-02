@@ -342,7 +342,6 @@ impl std::fmt::Debug for WsFramer {
 }
 
 /// The RFC 6455 close code a [`CloseReason`] puts on the wire.
-
 pub(crate) fn close_code_for(reason: CloseReason) -> CloseCode {
     match reason {
         CloseReason::Normal => CloseCode::Normal,
@@ -364,7 +363,6 @@ pub(crate) fn close_code_for(reason: CloseReason) -> CloseCode {
 }
 
 /// The close code a read failure on a LIVE connection fails it with (RFC 6455 §7.4.1), or `None`
-
 fn failure_code(e: &WsError) -> Option<CloseCode> {
     match e {
         WsError::Protocol(ProtocolError::ResetWithoutClosingHandshake) => None,
@@ -376,7 +374,6 @@ fn failure_code(e: &WsError) -> Option<CloseCode> {
 }
 
 /// What a failed read of the message stream means to the layer above: bytes that were not
-
 fn read_error(e: &WsError) -> TransportError {
     match e {
         WsError::Protocol(_) | WsError::Capacity(_) | WsError::Utf8(_) => TransportError::Framing,
@@ -386,7 +383,6 @@ fn read_error(e: &WsError) -> TransportError {
 }
 
 /// The fields an opening field may not set on the upgrade request: `host`, `connection` and
-
 const HANDSHAKE_FIELDS: &[&str] = &[
     "host",
     "connection",
@@ -399,7 +395,6 @@ const HANDSHAKE_FIELDS: &[&str] = &[
 const SUBPROTOCOL: &str = "sec-websocket-protocol";
 
 /// Whether a field rides between this hop and the layer above: an opening field onto the upgrade
-
 fn rides_upgrade(name: &str) -> bool {
     let lower = name.to_ascii_lowercase();
     !HANDSHAKE_FIELDS.contains(&lower.as_str())
@@ -407,7 +402,6 @@ fn rides_upgrade(name: &str) -> bool {
 }
 
 /// Whether every opening field that rides the upgrade request ([`rides_upgrade`]) can be written on
-
 pub(crate) fn carries_all(fields: &[(String, Vec<u8>)]) -> bool {
     fields
         .iter()
@@ -419,7 +413,6 @@ pub(crate) fn carries_all(fields: &[(String, Vec<u8>)]) -> bool {
 }
 
 /// Whether a dial's opening `fields` ask for a WebSocket extension (`Sec-WebSocket-Extensions`):
-
 pub(crate) fn asks_extension(fields: &[(String, Vec<u8>)]) -> bool {
     fields
         .iter()
@@ -427,7 +420,6 @@ pub(crate) fn asks_extension(fields: &[(String, Vec<u8>)]) -> bool {
 }
 
 /// The answer's validated head as a field block, in its original wire order. HeaderMap groups
-
 fn head_block(headers: &HeaderMap, seen: &[u8]) -> Result<Vec<u8>, TransportError> {
     let nominated: Vec<&[u8]> = headers
         .get_all("connection")
@@ -482,7 +474,6 @@ fn message_of(bytes: Bytes, text: bool) -> Result<Message, WsError> {
 }
 
 /// The status class of a far end's REFUSAL of the upgrade, by its HTTP status. Only `101` completes
-
 fn status_class(code: u16) -> WireStatusClass {
     match code {
         400..=499 => WireStatusClass::CallerFault,
@@ -492,7 +483,6 @@ fn status_class(code: u16) -> WireStatusClass {
 }
 
 /// The `Retry-After` an answer states, in whole seconds from `now_secs` (Unix seconds), in either
-
 pub(crate) fn retry_after(headers: &HeaderMap, now_secs: u64) -> Option<u64> {
     let raw = headers.get("retry-after")?.to_str().ok()?.trim();
     if let Some(n) = digits(raw, 10) {
@@ -502,7 +492,6 @@ pub(crate) fn retry_after(headers: &HeaderMap, now_secs: u64) -> Option<u64> {
 }
 
 /// `s` as a number in `radix` when it is all digits of it and at least one (RFC 9110's `1*DIGIT`,
-
 fn digits(s: &str, radix: u32) -> Option<u64> {
     if s.is_empty() || !s.bytes().all(|b| char::from(b).is_digit(radix)) {
         return None;
@@ -511,7 +500,6 @@ fn digits(s: &str, radix: u32) -> Option<u64> {
 }
 
 /// An HTTP-date (RFC 9110 §5.6.7: the IMF-fixdate, and the two obsolete forms a recipient must
-
 fn imf_fixdate_secs(s: &str) -> Option<u64> {
     httpdate::parse_http_date(s)
         .ok()?
@@ -521,7 +509,6 @@ fn imf_fixdate_secs(s: &str) -> Option<u64> {
 }
 
 /// Whether an answer's body is `chunked` (RFC 9112 §6.1, §6.3: the LAST transfer coding the answer
-
 fn is_chunked(headers: &HeaderMap) -> bool {
     headers
         .get_all("transfer-encoding")
@@ -534,7 +521,6 @@ fn is_chunked(headers: &HeaderMap) -> bool {
 }
 
 /// The longest chunk-size or trailer line a refused upgrade's chunked body may carry; a longer one is
-
 const CHUNK_LINE_MAX: usize = 4096;
 
 /// Where a chunked body's decoder stands (RFC 9112 §7.1).
@@ -566,7 +552,6 @@ pub(crate) struct Dechunk {
 
 impl Dechunk {
     /// Decode what `inbound` holds into `body`; `Some(whole)` once nothing more is read: `true` at
-
     fn feed(&mut self, inbound: &mut VecDeque<u8>, body: &mut Vec<u8>) -> Option<bool> {
         loop {
             match self.state {
@@ -623,7 +608,6 @@ impl Dechunk {
 }
 
 /// The `Content-Length` an answer declares: `Ok(None)` when it states none, and `Err` when what it
-
 fn content_length(headers: &HeaderMap) -> Result<Option<u64>, ()> {
     let mut declared = None;
     for value in headers.get_all("content-length") {
@@ -638,7 +622,6 @@ fn content_length(headers: &HeaderMap) -> Result<Option<u64>, ()> {
 }
 
 /// A dialled head's REASON PHRASE (HEAD-FIELDS: the dialled side fills `reason`, HTTP/1 as sent):
-
 pub(crate) fn reason_phrase(seen: &[u8]) -> Option<Vec<u8>> {
     let seen = status_line_start(seen);
     let end = seen.iter().position(|b| *b == b'\n')?;
@@ -663,7 +646,6 @@ fn status_line_start(mut seen: &[u8]) -> &[u8] {
 }
 
 /// Where a response head ends in `seen`: just past its first empty line, which the protocol
-
 fn head_end(seen: &[u8]) -> Option<usize> {
     let head = status_line_start(seen);
     let skipped = seen.len() - head.len();
@@ -680,7 +662,6 @@ fn head_end(seen: &[u8]) -> Option<usize> {
 }
 
 /// The library currently compares the whole Connection value with Upgrade. RFC 6455 instead
-
 fn normalized_response(response: &UpgradeResponse, seen: &[u8]) -> Option<Vec<u8>> {
     let values: Vec<_> = response.headers().get_all("connection").iter().collect();
     if values.len() == 1 && values[0].as_bytes().eq_ignore_ascii_case(b"Upgrade") {
@@ -714,7 +695,6 @@ fn normalized_response(response: &UpgradeResponse, seen: &[u8]) -> Option<Vec<u8
 }
 
 /// RFC 9110 combines repeated Connection fields into one ordered token list. The library's
-
 fn normalized_request(request: &UpgradeRequest, seen: &[u8]) -> Option<Vec<u8>> {
     let values: Vec<_> = request.headers().get_all("connection").iter().collect();
     if values.len() < 2 {
@@ -772,7 +752,6 @@ fn refused_upgrade(
 }
 
 /// A refused upgrade's BODY: frame what the pipe holds, decoded by its transfer coding when it is
-
 fn answered_body(
     mut pipe: Pipe,
     left: Option<u64>,
@@ -836,7 +815,6 @@ fn answered_body(
 }
 
 /// The close code a refusal's neutral status maps to (a neutral status the transport maps to its
-
 pub(crate) fn close_code_of_status(status: u32) -> CloseCode {
     match status {
         401 | 403 => CloseCode::Policy,
@@ -863,7 +841,6 @@ fn drain(phase: &mut Phase, out: &mut dyn FramerOut) {
 }
 
 /// The test harness's seed (`test-seeded`, a dev-dependency feature the published conformance
-
 #[cfg(feature = "test-seeded")]
 mod seeded {
     /// The handshake key a seeded dial sends (RFC 6455 section 1.3's own example).
@@ -910,7 +887,6 @@ mod seeded {
 
 impl WsFramer {
     /// Close `state` with `code` (a connection the far side failed closes with the failure's
-
     fn close_with(&self, state: u64, code: CloseCode, out: &mut dyn FramerOut) {
         let Some(conn) = self.map().remove(&state) else {
             return;
@@ -932,7 +908,6 @@ impl WsFramer {
     }
 
     /// The refusal `bytes`, closing the connection after it; `status` is the refusal's neutral
-
     pub(crate) fn refusal_with(
         &self,
         state: u64,
@@ -958,7 +933,6 @@ impl WsFramer {
     }
 
     /// A framer whose messages (and frames) are capped at `max_message_bytes`; `0` = the protocol
-
     #[must_use]
     pub(crate) fn new(max_message_bytes: usize) -> Self {
         Self {
@@ -971,7 +945,6 @@ impl WsFramer {
     }
 
     /// [`WsFramer::new`] with the test harness's seed off, whatever the build's features: its dials
-
     #[cfg(test)]
     pub(crate) fn unseeded(max_message_bytes: usize) -> Self {
         Self {
@@ -1002,7 +975,6 @@ impl WsFramer {
     }
 
     /// [`WsFramer::open`], a dialled connection's upgrade request carrying `fields` (the dial's
-
     pub(crate) fn open_with(
         &self,
         side: Side,
@@ -1015,7 +987,6 @@ impl WsFramer {
     }
 
     /// [`WsFramer::emit`]: with `text` (the emit's `EMIT_TEXT`) the message goes out as a text
-
     pub(crate) fn emit_text(
         &self,
         state: u64,
@@ -1082,19 +1053,16 @@ impl WsFramer {
     }
 
     /// The map of framing states. Its lock guards only the map (no framing's work runs under it),
-
     fn map(&self) -> MutexGuard<'_, HashMap<u64, Conn>> {
         self.states.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     /// Drop framing `state`, writing nothing: the door's finish of a framing whose op panicked,
-
     pub(crate) fn forget(&self, state: u64) {
         self.map().remove(&state);
     }
 
     /// Whether framing `state` is still held: an op that failed with its state alive failed that
-
     pub(crate) fn holds(&self, state: u64) -> bool {
         self.map().contains_key(&state)
     }
@@ -1111,7 +1079,6 @@ impl WsFramer {
     }
 
     /// How many ingested bytes framing `state` holds unread (a test reads that bytes nobody will
-
     #[cfg(test)]
     pub(crate) fn inbound_len(&self, state: u64) -> Option<usize> {
         let conn = self.conn(state).ok()?;
@@ -1120,7 +1087,6 @@ impl WsFramer {
     }
 
     /// Where framing `state`'s pipe keeps the bytes it writes, and how large that block is (a test
-
     #[cfg(test)]
     pub(crate) fn outbound_block(&self, state: u64) -> Option<(*const u8, usize)> {
         let conn = self.conn(state).ok()?;
@@ -1183,7 +1149,6 @@ impl WsFramer {
     }
 
     /// A dial's upgrade request, built and written into its pipe and not yet handed out: the
-
     fn dial(&self, target: &str, fields: &[(String, Vec<u8>)]) -> Result<Phase, TransportError> {
         let url = request_url(target)?;
         let mut request = url
@@ -1245,7 +1210,6 @@ impl WsFramer {
     }
 
     /// Parse interim response heads with the protocol library's parser and existing handshake
-
     fn response_heads(phase: &mut Phase, out: &mut dyn FramerOut) -> Result<bool, TransportError> {
         let Phase::Dialling { mid, response, .. } = phase else {
             return Ok(true);
@@ -1330,7 +1294,6 @@ impl WsFramer {
     }
 
     /// Drive `phase` over what its pipe holds: finish the handshake if it can, then hand every
-
     fn drive(
         phase: Phase,
         out: &mut dyn FramerOut,
@@ -1660,7 +1623,6 @@ impl WsFramer {
 }
 
 /// One `ws://`/`wss://` URL, read into `(secure, host, port, path)`. Strict over the scheme (in any
-
 pub(crate) fn split_ws_url(url: &str) -> Result<(bool, String, u16, String), TransportError> {
     let scheme = |s: &str| {
         url.get(..s.len())
@@ -1691,7 +1653,6 @@ fn authority_host(host: &str) -> String {
 }
 
 /// The upgrade request's URL for a dial to `url`: its scheme, host (an IPv6 literal bracketed),
-
 fn request_url(url: &str) -> Result<String, TransportError> {
     let (secure, host, _, path) = split_ws_url(url)?;
     let port = busbar_contract::net::parse_url(url)
@@ -1707,7 +1668,6 @@ fn request_url(url: &str) -> Result<String, TransportError> {
 
 impl WsFramer {
     /// Whether the far side FAILED the connection in `state` (a protocol violation, text that is
-
     #[cfg(test)]
     pub(crate) fn failed(&self, state: u64) -> bool {
         self.failure(state).is_some()
@@ -1744,10 +1704,8 @@ impl Default for WsFramer {
 }
 
 /// The framer's ops, as the door calls them (`door`): every op answers at once, and nothing here
-
 impl WsFramer {
     /// A `ws://` target is reached at its `host:port`; a `wss://` one asks for its bytes to be
-
     pub(crate) fn locate(&self, target: &str) -> Result<Located, TransportError> {
         let (secure, host, port, _path) = split_ws_url(target)?;
         Ok(Located {
@@ -1777,7 +1735,6 @@ impl WsFramer {
     }
 
     /// [`WsFramer::ingest`], answering the reason phrase of the head this call handed up (a dialled
-
     pub(crate) fn ingest_head(
         &self,
         state: u64,
@@ -1835,7 +1792,6 @@ impl WsFramer {
     }
 
     /// A WebSocket state keeps no deadline of its own (it never states one), so a tick finds nothing
-
     pub(crate) fn tick(&self, state: u64, _out: &mut dyn FramerOut) -> Result<(), TransportError> {
         if self.map().contains_key(&state) {
             Ok(())
@@ -1845,7 +1801,6 @@ impl WsFramer {
     }
 
     /// The upgrade into this framer: the stream another framer gave up, with the bytes it held —
-
     pub(crate) fn adopt(
         &self,
         side: Side,

@@ -100,7 +100,6 @@ fn sink(frame: &mut [u8], pieces: &mut [FramePiece], heads: &mut [HeadSlots]) ->
 }
 
 /// A response reason accompanies only its head's first piece and never stalls that piece.
-
 #[test]
 fn a_reason_rides_only_beside_its_heads_first_piece() {
     let head = |reason: &[u8]| {
@@ -148,7 +147,6 @@ fn a_reason_rides_only_beside_its_heads_first_piece() {
 }
 
 /// Finishing a framing whose operation panicked removes it from the framer.
-
 #[test]
 fn a_panicked_framing_is_forgotten_by_the_framer_at_its_finish() {
     // SAFETY: plain C data; all-zero is valid.
@@ -210,7 +208,6 @@ fn a_panicked_framing_is_forgotten_by_the_framer_at_its_finish() {
 }
 
 /// Hand `owed` over through a sink of the given caps, one fill at a time, until it is dry: every
-
 fn drain_owed(
     owed: &mut Owed,
     wire_cap: usize,
@@ -241,7 +238,6 @@ fn drain_owed(
 }
 
 /// Large pieces and wire output are handed over intact and in order across recalls.
-
 #[test]
 fn a_large_piece_and_wire_are_handed_over_intact_across_recalls() {
     let message: Vec<u8> = (0..1000_u32).map(|n| (n % 251) as u8).collect();
@@ -267,7 +263,6 @@ fn a_large_piece_and_wire_are_handed_over_intact_across_recalls() {
 }
 
 /// Partial handover retains the buffer without moving its remainder.
-
 #[test]
 fn handing_over_a_large_piece_or_wire_moves_no_remainder() {
     let mut owed = Owed::default();
@@ -305,7 +300,6 @@ fn handing_over_a_large_piece_or_wire_moves_no_remainder() {
 }
 
 /// Wire capacity follows its backlog rather than total throughput.
-
 #[test]
 fn the_wire_s_capacity_follows_its_backlog_not_its_throughput() {
     let mut owed = Owed::default();
@@ -322,7 +316,6 @@ fn the_wire_s_capacity_follows_its_backlog_not_its_throughput() {
 }
 
 /// A KEPT PIECE BUFFER GIVES BACK WHAT ONE LARGE MESSAGE GREW IT PAST [`KEEP_BYTES`]: a framing in
-
 #[test]
 fn a_kept_piece_buffer_is_bounded() {
     let mut owed = Owed::default();
@@ -339,7 +332,6 @@ fn a_kept_piece_buffer_is_bounded() {
 }
 
 /// ONLY THE OPENING IS WIPED (PL10): the bytes a framing's opening owed (a dialled upgrade request
-
 #[test]
 fn only_the_opening_is_wiped_as_it_is_handed_over() {
     let mut owed = Owed::default();
@@ -366,7 +358,6 @@ fn only_the_opening_is_wiped_as_it_is_handed_over() {
 }
 
 /// A drained wire releases capacity grown beyond `KEEP_BYTES`.
-
 #[test]
 fn a_drained_wire_is_bounded() {
     let mut owed = Owed::default();
@@ -421,7 +412,6 @@ impl Lend {
 }
 
 /// What one answer said: its outcome, its wire bytes, each piece (bytes, flags), each head's
-
 struct Said {
     outcome: Outcome,
     wire: Vec<u8>,
@@ -526,7 +516,6 @@ fn begin(
 }
 
 /// `ingest` of `bytes` (`end`: the carrier ended) on framing `token`; no bytes and no end is the
-
 fn ingest(p: *mut c_void, token: u64, bytes: &[u8], end: bool, l: &mut Lend) -> Said {
     // SAFETY: plain C data; all-zero is valid.
     let mut i: IngestIn = unsafe { std::mem::zeroed() };
@@ -597,7 +586,6 @@ fn switching(request: &[u8]) -> Vec<u8> {
 }
 
 /// The carrier's end reaches the framing machine through the plugin door.
-
 #[test]
 fn the_carriers_end_reaches_the_machine_through_the_door() {
     let p = instance();
@@ -629,7 +617,6 @@ fn the_carriers_end_reaches_the_machine_through_the_door() {
 }
 
 /// A finished framing is removed once its owed output drains.
-
 #[test]
 fn a_finished_framing_is_gone_once_drained() {
     let p = instance();
@@ -660,7 +647,6 @@ fn a_finished_framing_is_gone_once_drained() {
 }
 
 /// Only a dial's opening is marked secret through the door.
-
 #[test]
 fn only_a_dials_opening_is_marked_secret_through_the_door() {
     let p = instance();
@@ -700,7 +686,6 @@ fn only_a_dials_opening_is_marked_secret_through_the_door() {
 }
 
 /// A dialed response head's reason reaches the host's head slots.
-
 #[test]
 fn a_dialled_heads_reason_reaches_the_head_slots() {
     let p = instance();
@@ -718,7 +703,6 @@ fn a_dialled_heads_reason_reaches_the_head_slots() {
 }
 
 /// An opening buffer is freed and wiped on Linux.
-
 #[test]
 fn an_opening_buffer_is_freed_and_wiped_on_linux() {
     use crate::faults_tests::{assert_freed_wiped, watch_free};

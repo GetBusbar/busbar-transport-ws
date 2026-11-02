@@ -73,7 +73,6 @@ fn carrier() -> busbar_core_connector::compose::Via {
 }
 
 /// Offer one whole message on `stream`, waiting for the socket to take what the write buffer
-
 async fn send(conn: &mut Connection, stream: u64, bytes: &[u8], text: bool) -> Result<(), Failure> {
     let mut off = 0;
     poll_fn(|cx| loop {

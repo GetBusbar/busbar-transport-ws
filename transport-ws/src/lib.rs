@@ -13,7 +13,6 @@ mod meta;
 mod transport;
 
 /// The transport axis entry the composition root folds for this wire — its key, the layers it
-
 pub mod linked {
     pub use crate::door::{door, MACRO_DOOR};
 

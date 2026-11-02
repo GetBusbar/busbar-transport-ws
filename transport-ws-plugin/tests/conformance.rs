@@ -30,7 +30,6 @@ fn z<T>() -> T {
 }
 
 /// This crate's built cdylib (uplifted or under `deps`, newest wins). A missing artifact is a
-
 fn cdylib() -> std::path::PathBuf {
     let exe = std::env::current_exe().expect("the test binary has a path");
     let profile = exe
@@ -227,7 +226,6 @@ impl Host {
 }
 
 /// What the exchange left: the upgrade's first lines, what each end heard, whether the far end's
-
 type Script = (bool, bool, Vec<Vec<u8>>, Vec<Vec<u8>>, bool, bool);
 
 /// One exchange through the dispatcher: the upgrade, one message each way, the dialled end's close.

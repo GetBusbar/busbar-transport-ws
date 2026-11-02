@@ -54,7 +54,6 @@ pub const BODY_MAX_BYTES: &str = "limits.request_body_max_bytes";
 const KEY: &str = meta::KEY;
 
 /// The secured form of the scheme: a `wss` target is a `ws` one whose bytes the connector secures
-
 pub const SECURE_KEY: &str = "wss";
 
 /// The schemes `ws` claims, by name: the Statement's `claims`, the one place they are stated.
@@ -77,7 +76,6 @@ const EGRESS_SELECTOR_CODES: [u8; crate::claims::EGRESS_SELECTOR_FORMS.len()] =
 const FACTS: [AbiStr; meta::TRANSPORT_FACTS.len()] = strs(meta::TRANSPORT_FACTS);
 
 /// The claim row, rendered from the transport's one declaration (`meta.rs`, `claims.rs`). `ws` and
-
 const ROW: Claim = {
     let mut c = Claim::EMPTY.with_facts(&FACTS);
     c.selector_forms = AbiStr::of_bytes(&SELECTOR_CODES);
@@ -99,7 +97,6 @@ const SETTING_ROWS: [SettingRow; 1] = [SettingRow {
 const SETTINGS: &[SettingDecl] = &setting_decls(&SETTING_ROWS);
 
 /// The op facts are the ops the door serves: the framer begins on the accepting side and on the
-
 const TAIL: TransportTail = {
     let mut t = TransportTail::EMPTY
         .with_claim_rows(CLAIMS)
@@ -216,7 +213,6 @@ fn class_code(class: Option<WireStatusClass>) -> u8 {
 }
 
 /// How much of a field block's `bytes` a sink with `room` may take: all of it when it fits, else
-
 fn field_cut(bytes: &[u8], room: usize, in_value: bool) -> usize {
     if bytes.len() <= room {
         return bytes.len();
@@ -239,7 +235,6 @@ fn field_cut(bytes: &[u8], room: usize, in_value: bool) -> usize {
 }
 
 /// How much of a piece's unhanded `rest` a sink with `room` takes. A field block is cut only where
-
 fn take_of(piece: &Piece, rest: &[u8], room: usize, alone: bool) -> usize {
     if piece.fields {
         match field_cut(rest, room, piece.continued) {
@@ -444,7 +439,6 @@ impl Drop for Owed {
 const SPARE_MAX: usize = 8;
 
 /// The capacity a kept piece buffer holds at most: what one large message grew it past this is
-
 const KEEP_BYTES: usize = 256 * 1024;
 
 impl Owed {
@@ -544,7 +538,6 @@ impl Owed {
     }
 
     /// Owe `bytes` to the far side (`secret`: the framing's opening), never leaving a copy of a
-
     fn push(&mut self, bytes: &[u8], secret: bool) {
         if self.wire.capacity() - self.wire.len() < bytes.len() {
             let owed = self.wire.len() - self.wire_at;
@@ -564,7 +557,6 @@ impl Owed {
     }
 
     /// Mark the next `n` owed bytes handed to the host, wiping the secret ones in place; once all
-
     fn consume(&mut self, n: usize) {
         let end = self.wire_at + n;
         if self.secret > self.wire_at {
@@ -606,7 +598,6 @@ impl Owed {
 type OwedSlot = Arc<Mutex<Owed>>;
 
 /// THE INSTANCE: the framer and what each framing owes. The map's lock is held only to find, add
-
 pub struct Ws {
     framer: WsFramer,
     owed: Mutex<HashMap<u64, OwedSlot>>,
@@ -624,7 +615,6 @@ const BAD_BODY_MAX: &str =
     "settings: limits.request_body_max_bytes must be a count of bytes above 0";
 
 /// The settings blob read: a JSON object (empty bytes = `{}`) whose every key is one this transport
-
 fn read_settings(bytes: &[u8]) -> Result<usize, Refusal> {
     let object = settings_reading(bytes, &SETTING_ROWS).map_err(|why| {
         if why.text() == Some("settings: limits.request_body_max_bytes must be a count above 0") {
@@ -645,7 +635,6 @@ fn read_settings(bytes: &[u8]) -> Result<usize, Refusal> {
 }
 
 /// The lifecycle: `validate`, `open` and `refresh` read the settings; a refresh's ceiling applies
-
 impl Life for Ws {
     const CANCEL: u32 = CANCEL_NOTHING_MOVED;
 
@@ -725,7 +714,6 @@ impl frame::FramerOut for Collect<'_> {
 }
 
 /// A dial's opening head fields (`BeginIn::fields`), owned for the one `begin` call: they may carry
-
 struct OpeningFields(Vec<(String, Vec<u8>)>);
 
 impl Drop for OpeningFields {
@@ -780,7 +768,6 @@ fn reason_of(code: u32) -> CloseReason {
 }
 
 /// The stubs: a framer is not a carrier, so every carrier op is refused, and nothing upgrades out
-
 mod stubs {
     use super::{
         AcceptIn, AcceptOut, ArrivalIn, ArrivalOut, ConnIn, ConnOut, DialIn, FramerOut, FramingIn,
@@ -818,13 +805,11 @@ macro_rules! op {
 }
 
 /// The protocol an accepting listener offers, and a secured dial too: the opening handshake is a
-
 const OFFER: &[u8] = b"\x08http/1.1";
 
 const SMALL: &str = "locate: a host buffer is too small";
 
 /// A dial with an opening field the upgrade request cannot carry (an invalid name, or a value with a
-
 const BEGIN_UNCARRIABLE: &str =
     "begin: an opening field is not a valid HTTP field, and the upgrade request cannot carry it";
 
@@ -962,7 +947,6 @@ fn carries_userinfo(target: &str) -> bool {
 }
 
 /// A connection the far side FAILED ends its stream failed, not cleanly: the reader is told
-
 fn end_failed(f: &WsFramer, token: u64, owed: &mut Owed, ended_before: bool) {
     if ended_before || !owed.ended {
         return;

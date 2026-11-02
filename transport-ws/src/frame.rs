@@ -81,7 +81,6 @@ pub(crate) struct HostTime {
 }
 
 /// Where the framer puts what a call produced: bytes owed to the far side, frame pieces for the
-
 pub(crate) trait FramerOut {
     /// Bytes for the far side, in order.
     fn send(&mut self, bytes: &[u8]);
