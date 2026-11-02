@@ -591,8 +591,6 @@ fn a_recalled_exchange_answers_nothing_twice_and_drops_nothing() {
     );
 }
 
-/// THE UPGRADE IS STATED ON THE CLAIM ROW (busbar ARCHITECT ruling Q128 U7): the host reads a
-
 #[test]
 fn the_ws_claim_opens_at_the_upgrade_and_composes_over_nothing() {
     use busbar_contract::abi::transport::{Claim, TransportTail, UNIT0_UPGRADE};

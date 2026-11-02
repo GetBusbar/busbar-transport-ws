@@ -1,8 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Busbar Inc and contributors
 
-//! THE DIAL'S OPENING AND ITS MESSAGES (busbar ARCHITECT Q-L5B-WS-DIAL 2026-10-03): a dialled
-
 use crate::frame::{Framed, FramerOut, HostTime, Side};
 use busbar_contract::transport::wire::WireStatusClass;
 use tungstenite::handshake::derive_accept_key;
