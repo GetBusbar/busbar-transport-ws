@@ -410,3 +410,284 @@ fn connection_normalization_preserves_unread_frames_at_the_original_request_read
         shut(p);
     }
 }
+
+fn prewire_emit(
+    p: *mut c_void,
+    token: u64,
+    status: u32,
+    bytes: &[u8],
+    end: bool,
+    flags: u32,
+    l: &mut Lend,
+) -> Said {
+    // SAFETY: these ABI frames permit all-zero initialization.
+    let mut i: EmitIn = unsafe { std::mem::zeroed() };
+    i.framing = token;
+    i.stream = 37;
+    i.status = status;
+    i.bytes = bytes.as_ptr();
+    i.len = bytes.len();
+    i.end_of_frame = u32::from(end);
+    i.flags = flags;
+    i.sink = l.sink();
+    // SAFETY: all buffers and the live instance stay lent for this crossing.
+    let mut o: DoorOut = unsafe { std::mem::zeroed() };
+    let r = unsafe { Safe::<Emit>::enter(p, slot::EMIT, &i, &mut o) };
+    said(r, &o, l)
+}
+
+fn prewire_refuse(
+    p: *mut c_void,
+    token: u64,
+    status: u32,
+    bytes: &[u8],
+    head_sent: bool,
+    l: &mut Lend,
+) -> Said {
+    // SAFETY: these ABI frames permit all-zero initialization.
+    let mut i: RefuseIn = unsafe { std::mem::zeroed() };
+    i.framing = token;
+    i.stream = 37;
+    i.has_stream = 1;
+    i.status = status;
+    i.head_sent = u32::from(head_sent);
+    i.bytes = bytes.as_ptr();
+    i.len = bytes.len();
+    i.sink = l.sink();
+    // SAFETY: all buffers and the live instance stay lent for this crossing.
+    let mut o: DoorOut = unsafe { std::mem::zeroed() };
+    let r = unsafe { Safe::<Refuse>::enter(p, slot::REFUSE, &i, &mut o) };
+    said(r, &o, l)
+}
+
+fn prewire_extension() -> Vec<u8> {
+    extensions::encode(&[
+        (EXT_ADOPTED_SESSION, &context(37).encode()),
+        ("session.prewire", b"1"),
+    ])
+}
+
+fn staged() -> (*mut c_void, u64, Said) {
+    let p = instance();
+    let ext = prewire_extension();
+    let (answer, token) = adopt(p, &ext, UPGRADE, &mut Lend::roomy());
+    (p, token, answer)
+}
+
+#[test]
+fn prewire_success_has_a_typed_inherited_acceptance_marker() {
+    let p = instance();
+    let ext = prewire_extension();
+    let mut l = Lend::roomy();
+    let (answer, token) = adopt(p, &ext, UPGRADE, &mut l);
+    assert_eq!(answer.outcome, Outcome::Ready);
+    assert_eq!(answer.flags & YIELD_ENDED, 0);
+    assert!(answer.wire.starts_with(b"HTTP/1.1 101"));
+    assert!(l.pieces[..answer.pieces.len()].iter().any(|piece| {
+        piece.stream == 37
+            && piece.flags & (PIECE_FIELDS | PIECE_HAS_CODE) == PIECE_FIELDS | PIECE_HAS_CODE
+            && piece.code == 101
+            && piece.status_class == STATUS_SUCCESS
+    }));
+    finish(p, token, &mut l);
+    shut(p);
+}
+
+#[test]
+fn prewire_malformed_upgrades_end_without_an_acceptance_marker() {
+    for (request, status) in [
+        (b"GET / HTTP/1.1\r\nhost: svc.test\r\n\r\n".to_vec(), 400),
+        (
+            String::from_utf8(UPGRADE.to_vec())
+                .unwrap()
+                .replace("Version: 13", "Version: 12")
+                .into_bytes(),
+            426,
+        ),
+    ] {
+        let p = instance();
+        let ext = prewire_extension();
+        let mut l = Lend::roomy();
+        let (answer, token) = adopt(p, &ext, &request, &mut l);
+        assert_eq!(answer.outcome, Outcome::Ready);
+        assert_ne!(answer.flags & YIELD_ENDED, 0);
+        assert!(answer
+            .wire
+            .starts_with(format!("HTTP/1.1 {status}").as_bytes()));
+        assert!(!l.pieces[..answer.pieces.len()]
+            .iter()
+            .any(|piece| piece.code == 101));
+        finish(p, token, &mut l);
+        shut(p);
+    }
+}
+
+#[test]
+fn prewire_http_refusal_preserves_status_duplicate_headers_and_body() {
+    for status in [401, 403, 429, 503] {
+        let (p, token, held) = staged();
+        assert!(held.wire.starts_with(b"HTTP/1.1 101"));
+        let fields = b"www-authenticate: Bearer realm=\"original\"\r\nset-cookie: a=1\r\nset-cookie: b=2\r\nx-binary: caf\xe9\r\ncontent-length: 9\r\n";
+        let mut l = Lend::roomy();
+        let head = prewire_emit(p, token, status, fields, false, 0, &mut l);
+        assert_eq!(head.outcome, Outcome::Ready);
+        let body = prewire_emit(p, token, 0, b"no-access", true, 0, &mut l);
+        assert_eq!(body.outcome, Outcome::Ready);
+        let wire = [head.wire, body.wire].concat();
+        assert!(wire.starts_with(format!("HTTP/1.1 {status} ").as_bytes()));
+        assert_eq!(
+            &wire[wire.windows(2).position(|v| v == b"\r\n").unwrap() + 2..],
+            &[fields.as_slice(), b"\r\nno-access"].concat()
+        );
+        assert!(!wire.windows(12).any(|v| v == b"HTTP/1.1 101"));
+        assert_ne!(body.flags & YIELD_ENDED, 0);
+        finish(p, token, &mut l);
+        shut(p);
+    }
+}
+
+#[test]
+fn prewire_commit_uses_existing_emit_and_postcommit_refusal_stays_websocket() {
+    let (p, token, held) = staged();
+    let mut l = Lend::roomy();
+    let commit = prewire_emit(p, token, 101, &[], true, 0, &mut l);
+    assert_eq!(commit.outcome, Outcome::Ready);
+    assert!(
+        commit.wire.is_empty(),
+        "the held 101 is published exactly once"
+    );
+    assert!(commit.pieces.is_empty());
+    assert!(held.wire.starts_with(b"HTTP/1.1 101"));
+    let message = prewire_emit(p, token, 0, b"ok", true, 0, &mut l);
+    assert_eq!(message.wire, b"\x82\x02ok");
+    let refused = prewire_refuse(p, token, 401, b"denied", true, &mut l);
+    assert_eq!(refused.outcome, Outcome::Ready);
+    assert!(refused.wire.starts_with(b"\x82\x06denied"));
+    assert!(!refused.wire.starts_with(b"HTTP/"));
+    assert_ne!(refused.flags & YIELD_ENDED, 0);
+    finish(p, token, &mut l);
+    shut(p);
+}
+
+#[test]
+fn prewire_refuse_before_head_is_http_and_discards_owed_upgrade_and_frames() {
+    let p = instance();
+    let ext = prewire_extension();
+    let mut l = Lend::new(1, 1, 1, 1);
+    let (_, token) = adopt(p, &ext, UPGRADE, &mut l);
+    poke(p, move |inst| {
+        let slot = inst.queues().get(&token).cloned().unwrap();
+        slot.lock()
+            .unwrap()
+            .pieces
+            .push_back(Piece::plain(0, b"private-pending".to_vec(), true));
+    });
+    let mut roomy = Lend::roomy();
+    let refused = prewire_refuse(p, token, 401, b"denied", false, &mut roomy);
+    assert_eq!(refused.outcome, Outcome::Ready);
+    assert!(refused.wire.starts_with(b"HTTP/1.1 401 "));
+    assert!(refused.wire.ends_with(b"\r\n\r\ndenied"));
+    assert!(!refused.wire.windows(12).any(|v| v == b"HTTP/1.1 101"));
+    assert!(refused.pieces.is_empty());
+    assert_ne!(refused.flags & YIELD_ENDED, 0);
+    finish(p, token, &mut roomy);
+    poke(p, move |inst| {
+        assert!(!inst.queues().contains_key(&token));
+        assert!(!inst.framer.holds(token));
+    });
+    shut(p);
+}
+
+#[test]
+fn prewire_finish_releases_pending_state_without_sending_handshake_or_close() {
+    let (p, token, _) = staged();
+    let done = finish(p, token, &mut Lend::roomy());
+    assert_eq!(done.outcome, Outcome::Ready);
+    assert!(done.wire.is_empty());
+    poke(p, move |inst| {
+        assert!(!inst.queues().contains_key(&token));
+        assert!(!inst.framer.holds(token));
+    });
+    shut(p);
+}
+
+#[test]
+fn prewire_chunked_refusal_preserves_trailers_and_checks_body_length() {
+    use busbar_contract::abi::transport::EMIT_TRAILERS;
+    let (p, token, _) = staged();
+    let mut l = Lend::roomy();
+    let head = prewire_emit(
+        p,
+        token,
+        429,
+        b"retry-after: 7\r\ntrailer: x-final\r\n",
+        false,
+        0,
+        &mut l,
+    );
+    assert_eq!(head.outcome, Outcome::Ready);
+    let body = prewire_emit(p, token, 0, b"slow", false, 0, &mut l);
+    assert_eq!(body.outcome, Outcome::Ready);
+    let trailers = prewire_emit(
+        p,
+        token,
+        0,
+        b"x-final: original\r\n",
+        true,
+        EMIT_TRAILERS,
+        &mut l,
+    );
+    assert_eq!(trailers.outcome, Outcome::Ready);
+    let wire = [head.wire, body.wire, trailers.wire].concat();
+    assert!(wire.starts_with(b"HTTP/1.1 429 "));
+    assert!(wire
+        .windows(b"retry-after: 7\r\n".len())
+        .any(|v| v == b"retry-after: 7\r\n"));
+    assert!(wire
+        .windows(b"transfer-encoding: chunked\r\n".len())
+        .any(|v| v == b"transfer-encoding: chunked\r\n"));
+    assert!(wire.ends_with(b"\r\n\r\n4\r\nslow\r\n0\r\nx-final: original\r\n\r\n"));
+    assert_ne!(trailers.flags & YIELD_ENDED, 0);
+    finish(p, token, &mut l);
+    shut(p);
+
+    let (p, token, _) = staged();
+    assert_eq!(
+        prewire_emit(p, token, 401, b"content-length: 3\r\n", false, 0, &mut l).outcome,
+        Outcome::Ready
+    );
+    let over = prewire_emit(p, token, 0, b"long", true, 0, &mut l);
+    assert_ne!(over.outcome, Outcome::Ready);
+    assert!(over.wire.is_empty());
+    finish(p, token, &mut l);
+    shut(p);
+}
+
+#[test]
+fn prewire_invalid_modes_and_incomplete_handshakes_never_commit() {
+    let p = instance();
+    let ext = prewire_extension();
+    let mut l = Lend::roomy();
+    let (answer, token) = adopt(p, &ext, &UPGRADE[..UPGRADE.len() / 2], &mut l);
+    assert_eq!(answer.outcome, Outcome::Ready);
+    assert!(answer.wire.is_empty());
+    assert!(answer.pieces.is_empty());
+    let commit = prewire_emit(p, token, 101, &[], true, 0, &mut l);
+    assert_ne!(commit.outcome, Outcome::Ready);
+    assert!(commit.wire.is_empty());
+    finish(p, token, &mut l);
+    shut(p);
+
+    let p = instance();
+    for bad in [&b""[..], &b"2"[..], &[1][..]] {
+        let ext = extensions::encode(&[
+            (EXT_ADOPTED_SESSION, &context(37).encode()),
+            ("session.prewire", bad),
+        ]);
+        let (answer, token) = adopt(p, &ext, UPGRADE, &mut l);
+        assert_eq!(answer.outcome, Outcome::Failed);
+        assert_eq!(token, 0);
+        assert!(answer.wire.is_empty());
+    }
+    shut(p);
+}
