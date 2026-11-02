@@ -58,7 +58,7 @@ use tungstenite::client::IntoClientRequest;
 use tungstenite::error::ProtocolError;
 use tungstenite::handshake::client::{ClientHandshake, Response as UpgradeResponse};
 use tungstenite::handshake::machine::{HandshakeMachine, RoundResult, StageResult};
-use tungstenite::handshake::server::{NoCallback, ServerHandshake};
+use tungstenite::handshake::server::{NoCallback, Request as UpgradeRequest, ServerHandshake};
 use tungstenite::handshake::{HandshakeError, MidHandshake};
 use tungstenite::http::{HeaderMap, HeaderName, HeaderValue};
 use tungstenite::protocol::frame::coding::CloseCode;
@@ -83,6 +83,8 @@ pub(crate) struct Pipe {
     head_at: usize,
     /// Original Connection values when only the library's response validator needed normalization.
     response_connection: Option<Vec<HeaderValue>>,
+    /// Capture only the accepted request parser's bounded reads, including its read-ahead tail.
+    record_request: bool,
     /// The test harness's seed is on for this dialled end (`test-seeded`): its frames go out under
     /// the all-zero mask ([`seeded::unmask`]).
     #[cfg(feature = "test-seeded")]
@@ -257,6 +259,9 @@ impl Read for Pipe {
         buf[..a].copy_from_slice(&front[..a]);
         buf[a..n].copy_from_slice(&back[..n - a]);
         self.inbound.drain(..n);
+        if self.record_request {
+            self.seen.extend_from_slice(&buf[..n]);
+        }
         Ok(n)
     }
 }
@@ -291,6 +296,7 @@ enum Phase {
     /// ceiling it began under (`0` = none).
     Accepting {
         mid: MidHandshake<ServerHandshake<Pipe, NoCallback>>,
+        request: Option<HandshakeMachine<Pipe>>,
         max: usize,
     },
     /// A dialled connection waiting for (the rest of) the upgrade response, with the messages
@@ -343,6 +349,10 @@ enum Phase {
 impl Phase {
     fn input(&mut self) -> &mut Pipe {
         match self {
+            Phase::Accepting {
+                request: Some(parser),
+                ..
+            } => parser.get_mut(),
             Phase::Dialling {
                 response: Some(parser),
                 ..
@@ -788,6 +798,65 @@ fn normalized_response(response: &UpgradeResponse, seen: &[u8]) -> Option<Vec<u8
     Some(normalized)
 }
 
+/// RFC 9110 combines repeated Connection fields into one ordered token list. The library's
+/// server validator reads only its first field. Change only that validator's request: the host's
+/// policy has already read the untouched original bytes, and every other request line is kept.
+fn normalized_request(request: &UpgradeRequest, seen: &[u8]) -> Option<Vec<u8>> {
+    let values: Vec<_> = request.headers().get_all("connection").iter().collect();
+    if values.len() < 2 {
+        return None;
+    }
+    let mut joined = Vec::new();
+    for (index, value) in values.into_iter().enumerate() {
+        if index != 0 {
+            joined.extend_from_slice(b", ");
+        }
+        joined.extend_from_slice(value.as_bytes());
+    }
+    let mut normalized = Vec::with_capacity(seen.len());
+    let mut inserted = false;
+    for line in seen.split_inclusive(|byte| *byte == b'\n') {
+        if line
+            .iter()
+            .position(|byte| *byte == b':')
+            .is_some_and(|at| line[..at].eq_ignore_ascii_case(b"connection"))
+        {
+            if !inserted {
+                normalized.extend_from_slice(b"Connection: ");
+                normalized.extend_from_slice(&joined);
+                normalized.extend_from_slice(b"\r\n");
+                inserted = true;
+            }
+        } else {
+            normalized.extend_from_slice(line);
+        }
+    }
+    Some(normalized)
+}
+
+/// Answer a malformed accepted upgrade with the same refusal as the server handshake machine.
+fn refused_upgrade(
+    error: WsError,
+    out: &mut dyn FramerOut,
+) -> Result<(Phase, bool, Option<Vec<u8>>), TransportError> {
+    if matches!(
+        error,
+        WsError::Protocol(ProtocolError::HandshakeIncomplete) | WsError::Io(_)
+    ) {
+        return Err(TransportError::HandshakeFailed);
+    }
+    let answer: &[u8] = if matches!(
+        error,
+        WsError::Protocol(ProtocolError::MissingSecWebSocketVersionHeader)
+    ) {
+        b"HTTP/1.1 426 Upgrade Required\r\nSec-WebSocket-Version: 13\r\nConnection: close\r\nContent-Length: 0\r\n\r\n"
+    } else {
+        b"HTTP/1.1 400 Bad Request\r\nConnection: close\r\nContent-Length: 0\r\n\r\n"
+    };
+    out.send(answer);
+    Ok((Phase::Refused(Pipe::default()), true, None))
+}
+
 /// A refused upgrade's BODY: frame what the pipe holds, decoded by its transfer coding when it is
 /// `chunked` (to its last chunk), otherwise up to the `left` bytes its declared `Content-Length`
 /// still owes (or, with none declared, until the carrier ends), and end the frames once they are
@@ -992,7 +1061,9 @@ impl WsFramer {
         }
         let sent = self.emit(state, StreamId(0), bytes, true, false, out);
         self.close_with(state, close_code_of_status(status), out);
-        sent
+        sent?;
+        out.end();
+        Ok(())
     }
 
     /// A framer whose messages (and frames) are capped at `max_message_bytes`; `0` = the protocol
@@ -1207,7 +1278,14 @@ impl WsFramer {
                     .and_then(|c| c.max_message_size)
                     .unwrap_or(0);
                 match tungstenite::accept_with_config(Pipe::default(), config) {
-                    Err(HandshakeError::Interrupted(mid)) => Phase::Accepting { mid, max },
+                    Err(HandshakeError::Interrupted(mid)) => Phase::Accepting {
+                        mid,
+                        request: Some(HandshakeMachine::start_read(Pipe {
+                            record_request: true,
+                            ..Pipe::default()
+                        })),
+                        max,
+                    },
                     // Nothing has been read, so nothing can have completed or failed yet.
                     Ok(_) | Err(HandshakeError::Failure(_)) => {
                         return Err(TransportError::HandshakeFailed)
@@ -1418,49 +1496,94 @@ impl WsFramer {
         // it), set on the call that hands the head up.
         let mut reason = None;
         let mut phase = match phase {
-            Phase::Accepting { mid, max } => match mid.handshake() {
-                Ok(mut ws) => {
-                    // The machine refuses any byte it read past the request. Bytes left unread
-                    // in the pipe therefore begin at a frame boundary; feed them before the
-                    // session consumes them, carrying any partial frame into the next call.
-                    let pipe = ws.get_mut();
-                    pipe.seen = Vec::new();
-                    let mut scan = TextScan {
-                        masked: true,
-                        ..TextScan::default()
-                    };
-                    let (front, back) = pipe.inbound.as_slices();
-                    scan.feed(front);
-                    scan.feed(back);
-                    pipe.scan = Some(scan);
-                    Phase::open(ws, Vec::new(), max)
-                }
-                Err(HandshakeError::Interrupted(mid)) => {
-                    return Ok((Phase::Accepting { mid, max }, false, None))
-                }
-                // A request that is not an upgrade this end accepts is ANSWERED (RFC 6455 4.2.1:
-                // 400; a version it does not speak, 4.4: 426 naming the one it does), and the
-                // connection's frames end failed. A request still incomplete, or a carrier that
-                // broke, has no request to answer.
-                Err(HandshakeError::Failure(e)) => {
-                    if matches!(
-                        e,
-                        WsError::Protocol(ProtocolError::HandshakeIncomplete) | WsError::Io(_)
-                    ) {
-                        return Err(TransportError::HandshakeFailed);
+            Phase::Accepting {
+                mut mid,
+                mut request,
+                max,
+            } => {
+                let mut unread = VecDeque::new();
+                if let Some(mut parser) = request.take() {
+                    loop {
+                        match parser.single_round::<UpgradeRequest>() {
+                            Ok(RoundResult::Incomplete(next)) => parser = next,
+                            Ok(RoundResult::WouldBlock(next)) => {
+                                return Ok((
+                                    Phase::Accepting {
+                                        mid,
+                                        request: Some(next),
+                                        max,
+                                    },
+                                    false,
+                                    None,
+                                ));
+                            }
+                            Ok(RoundResult::StageFinished(StageResult::DoneReading {
+                                result,
+                                mut stream,
+                                tail,
+                            })) => {
+                                // Preserve the library's original read-ahead rule. A request
+                                // followed by bytes in the same parser read is illegal early data;
+                                // bytes still unread in the pipe are carried into the open session.
+                                if !tail.is_empty() {
+                                    stream.seen.zeroize();
+                                    return refused_upgrade(
+                                        WsError::Protocol(ProtocolError::JunkAfterRequest),
+                                        out,
+                                    );
+                                }
+                                let mut normalized = normalized_request(&result, &stream.seen);
+                                let pipe = mid.get_mut().get_mut();
+                                pipe.inbound
+                                    .extend(normalized.as_deref().unwrap_or(&stream.seen));
+                                pipe.ended = stream.ended;
+                                unread = std::mem::take(&mut stream.inbound);
+                                stream.seen.zeroize();
+                                if let Some(bytes) = normalized.as_mut() {
+                                    bytes.zeroize();
+                                }
+                                break;
+                            }
+                            Ok(RoundResult::StageFinished(StageResult::DoneWriting(_))) => {
+                                return Err(TransportError::HandshakeFailed);
+                            }
+                            Err(error) => return refused_upgrade(error, out),
+                        }
                     }
-                    let answer: &[u8] = if matches!(
-                        e,
-                        WsError::Protocol(ProtocolError::MissingSecWebSocketVersionHeader)
-                    ) {
-                        b"HTTP/1.1 426 Upgrade Required\r\nSec-WebSocket-Version: 13\r\nConnection: close\r\nContent-Length: 0\r\n\r\n"
-                    } else {
-                        b"HTTP/1.1 400 Bad Request\r\nConnection: close\r\nContent-Length: 0\r\n\r\n"
-                    };
-                    out.send(answer);
-                    return Ok((Phase::Refused(Pipe::default()), true, None));
                 }
-            },
+                match mid.handshake() {
+                    Ok(mut ws) => {
+                        // The machine refuses any byte it read past the request. Bytes left unread
+                        // in the pipe therefore begin at a frame boundary; feed them before the
+                        // session consumes them, carrying any partial frame into the next call.
+                        let pipe = ws.get_mut();
+                        pipe.inbound.append(&mut unread);
+                        pipe.seen = Vec::new();
+                        let mut scan = TextScan {
+                            masked: true,
+                            ..TextScan::default()
+                        };
+                        let (front, back) = pipe.inbound.as_slices();
+                        scan.feed(front);
+                        scan.feed(back);
+                        pipe.scan = Some(scan);
+                        Phase::open(ws, Vec::new(), max)
+                    }
+                    Err(HandshakeError::Interrupted(mut mid)) => {
+                        mid.get_mut().get_mut().inbound.append(&mut unread);
+                        return Ok((
+                            Phase::Accepting {
+                                mid,
+                                request: None,
+                                max,
+                            },
+                            false,
+                            None,
+                        ));
+                    }
+                    Err(HandshakeError::Failure(error)) => return refused_upgrade(error, out),
+                }
+            }
             Phase::Dialling {
                 mid,
                 response,
@@ -1843,8 +1966,8 @@ impl WsFramer {
         if let Some(scan) = pipe.scan.as_mut().filter(|_| was_open) {
             scan.feed(bytes);
         }
-        // Only a dialled head is read back off what the handshake saw (its reason phrase, a
-        // refusal's body); an accepting handshake keeps no copy.
+        // Dialled heads retain the input for reason/body parsing. The accepted request parser
+        // records only its bounded reads in Pipe::read, preserving its read-ahead boundary.
         if dialling {
             pipe.seen.extend_from_slice(bytes);
         }

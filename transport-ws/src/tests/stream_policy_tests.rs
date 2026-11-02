@@ -21,6 +21,7 @@ use std::mem::size_of;
 thread_local! {
     static HANDED: RefCell<Vec<(u32, u64, u64)>> = const { RefCell::new(Vec::new()) };
     static FLOW: Cell<u32> = const { Cell::new(FLOW_CONTINUE) };
+    static FIELDS: RefCell<Vec<(Vec<u8>, Vec<u8>)>> = const { RefCell::new(Vec::new()) };
 }
 
 extern "C" fn hand_in(_: HostCtx, input: *const c_void, out: *mut ServiceOut) -> RawOutcome {
@@ -30,6 +31,17 @@ extern "C" fn hand_in(_: HostCtx, input: *const c_void, out: *mut ServiceOut) ->
         HANDED.with(|seen| {
             seen.borrow_mut()
                 .push((input.line, input.auth.mac, input.stream))
+        });
+        FIELDS.with(|seen| {
+            let fields = if input.request.fields_len == 0 {
+                &[][..]
+            } else {
+                std::slice::from_raw_parts(input.request.fields, input.request.fields_len)
+            };
+            *seen.borrow_mut() = fields
+                .iter()
+                .map(|field| (field.name.bytes().to_vec(), field.value.bytes().to_vec()))
+                .collect();
         });
         input.answer.write_unaligned(AuthAnswer {
             size: size_of::<AuthAnswer>() as u32,
@@ -116,6 +128,7 @@ struct Host {
 impl Host {
     fn new() -> Self {
         HANDED.with(|seen| seen.borrow_mut().clear());
+        FIELDS.with(|seen| seen.borrow_mut().clear());
         FLOW.with(|flow| flow.set(FLOW_CONTINUE));
         // SAFETY: these ABI tables are plain C data with valid zero defaults.
         let mut slots: Box<HostSlots> = Box::new(unsafe { std::mem::zeroed() });
@@ -230,8 +243,7 @@ impl Drop for Host {
 #[test]
 fn a_direct_upgrade_selects_its_own_generation_before_answering_or_reading_messages() {
     let host = Host::new();
-    let mut wire = UPGRADE.to_vec();
-    wire.extend_from_slice(&masked(b"first"));
+    let wire = UPGRADE.to_vec();
     let mut lend = Lend::roomy();
     let (waiting, open) = host.ingest(&wire, &[], ticket(2), &mut lend);
     assert_eq!(waiting.outcome, Outcome::Ready);
@@ -243,10 +255,13 @@ fn a_direct_upgrade_selects_its_own_generation_before_answering_or_reading_messa
     assert!(open.is_none());
     assert_eq!(admitted.outcome, Outcome::Ready);
     assert!(admitted.wire.starts_with(b"HTTP/1.1 101"));
-    assert_eq!(admitted.pieces[0].0, b"first");
+    assert!(admitted.pieces.is_empty());
+    let (first, open) = host.ingest(&masked(b"first"), &[], ticket(3), &mut lend);
+    assert!(open.is_none());
+    assert_eq!(first.pieces[0].0, b"first");
     HANDED.with(|seen| assert_eq!(seen.borrow().as_slice(), &[(44, 4, 0)]));
     let next = masked(b"second");
-    let (_, open) = host.ingest(&next, &policy(9, 99), ticket(3), &mut lend);
+    let (_, open) = host.ingest(&next, &policy(9, 99), ticket(4), &mut lend);
     assert!(
         open.is_none(),
         "an admitted session never selects a later generation"
@@ -341,4 +356,39 @@ fn a_host_refusal_is_framed_before_the_websocket_handshake_and_drains() {
     assert!(wire.starts_with(b"HTTP/1.1 403"));
     assert!(wire.ends_with(b"denied-verbatim"));
     assert_eq!(answer.flags & YIELD_ENDED, YIELD_ENDED);
+}
+
+#[test]
+fn repeated_connection_normalization_happens_after_policy_reads_the_original_fields() {
+    let host = Host::new();
+    let request = String::from_utf8(UPGRADE.to_vec())
+        .unwrap()
+        .replace(
+            "Connection: Upgrade\r\n",
+            "Connection: keep-alive\r\nConnection: Upgrade\r\nX-Policy: original\r\n",
+        )
+        .into_bytes();
+    let original = request.clone();
+    let mut lend = Lend::roomy();
+    let (waiting, open) = host.ingest(&request, &[], ticket(2), &mut lend);
+    assert!(waiting.wire.is_empty());
+    assert!(open.is_some());
+    let (admitted, _) = host.ingest(&request, &policy(4, 44), ticket(2), &mut lend);
+    assert!(admitted.wire.starts_with(b"HTTP/1.1 101"));
+    FIELDS.with(|seen| {
+        let fields = seen.borrow();
+        let connection: Vec<_> = fields
+            .iter()
+            .filter(|(name, _)| name == b"connection")
+            .map(|(_, value)| value.as_slice())
+            .collect();
+        assert_eq!(
+            connection,
+            [b"keep-alive".as_slice(), b"Upgrade".as_slice()]
+        );
+        assert!(fields
+            .iter()
+            .any(|(name, value)| name == b"x-policy" && value == b"original"));
+    });
+    assert_eq!(request, original);
 }

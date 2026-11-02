@@ -89,8 +89,7 @@ fn adoption_keeps_the_inherited_stream_from_initial_leftovers_through_finish() {
         let p = instance();
         let previous = accepted(p);
         let mut extension = extensions::encode(&[(EXT_ADOPTED_SESSION, &context(stream).encode())]);
-        let mut leftover = UPGRADE.to_vec();
-        leftover.extend_from_slice(&masked(b"initial-payload"));
+        let leftover = UPGRADE.to_vec();
         let original = leftover.clone();
         let mut l = Lend::new(1, 3, 1, 1);
         let (mut answer, token) = adopt(p, &extension, &leftover, &mut l);
@@ -119,6 +118,25 @@ fn adoption_keeps_the_inherited_stream_from_initial_leftovers_through_finish() {
         }
         assert_eq!(answer.flags & YIELD_MORE, 0);
         assert!(wire.starts_with(b"HTTP/1.1 101"));
+        assert!(
+            payload.is_empty(),
+            "no message arrives before the 101 is drained"
+        );
+        let mut initial = masked(b"initial-payload");
+        let mut heard = ingest(p, token, &initial, false, &mut l);
+        initial.fill(0);
+        drop(initial);
+        for _ in 0..1000 {
+            streams(&l, &heard, stream);
+            for (bytes, _) in &heard.pieces {
+                payload.extend_from_slice(bytes);
+            }
+            if heard.flags & YIELD_MORE == 0 {
+                break;
+            }
+            heard = ingest(p, token, &[], false, &mut l);
+        }
+        assert_eq!(heard.flags & YIELD_MORE, 0);
         assert_eq!(payload, b"initial-payload");
 
         let mut roomy = Lend::roomy();
@@ -257,4 +275,139 @@ fn the_door_advertises_the_shared_adopted_session_capability() {
         extensions::get(bytes, EXT_ADOPTED_SESSION),
         Some(SUPPORT_ADOPTED_SESSION)
     );
+}
+
+/// Begin and HTTP hand-off use the same accepted request validation, at every header split.
+#[test]
+fn accepted_connection_lists_are_combined_without_changing_original_request_bytes() {
+    for connection in [
+        "Connection: keep-alive\r\nConnection: Upgrade\r\n",
+        "Connection: Upgrade\r\nConnection: keep-alive\r\n",
+        "cOnNeCtIoN: keep-alive, X-Hop\r\nconnection: uPgRaDe\r\n",
+        "Connection: keep-alive, Upgrade\r\n",
+    ] {
+        let request = format!("GET /echo HTTP/1.1\r\nHost: svc.test\r\nUpgrade: websocket\r\n{connection}Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\nX-Hop: untouched\r\nAuthorization: Bearer original\r\n\r\n").into_bytes();
+        let original = request.clone();
+        for adopted in [false, true] {
+            for split in 0..=request.len() {
+                let p = instance();
+                let mut l = Lend::roomy();
+                let ext = extensions::encode(&[(EXT_ADOPTED_SESSION, &context(37).encode())]);
+                let (first, token) = if adopted {
+                    adopt(p, &ext, &request[..split], &mut l)
+                } else {
+                    let (_, token) = begin(p, SIDE_ACCEPT, "", &[], &mut l);
+                    (ingest(p, token, &request[..split], false, &mut l), token)
+                };
+                assert_eq!(
+                    first.outcome,
+                    Outcome::Ready,
+                    "adopt {adopted}, split {split}"
+                );
+                let second = ingest(p, token, &request[split..], false, &mut l);
+                assert_eq!(second.outcome, Outcome::Ready);
+                let mut wire = first.wire;
+                wire.extend_from_slice(&second.wire);
+                assert!(
+                    wire.starts_with(b"HTTP/1.1 101"),
+                    "adopt {adopted}, split {split}: {wire:?}"
+                );
+                assert!(first.pieces.is_empty() && second.pieces.is_empty());
+                let heard = ingest(p, token, &masked(b"after-101"), false, &mut l);
+                assert_eq!(heard.pieces[0].0, b"after-101");
+                streams(&l, &heard, if adopted { 37 } else { 0 });
+                assert_eq!(request, original, "policy and hand-off bytes stay original");
+                finish(p, token, &mut l);
+                shut(p);
+            }
+        }
+    }
+}
+
+#[test]
+fn combining_accepted_connection_fields_keeps_every_other_validation_and_early_data_refusal() {
+    let request = |connection: &str, upgrade: &str, key: &str, version: &str| {
+        format!("GET /echo HTTP/1.1\r\nHost: svc.test\r\n{upgrade}{connection}{key}{version}\r\n")
+            .into_bytes()
+    };
+    let connection = "Connection: keep-alive\r\nConnection: Upgrade\r\n";
+    let upgrade = "Upgrade: websocket\r\n";
+    let key = "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n";
+    let version = "Sec-WebSocket-Version: 13\r\n";
+    let mut early = request(connection, upgrade, key, version);
+    early.extend_from_slice(&masked(b"too-early"));
+    for (bytes, status) in [
+        (
+            request(
+                "Connection: keep-alive\r\nConnection: X-Hop\r\n",
+                upgrade,
+                key,
+                version,
+            ),
+            400,
+        ),
+        (request(connection, "Upgrade: other\r\n", key, version), 400),
+        (request(connection, "", key, version), 400),
+        (request(connection, upgrade, "", version), 400),
+        (
+            request(connection, upgrade, key, "Sec-WebSocket-Version: 12\r\n"),
+            426,
+        ),
+        (early, 400),
+    ] {
+        for adopted in [false, true] {
+            let p = instance();
+            let mut l = Lend::roomy();
+            let (answer, token) = if adopted {
+                let ext = extensions::encode(&[(EXT_ADOPTED_SESSION, &context(37).encode())]);
+                adopt(p, &ext, &bytes, &mut l)
+            } else {
+                let (_, token) = begin(p, SIDE_ACCEPT, "", &[], &mut l);
+                (ingest(p, token, &bytes, false, &mut l), token)
+            };
+            assert_eq!(answer.outcome, Outcome::Ready);
+            assert!(
+                answer
+                    .wire
+                    .starts_with(format!("HTTP/1.1 {status}").as_bytes()),
+                "{status}: {:?}",
+                answer.wire
+            );
+            assert_ne!(answer.flags & YIELD_ENDED, 0);
+            assert!(answer.pieces.iter().all(|(bytes, _)| bytes != b"too-early"));
+            finish(p, token, &mut l);
+            shut(p);
+        }
+    }
+}
+
+#[test]
+fn connection_normalization_preserves_unread_frames_at_the_original_request_read_boundary() {
+    let mut request = b"GET /echo HTTP/1.1\r\nHost: svc.test\r\nUpgrade: websocket\r\nConnection: keep-alive\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\nX-Pad: ".to_vec();
+    request.resize(4096 - 4, b'p');
+    request.extend_from_slice(b"\r\n\r\n");
+    let payload = b"\xaa\xbb\x81\x82\x00\x00\x00\x00\xff\xff";
+    let frame = masked(payload);
+    request.extend_from_slice(&frame[..8]);
+    for adopted in [false, true] {
+        let p = instance();
+        let mut l = Lend::roomy();
+        let (answer, token) = if adopted {
+            let ext = extensions::encode(&[(EXT_ADOPTED_SESSION, &context(37).encode())]);
+            adopt(p, &ext, &request, &mut l)
+        } else {
+            let (_, token) = begin(p, SIDE_ACCEPT, "", &[], &mut l);
+            (ingest(p, token, &request, false, &mut l), token)
+        };
+        assert_eq!(answer.outcome, Outcome::Ready);
+        assert!(answer.wire.starts_with(b"HTTP/1.1 101"));
+        assert!(answer.pieces.is_empty());
+        let rest = ingest(p, token, &frame[8..], false, &mut l);
+        assert_eq!(rest.outcome, Outcome::Ready);
+        assert_eq!(rest.flags & YIELD_ENDED, 0);
+        assert_eq!(rest.pieces[0].0, payload);
+        streams(&l, &rest, if adopted { 37 } else { 0 });
+        finish(p, token, &mut l);
+        shut(p);
+    }
 }
