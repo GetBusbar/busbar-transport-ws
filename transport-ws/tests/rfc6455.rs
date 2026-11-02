@@ -48,12 +48,17 @@ fn call<I, O>(op: Option<Op>, inst: *mut c_void, i: &mut I, o: &mut O, index: u3
         (*ih).op = index;
         (*std::ptr::from_mut(o).cast::<OutHead>()).size = size_of::<O>() as u32;
     }
-    (op.expect("every slot is filled"))(
-        inst,
-        std::ptr::from_ref(i).cast(),
-        std::ptr::from_mut(o).cast(),
-    )
-    .outcome()
+    // SAFETY: this private harness pairs each slot with its matching ABI input/output types
+    // and a live instance (or null for validate/open). Their heads are initialized above; all
+    // referenced settings, sinks and payload buffers remain valid and borrowed through the call.
+    unsafe {
+        (op.expect("every slot is filled"))(
+            inst,
+            std::ptr::from_ref(i).cast(),
+            std::ptr::from_mut(o).cast(),
+        )
+        .outcome()
+    }
 }
 
 /// What one op answered: the bytes for the far side, the frames for the layer above (each with
