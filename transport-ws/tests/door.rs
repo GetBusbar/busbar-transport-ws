@@ -19,9 +19,9 @@ use busbar_contract::abi::transport::check::{check_framer, check_framer_fields};
 use busbar_contract::abi::transport::fields::lines;
 use busbar_contract::abi::transport::{
     slot, AdoptIn, BeginIn, EmitIn, FinishIn, FramePiece, FramerOut, FramerSink, IngestIn, Ops,
-    RefuseIn, CLOSE_NORMAL, EMIT_TEXT, PIECE_CONTINUED, PIECE_END, PIECE_END_OF_FRAME,
-    PIECE_FIELDS, PIECE_HAS_CODE, PIECE_STREAM_FAILED, PIECE_TEXT, SIDE_ACCEPT, SIDE_DIAL,
-    STATUS_SUCCESS, YIELD_ENDED, YIELD_MORE,
+    RefuseIn, CLOSE_NORMAL, EMIT_TEXT, EMIT_TRAILERS, PIECE_CONTINUED, PIECE_END,
+    PIECE_END_OF_FRAME, PIECE_FIELDS, PIECE_HAS_CODE, PIECE_STREAM_FAILED, PIECE_TEXT, SIDE_ACCEPT,
+    SIDE_DIAL, STATUS_SUCCESS, YIELD_ENDED, YIELD_MORE,
 };
 use tungstenite::handshake::derive_accept_key;
 
@@ -265,11 +265,21 @@ impl Host {
 
     /// One whole message from `end`, its `EmitIn::flags` as given; the raw answer.
     fn emit(&mut self, end: &End, message: &[u8], flags: u32) -> (Outcome, FramerOut) {
+        self.emit_piece(end, message, flags, true)
+    }
+
+    fn emit_piece(
+        &mut self,
+        end: &End,
+        message: &[u8],
+        flags: u32,
+        whole: bool,
+    ) -> (Outcome, FramerOut) {
         let mut i: EmitIn = z();
         i.framing = end.framing;
         i.bytes = message.as_ptr();
         i.len = message.len();
-        i.end_of_frame = 1;
+        i.end_of_frame = u32::from(whole);
         i.flags = flags;
         i.sink = self.sink();
         let mut o: FramerOut = z();
@@ -424,6 +434,38 @@ fn a_text_message_arrives_as_text_through_the_door() {
     let ops = linked();
     text_and_binary("linked roomy", ops, (64 * 1024, 64 * 1024, 64));
     text_and_binary("linked tight", ops, (7, 3, 1));
+}
+
+/// Unsupported neutral trailers and unknown bits refuse before altering the open message.
+#[test]
+fn unsupported_emit_flags_refuse_through_the_real_door_and_leave_the_session_usable() {
+    let mut host = Host::open(linked(), (64 * 1024, 64 * 1024, 64));
+    let mut dial = host.begin(SIDE_DIAL, "ws://svc.test/stream");
+    let mut accept = host.begin(SIDE_ACCEPT, "");
+    host.carry(&mut dial, &mut accept);
+    host.carry(&mut accept, &mut dial);
+    let (outcome, out) = host.emit_piece(&accept, b"prefix-", 0, false);
+    assert_eq!(outcome, Outcome::Ready);
+    assert_eq!(out.yielded.wire_len, 0);
+    for flags in [EMIT_TRAILERS, EMIT_TRAILERS | EMIT_TEXT, 1 << 31] {
+        let (outcome, out) = host.emit(&accept, b"x-final: value\r\n", flags);
+        assert_eq!(outcome, Outcome::Refused);
+        assert_eq!(out.yielded.wire_len, 0);
+        assert_eq!(out.yielded.frame_len, 0);
+        assert_eq!(out.yielded.pieces_len, 0);
+    }
+    for (payload, flags) in [(&b"binary"[..], 0), (&b"text"[..], EMIT_TEXT)] {
+        let (outcome, out) = host.emit(&accept, payload, flags);
+        let more = host.take(outcome, &out, &mut accept);
+        host.again(more, &mut accept);
+        host.carry(&mut accept, &mut dial);
+    }
+    assert_eq!(
+        dial.frames,
+        [(b"prefix-binary".to_vec(), true), (b"text".to_vec(), true)]
+    );
+    assert_eq!(dial.text, [false, true]);
+    host.close();
 }
 
 /// The far end's switching answer to the upgrade request `request`, its own fields `extra`

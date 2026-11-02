@@ -38,7 +38,9 @@ use busbar_contract::abi::mechanism::lifecycle::{CancelIn, CancelOut, RefreshIn}
 use busbar_contract::abi::sdk::door::{abi_str, statement};
 use busbar_contract::abi::sdk::life::{self, Held, Life, Refreshed, Refusal};
 use busbar_contract::abi::sdk::transport::policy::Loans;
-use busbar_contract::abi::sdk::transport::{form_codes, settings_reading, DEFAULT_BODY_MAX};
+use busbar_contract::abi::sdk::transport::{
+    form_codes, setting_decls, settings_reading, SettingRow, DEFAULT_BODY_MAX,
+};
 use busbar_contract::abi::sdk::{Instance, Lent, Out, Safe, SafeSlot};
 use busbar_contract::abi::transport::adopted_session::{
     AdoptedSession, EXT_ADOPTED_SESSION, SUPPORT_ADOPTED_SESSION,
@@ -110,12 +112,12 @@ const ROW: Claim = {
 /// Each claimed scheme's row, by index into [`CLAIM_NAMES`].
 const CLAIMS: &[Claim] = &[ROW, ROW];
 
-const SETTINGS: &[SettingDecl] = &[SettingDecl {
-    path: abi_str(BODY_MAX_BYTES),
+const SETTING_ROWS: [SettingRow; 1] = [SettingRow {
+    path: BODY_MAX_BYTES,
     kind: SETTING_COUNT,
-    _reserved: 0,
-    default: abi_str(DEFAULT_BODY_MAX),
+    default: DEFAULT_BODY_MAX,
 }];
+const SETTINGS: &[SettingDecl] = &setting_decls(&SETTING_ROWS);
 
 /// The op facts are the ops the door serves: the framer begins on the accepting side and on the
 /// dialling side, and adopts a stream another framer detached (`FACT_ACCEPTS`, `FACT_DIALS`,
@@ -420,7 +422,14 @@ const BAD_BODY_MAX: &str =
 /// The settings blob read: a JSON object (empty bytes = `{}`) whose every key is one this transport
 /// declares, its ceiling a count above 0.
 fn read_settings(bytes: &[u8]) -> Result<usize, Refusal> {
-    let object = settings_reading(bytes, &[BODY_MAX_BYTES])?;
+    let object = settings_reading(bytes, &SETTING_ROWS).map_err(|why| {
+        // Retain this transport's established byte-count diagnostic for the SDK's count rule.
+        if why.text() == Some("settings: limits.request_body_max_bytes must be a count above 0") {
+            Refusal::failed(BAD_BODY_MAX)
+        } else {
+            why
+        }
+    })?;
     match object.get(BODY_MAX_BYTES) {
         None => Ok(DEFAULT_REQUEST_BODY_MAX_BYTES),
         // `WsFramer::new(0)` means the library's inbound default and NO outbound ceiling: refuse
@@ -789,11 +798,9 @@ fn opening(
         o.error(texts.no_instance);
         return Outcome::Failed;
     };
-    let mut owed = Owed {
-        adopted,
-        policy,
-        ..Owed::default()
-    };
+    let mut owed = Owed::default();
+    owed.adopted = adopted;
+    owed.policy = policy;
     let mut c = Collect {
         owed: &mut owed,
         now: time(&sink),
@@ -1003,6 +1010,10 @@ op!(
 op!(
     /// `emit`.
     Emit(EmitIn => FramerOut) |p, i, o| {
+        if i.flags & !EMIT_TEXT != 0 {
+            o.error("emit: the ws framer does not support these flags");
+            return Outcome::Refused;
+        }
         let bytes = i.bytes();
         let eof = i.end_of_frame != 0;
         let (token, text) = (i.framing, i.flags & EMIT_TEXT != 0);
