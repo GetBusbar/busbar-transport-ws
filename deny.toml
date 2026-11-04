@@ -221,4 +221,8 @@ skip = [
 unknown-registry = "deny"
 unknown-git = "deny"
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]
-allow-git = ["https://github.com/GetBusbar/busbar"]
+allow-git = [
+    "https://github.com/GetBusbar/busbar",
+    # Existing pinned tungstenite patch, Cargo.lock revision 1c190f7dda55dc7df4781b7ecea9faa671fc76fd.
+    "https://github.com/MattJackson/tungstenite-rs",
+]
