@@ -2,6 +2,9 @@
 // Copyright (C) 2026 Busbar Inc and contributors
 
 //! **ONE `ws` DOOR, BOTH WAYS IN**: the linked door (`busbar_transport_ws::linked::door`) and this
+//! crate's built cdylib (the same door behind the one `export_door!`), each admitted through the
+//! loader's ONE door validation and driven through the ONE dispatcher's crossing, give the same
+//! Statement and the same answers.
 
 use std::mem::zeroed;
 use std::sync::Arc;
@@ -234,6 +237,7 @@ impl Host {
 }
 
 /// What the exchange left: the upgrade's first lines, what each end heard, whether the far end's
+/// stream ended (its `PIECE_END` piece) and its connection with `YIELD_ENDED`.
 type Script = (bool, bool, Vec<Vec<u8>>, Vec<Vec<u8>>, bool, bool);
 
 /// One exchange through the dispatcher: the upgrade, one message each way, the dialled end's close.

@@ -2,6 +2,9 @@
 // Copyright (C) 2026 Busbar Inc and contributors
 
 //! THE `ws` DOOR AGAINST RFC 6455, AS AUTOBAHN|TESTSUITE GRADES IT: the accepted end of the door,
+//! driven over the transport kind's table exactly as the connector drives it, with a far end that
+//! writes raw client frames (masked, chopped, broken on purpose) and reads the raw frames the door
+//! answers.
 
 use std::ffi::c_void;
 use std::mem::{size_of, zeroed};
@@ -17,6 +20,7 @@ use busbar_contract::abi::transport::{
 };
 
 /// A message's kind as this harness names it: what its pieces state (`PIECE_TEXT` or nothing) and
+/// what an `emit` asks for (`EMIT_TEXT` or nothing).
 const UTF8: u8 = 1;
 const OCTETS: u8 = 2;
 
@@ -279,6 +283,7 @@ const CLOSE: u8 = 0x8;
 const PING: u8 = 0x9;
 
 /// One client frame: masked (with a key that is not zero, so unmasking is exercised), `rsv` the
+/// three reserved bits.
 fn client(fin: bool, rsv: u8, opcode: u8, payload: &[u8]) -> Vec<u8> {
     let mask = [0x37, 0xfa, 0x21, 0x3d];
     let mut f = vec![(u8::from(fin) << 7) | (rsv << 4) | opcode];
@@ -467,6 +472,8 @@ fn a_drain_closes_with_1012() {
 }
 
 /// Every reason this end closes for puts its own RFC 6455 code on the wire, a distinct one per
+/// reason a peer can act on, and never a reserved code (1005, 1006, 1015); the in-process
+/// transport's battery pinned the same table, which now has one home, the framer.
 #[test]
 fn each_close_reason_puts_its_own_code_on_the_wire() {
     for (reason, code) in [
@@ -491,6 +498,7 @@ fn each_close_reason_puts_its_own_code_on_the_wire() {
 }
 
 /// The far side sends `bytes` (a valid message, then a violation) in ONE chop: the message is
+/// handed up, the frames end, the layer above still answers it, and the close carries `code`.
 fn answered_then_failed(case: &str, bytes: &[u8], code: u16) {
     let mut h = Host::new();
     let f = h.accept();
@@ -578,7 +586,8 @@ fn a_violation_alone_ends_the_frames_and_closes_with_1002() {
     assert_eq!(close_code(&server_frames(&closed.wire)), Some(1002));
 }
 
-/// Autobahn 6.4.3/6.4.4: one text frame sent in chops, an inner chop making it invalid (F4 90 80
+/// Autobahn 6.4.3/6.4.4: one text frame sent in chops, an inner chop making it invalid (F4 90 80 80
+/// is past U+10FFFF).
 #[test]
 fn invalid_utf8_inside_one_frame_fails_the_connection_at_the_bad_byte() {
     let part1 = "κόσμε".as_bytes();
@@ -654,7 +663,7 @@ fn a_code_point_split_across_chops_and_fragments_is_valid() {
 /// Autobahn's "small text message" (cases 3.x and 4.x).
 const SMALL: &[u8] = b"Hello, world!";
 
-/// The far side sends `chop` (a whole text message `first`, then a violation) in one read. Strict:
+/// The far side sends `chop` (a whole text message `first`, then a violation) in one read.
 fn strict(case: &str, chop: &[u8], first: &[u8]) {
     let mut h = Host::new();
     let f = h.accept();
@@ -741,6 +750,8 @@ fn autobahn_5_15_a_continuation_with_nothing_to_continue_after_a_fragmented_mess
 }
 
 /// The far side sends `frames` (one empty message of `kind`, `rounds` times over, each after the
+/// echo of the one before, as Autobahn waits for it): each is handed up as an empty message of its
+/// kind, never as the stream's end, and its echo is an empty message of the same opcode.
 fn empty_echoed(case: &str, frames: &[u8], kind: u8, rounds: usize) {
     let opcode = if kind == UTF8 { TEXT } else { BINARY };
     let mut h = Host::new();
@@ -810,6 +821,7 @@ fn autobahn_9_8_1_a_thousand_empty_binary_messages() {
 const PONG: u8 = 0xa;
 
 /// A client PING with a payload is answered, on the bytes the same call writes, with an unmasked
+/// PONG carrying that payload; the ping hands nothing up and does not end the stream.
 #[test]
 fn a_ping_is_answered_with_its_pong() {
     let mut h = Host::new();
@@ -822,6 +834,7 @@ fn a_ping_is_answered_with_its_pong() {
 }
 
 /// `limits.request_body_max_bytes` is the inbound message ceiling: a client message past it ends
+/// the stream FAILED and the close carries 1009 (Message Too Big); one within it is served.
 #[test]
 fn a_message_past_the_settings_ceiling_fails_the_stream_with_1009() {
     let mut h = Host::with_settings(br#"{"limits.request_body_max_bytes": 64}"#);

@@ -392,3 +392,50 @@ fn repeated_connection_normalization_happens_after_policy_reads_the_original_fie
     });
     assert_eq!(request, original);
 }
+
+#[test]
+fn malformed_direct_upgrade_returns_http_error_before_policy_admission() {
+    let host = Host::new();
+    let mut lend = Lend::new(3, 64, 2, 1);
+    let (mut answer, open) = host.ingest(
+        b"GET / HTTP/1.1\r\nbad name: value\r\n\r\n",
+        &[],
+        ticket(2),
+        &mut lend,
+    );
+    assert!(open.is_none());
+    let mut wire = Vec::new();
+    for _ in 0..100 {
+        assert_eq!(answer.outcome, Outcome::Ready);
+        wire.extend_from_slice(&answer.wire);
+        if answer.flags & YIELD_MORE == 0 {
+            break;
+        }
+        answer = host.ingest(&[], &[], ticket(3), &mut lend).0;
+    }
+    assert!(wire.starts_with(b"HTTP/1.1 400 Bad Request\r\n"));
+    assert!(wire.ends_with(b"content-length: 0\r\n\r\n"));
+    assert_eq!(answer.flags & YIELD_ENDED, YIELD_ENDED);
+    HANDED.with(|seen| assert!(seen.borrow().is_empty()));
+}
+
+#[test]
+fn invalid_nonce_or_missing_host_is_refused_before_policy_hand_in() {
+    let valid = String::from_utf8(UPGRADE.to_vec()).unwrap();
+    for request in [
+        valid.replace("Host: svc.test\r\n", ""),
+        valid.replace("Host: svc.test", "Host: bad host"),
+        valid.replace("Host: svc.test", "Host: bad\thost"),
+        valid.replace("dGhlIHNhbXBsZSBub25jZQ==", "x"),
+        valid.replace("Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==", "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ=="),
+    ] {
+        let host = Host::new();
+        let mut lend = Lend::roomy();
+        let (answer, open) = host.ingest(request.as_bytes(), &[], ticket(2), &mut lend);
+        assert!(open.is_none());
+        assert_eq!(answer.outcome, Outcome::Ready);
+        assert!(answer.wire.starts_with(b"HTTP/1.1 400"));
+        assert_ne!(answer.flags & YIELD_ENDED, 0);
+        HANDED.with(|seen| assert!(seen.borrow().is_empty()));
+    }
+}

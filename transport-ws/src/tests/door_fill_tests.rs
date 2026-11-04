@@ -2,6 +2,7 @@
 // Copyright (C) 2026 Busbar Inc and contributors
 
 //! The door's answer filling: a dialled head's reason phrase rides only beside its head's first
+//! piece.
 
 use super::*;
 use std::cell::RefCell;
@@ -208,6 +209,7 @@ fn a_panicked_framing_is_forgotten_by_the_framer_at_its_finish() {
 }
 
 /// Hand `owed` over through a sink of the given caps, one fill at a time, until it is dry: every
+/// answer's wire run and frame pieces (bytes, flags), in order.
 fn drain_owed(
     owed: &mut Owed,
     wire_cap: usize,
@@ -316,6 +318,7 @@ fn the_wire_s_capacity_follows_its_backlog_not_its_throughput() {
 }
 
 /// A KEPT PIECE BUFFER GIVES BACK WHAT ONE LARGE MESSAGE GREW IT PAST [`KEEP_BYTES`]: a framing in
+/// steady state holds working-size spares, not its high-water mark eight times over.
 #[test]
 fn a_kept_piece_buffer_is_bounded() {
     let mut owed = Owed::default();
@@ -332,6 +335,8 @@ fn a_kept_piece_buffer_is_bounded() {
 }
 
 /// ONLY THE OPENING IS WIPED (PL10): the bytes a framing's opening owed (a dialled upgrade request
+/// carries its auth's credential lines) are wiped as they are handed over and when the buffer
+/// outgrows them; the message bytes owed after them are handed over as they are, never wiped.
 #[test]
 fn only_the_opening_is_wiped_as_it_is_handed_over() {
     let mut owed = Owed::default();
@@ -411,7 +416,8 @@ impl Lend {
     }
 }
 
-/// What one answer said: its outcome, its wire bytes, each piece (bytes, flags), each head's
+/// What one answer said: its outcome, its wire bytes, each piece (bytes, flags), each head's reason
+/// phrase, and its yield flags.
 struct Said {
     outcome: Outcome,
     wire: Vec<u8>,
@@ -516,6 +522,7 @@ fn begin(
 }
 
 /// `ingest` of `bytes` (`end`: the carrier ended) on framing `token`; no bytes and no end is the
+/// `YIELD_MORE` re-call.
 fn ingest(p: *mut c_void, token: u64, bytes: &[u8], end: bool, l: &mut Lend) -> Said {
     // SAFETY: plain C data; all-zero is valid.
     let mut i: IngestIn = unsafe { std::mem::zeroed() };

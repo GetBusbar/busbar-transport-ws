@@ -352,6 +352,7 @@ fn exchange(label: &str, ops: &'static Ops, caps: (usize, usize, usize)) -> Vec<
 }
 
 /// One client message as the wire carries it: FIN, `opcode`, masked with the all-zero key (so the
+/// payload is its own masking), a payload under 126 bytes.
 fn client_message(opcode: u8, payload: &[u8]) -> Vec<u8> {
     let mut m = vec![0x80 | opcode, 0x80 | payload.len() as u8, 0, 0, 0, 0];
     m.extend_from_slice(payload);
@@ -460,7 +461,8 @@ fn unsupported_emit_flags_refuse_through_the_real_door_and_leave_the_session_usa
     host.close();
 }
 
-/// The far end's switching answer to the upgrade request `request`, its own fields `extra`
+/// The far end's switching answer to the upgrade request `request`, its own fields `extra` (each
+/// `name: value\r\n`) after the handshake's.
 fn switching(request: &[u8], extra: &str) -> Vec<u8> {
     let request = String::from_utf8_lossy(request);
     let key = request
@@ -549,6 +551,7 @@ fn a_silent_far_end_that_answered_the_upgrade_is_answered_through_the_door() {
 }
 
 /// The accepting end's own switching answer, carried to the dialled end: its head crosses EMPTY
+/// (every field of it hop-by-hop or the handshake's own), framed all the same, with its status.
 #[test]
 fn an_upgrade_answered_with_no_field_left_is_an_empty_head() {
     let ops = linked();
@@ -662,7 +665,7 @@ fn locate_for_a_listener_answers_the_accepting_offer() {
     host.close();
 }
 
-/// Secure dial location crosses the table with its certificate name and ALPN offer. Each
+/// Secure dial location crosses the table with its certificate name and ALPN offer.
 #[test]
 fn locate_for_a_secure_dial_reports_every_output_and_short_buffer() {
     use busbar_contract::abi::transport::{LocateIn, LocateOut};
@@ -711,6 +714,9 @@ fn locate_for_a_secure_dial_reports_every_output_and_short_buffer() {
 }
 
 /// A REFUSED UPGRADE'S WAIT, IN ITS HTTP-DATE FORM, CROSSES THE ABI (RFC 9110 §10.2.3): a `503`
+/// whose `Retry-After` is an IMF-fixdate 120 s after the sink's unix clock (1790000000 s, so
+/// 1790000120 s is Mon, 21 Sep 2026 14:15:20 GMT) is heard as 120 seconds, read against the wall
+/// clock and not the monotonic one.
 #[test]
 fn a_refused_upgrade_s_retry_after_http_date_reaches_the_host() {
     let mut host = Host::open(linked(), (64 * 1024, 64 * 1024, 64));
@@ -807,6 +813,7 @@ fn a_refused_open_says_why() {
 }
 
 /// An accepted framing whose far end broke the protocol (a reserved opcode), on a host whose frame
+/// buffer holds `frame_cap` bytes: the accepted end, after it has heard the violation.
 fn broken_accept(frame_cap: usize) -> (Host, End) {
     let mut host = Host::open(linked(), (64 * 1024, frame_cap, 8));
     let mut dial = host.begin(SIDE_DIAL, "ws://svc.test/stream");
@@ -818,6 +825,7 @@ fn broken_accept(frame_cap: usize) -> (Host, End) {
 }
 
 /// THE FAILED END PIECE CARRIES THE REASON: the bytes of the piece that ends a stream the far end
+/// broke state how it broke it.
 #[test]
 fn a_failed_stream_s_end_piece_says_why() {
     let (host, accept) = broken_accept(64 * 1024);
@@ -830,6 +838,7 @@ fn a_failed_stream_s_end_piece_says_why() {
 }
 
 /// A FAILED PIECE IS NEVER SPLIT: a frame buffer smaller than its reason hands it as ONE piece,
+/// flagged failed, its reason cut to the room; never as unflagged payload.
 #[test]
 fn a_failed_piece_is_never_handed_as_payload() {
     let (host, accept) = broken_accept(5);
@@ -840,6 +849,8 @@ fn a_failed_piece_is_never_handed_as_payload() {
 }
 
 /// AN OVER-CEILING EMIT FAILS THE OP, NOT THE CONNECTION, WHATEVER IS QUEUED: with pieces still
+/// owed to the host, the refused message is answered `Failed` with its text, the connection is not
+/// ended, a later message goes out, and the backlog is still handed over.
 #[test]
 fn a_refused_emit_with_a_backlog_fails_the_op_and_keeps_the_connection() {
     let mut host = Host::open(linked(), (64 * 1024, 3, 1));
@@ -889,6 +900,7 @@ const REFUSED_WHY: &[u8] =
     b"the upgrade request is not a WebSocket opening handshake this end can accept";
 
 /// What the accepted end said after being refused: answered on the wire, the stream ended FAILED
+/// (never whole), the connection ended.
 fn assert_answered(end: &End, status_line: &str) {
     let wire = String::from_utf8_lossy(&end.wire);
     assert!(wire.starts_with(status_line), "the wire answers: {wire:?}");
@@ -906,6 +918,7 @@ fn assert_answered(end: &End, status_line: &str) {
 }
 
 /// A REQUEST FOR A VERSION THIS END DOES NOT SPEAK IS ANSWERED 426 with the version it does (RFC
+/// 6455 4.4), and one missing its key 400 (4.2.1); either way the stream ends failed.
 #[test]
 fn a_refused_upgrade_request_is_answered() {
     for (request, status) in [
@@ -927,6 +940,7 @@ fn a_refused_upgrade_request_is_answered() {
 }
 
 /// THE SAME REFUSAL THROUGH ADOPT: the request is the connection's leftover; `adopt` answers READY
+/// with the 400/426 on the wire and a failed end piece.
 #[test]
 fn an_adopted_connection_whose_leftover_is_refused_is_answered() {
     for (request, status) in [
@@ -957,6 +971,7 @@ fn an_adopted_connection_whose_leftover_is_refused_is_answered() {
 }
 
 /// AN OP ON A FRAMING THAT WAS ALREADY GONE FAILS THE OP: after a successful `refuse` the state is
+/// gone; a later `ingest` answers `Failed` with an explained text, and ends nothing a second time.
 #[test]
 fn an_op_after_a_refuse_fails_and_does_not_end_the_stream_again() {
     let mut host = Host::open(linked(), (64 * 1024, 64 * 1024, 8));
@@ -971,7 +986,6 @@ fn an_op_after_a_refuse_fails_and_does_not_end_the_stream_again() {
     assert_eq!(r, Outcome::Ready);
     let more = host.take(r, &o, &mut accept);
     host.again(more, &mut accept);
-    let before = accept.failures.len();
     let bytes = client_message(0x1, b"late");
     let mut i: IngestIn = z();
     i.framing = accept.framing;
@@ -984,7 +998,13 @@ fn an_op_after_a_refuse_fails_and_does_not_end_the_stream_again() {
     // SAFETY: the door's error text, valid until the next call.
     let why = unsafe { std::slice::from_raw_parts(o.head.error.ptr, o.head.error.len) };
     assert_eq!(why, b"ingest: the connection is closed");
-    assert_eq!(accept.failures.len(), before);
+    assert_eq!(
+        o.yielded.pieces_len, 0,
+        "the failed op yields no second terminal piece"
+    );
+    assert_eq!(o.yielded.frame_len, 0);
+    assert_eq!(o.yielded.wire_len, 0);
+    assert_eq!(o.yielded.flags & (YIELD_ENDED | YIELD_MORE), 0);
     host.close();
 }
 
@@ -1021,6 +1041,8 @@ fn a_re_called_refuse_hands_over_the_whole_refusal_and_the_close() {
 }
 
 /// NEW INPUT ON A FRAMING A REFUSAL ALREADY CLOSED IS NOT SWALLOWED BY THE DRAIN: an emit with
+/// bytes, while the refusal is still owed, answers `Failed` with the closed text, and the refusal
+/// and its close still drain in full through the `refuse` re-calls.
 #[test]
 fn an_emit_after_a_refuse_with_a_backlog_fails_and_the_backlog_still_drains() {
     let mut host = Host::open(linked(), (16, 64 * 1024, 8));
@@ -1095,6 +1117,7 @@ fn validate(settings: &[u8]) -> (Outcome, String) {
 }
 
 /// `open` over `settings`, a reason buffer lent: its outcome and its text (the instance, if one
+/// opened, is closed).
 fn open_with(settings: &[u8]) -> (Outcome, String) {
     use busbar_contract::abi::mechanism::call::Blob;
     let mut buf = [0_u8; 256];
@@ -1202,6 +1225,7 @@ fn pair(host: &mut Host) -> (End, End) {
 }
 
 /// REFRESH RE-READS THE SETTINGS: a bad blob is refused with the validate texts and the old ceiling
+/// stays; a good one applies to framings begun after it, and one begun before keeps its own.
 #[test]
 fn refresh_rereads_the_settings_for_framings_begun_after_it() {
     let mut host = Host::open(linked(), (64 * 1024, 64 * 1024, 64));
@@ -1244,6 +1268,7 @@ fn refresh_rereads_the_settings_for_framings_begun_after_it() {
 }
 
 /// A CARRIER OP IS REFUSED BY NAME: the ws framer serves none of them, and says which op it was
+/// asked for.
 #[test]
 fn a_carrier_op_is_refused_by_name() {
     use busbar_contract::abi::transport::{
@@ -1463,6 +1488,8 @@ fn locate_refuses_a_target_carrying_userinfo() {
 }
 
 /// AN UNDECLARED KEY WITH NOWHERE TO PUT ITS NAME SAYS SO IN THE SDK'S WORDS: `validate` and `open`
+/// with no reason buffer lent answer the lifecycle SDK's text for a reason that was not kept, as
+/// every door on `abi::sdk::life` does.
 #[test]
 fn an_undeclared_key_with_no_reason_buffer_says_the_reason_was_not_kept() {
     use busbar_contract::abi::mechanism::call::Blob;
@@ -1505,6 +1532,8 @@ fn an_undeclared_key_with_no_reason_buffer_says_the_reason_was_not_kept() {
 }
 
 /// A RELEASE OF A LEASE THE INSTANCE NEVER HANDED OUT IS REFUSED, in the lifecycle SDK's words
+/// (`release: no such lease`): the door leases nothing, so every release names a lease it does not
+/// hold, a host bug.
 #[test]
 fn a_release_of_a_lease_never_handed_out_is_refused() {
     use busbar_contract::abi::mechanism::lifecycle::ReleaseIn;
@@ -1528,6 +1557,7 @@ fn a_release_of_a_lease_never_handed_out_is_refused() {
 }
 
 /// `begin` dialling `target` with `fields` (name, value); the refusal's text, or `None` once it
+/// opens.
 fn begin_with_fields(
     host: &mut Host,
     target: &'static str,

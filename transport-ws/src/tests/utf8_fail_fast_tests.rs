@@ -2,6 +2,10 @@
 // Copyright (C) 2026 Busbar Inc and contributors
 
 //! A TEXT MESSAGE THAT TURNS INVALID UTF-8 FAILS THE CONNECTION AT THE BAD BYTE (RFC 6455 section
+//! 8.1; Autobahn 6.4.3 and 6.4.4, graded NON-STRICT when the failure waits for the message or the
+//! frame to complete): across fragments and inside one frame, the frames end failed (close 1007) on
+//! the ingest that carries the first definitely-invalid byte, while a code point split validly
+//! across fragments or chops is still accepted.
 
 use busbar_contract::transport::wire::CloseReason;
 
@@ -72,7 +76,8 @@ fn close_code(framer: &WsFramer, state: u64) -> Option<u16> {
     (w.len() >= 4 && w[0] & 0x0f == 0x8).then(|| u16::from_be_bytes([w[2], w[3]]))
 }
 
-/// Ingest `chops` in order; each must leave the connection alive except the last, which must end
+/// Ingest `chops` in order; each must leave the connection alive except the last, which must end it
+/// with 1007 and hand up no frame.
 fn fails_at_last(chops: &[Vec<u8>]) {
     let framer = WsFramer::new(0);
     let state = open(&framer);
@@ -128,6 +133,7 @@ fn an_invalid_byte_inside_one_frame_fails_at_its_chop() {
 }
 
 /// A code point split across fragments, and a masked frame header split from its payload, are
+/// valid: nothing fails and the whole message arrives at its end.
 #[test]
 fn a_code_point_split_across_fragments_is_still_accepted() {
     let framer = WsFramer::new(0);
@@ -152,7 +158,7 @@ fn a_code_point_split_across_fragments_is_still_accepted() {
     assert_eq!(frames.concat(), bytes);
 }
 
-/// Control payloads are octets even while a text code point is unfinished. Splitting each
+/// Control payloads are octets even while a text code point is unfinished.
 #[test]
 fn split_extended_headers_and_interleaved_controls_preserve_text_state() {
     for len in [126, 65_536] {

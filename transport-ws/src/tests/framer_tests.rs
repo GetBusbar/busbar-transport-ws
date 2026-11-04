@@ -229,7 +229,7 @@ fn a_dial_carries_its_opening_fields_holds_early_messages_and_flags_text() {
         .is_err());
 }
 
-/// `split_ws_url` on the bracketed-IPv6 shapes. A literal address with an explicit port is the one
+/// `split_ws_url` on the bracketed-IPv6 shapes.
 #[test]
 fn a_bracketed_ipv6_authority_parses_with_and_without_a_port() {
     assert_eq!(
@@ -269,7 +269,7 @@ fn a_ws_authority_ends_at_a_query_a_fragment_or_a_backslash() {
     assert!(crate::transport::split_ws_url("wss://u@host/").is_err());
 }
 
-/// HELD, AND BOUNDED: a dial whose far end never answers cannot grow the framing without end. A
+/// HELD, AND BOUNDED: a dial whose far end never answers cannot grow the framing without end.
 #[test]
 fn a_dial_holds_early_messages_only_up_to_the_ceiling_and_the_held_count() {
     let framer = WsFramer::new(8);
@@ -709,6 +709,8 @@ fn close_code(wire: &[u8]) -> Option<u16> {
 }
 
 /// A REFUSAL CLOSES WITH THE CODE ITS NEUTRAL STATUS MAPS TO (the plane seam: a neutral status the
+/// transport maps to its wire): 401/403 policy (1008), 413 too big (1009), 429/503 try again later
+/// (1013), another 5xx internal error (1011), none stated normal (1000).
 #[test]
 fn a_refusal_closes_with_the_code_its_status_maps_to() {
     for (status, code) in [
@@ -738,6 +740,8 @@ fn a_refusal_closes_with_the_code_its_status_maps_to() {
 }
 
 /// A TEXT MESSAGE HELD WHILE THE DIAL'S HANDSHAKE RUNS IS CHECKED AT THE CALL, as the open
+/// connection checks it: bytes that are not UTF-8 fail the write, before they are held, so a bad
+/// message never tears the connection down later with the good ones queued ahead of it.
 #[test]
 fn a_held_text_message_that_is_not_utf8_fails_at_the_call() {
     let framer = WsFramer::new(0);
@@ -869,6 +873,7 @@ fn a_signed_chunk_size_is_malformed() {
 }
 
 /// A `Content-Length` is 1*DIGIT, and every value stated must agree (RFC 9110 §8.6, RFC 9112 §6.3):
+/// otherwise the body is failed at once, not read as close-delimited.
 #[test]
 fn an_invalid_or_conflicting_content_length_ends_failed() {
     for head in [
@@ -895,7 +900,8 @@ fn an_invalid_or_conflicting_content_length_ends_failed() {
     }
 }
 
-/// A `Transfer-Encoding` whose final coding is not `chunked` leaves the body to run to the carrier's
+/// A `Transfer-Encoding` whose final coding is not `chunked` leaves the body to run to the
+/// carrier's end, `Content-Length` ignored (RFC 9112 §6.3).
 #[test]
 fn a_non_chunked_transfer_encoding_overrides_content_length() {
     let (framer, state, heard) = refused_with(
@@ -1070,4 +1076,27 @@ fn a_chunk_line_past_its_bound_ends_the_body_failed() {
     let (framer, state, heard) = refused_with(&wire, false);
     assert!(heard.ended, "the frames end at the bound");
     assert!(framer.failed(state), "failed, not whole");
+}
+
+#[test]
+fn accepting_requires_host_and_one_valid_nonce() {
+    let valid = "GET / HTTP/1.1\r\nHost: svc.test\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n";
+    for request in [
+        valid.to_owned(),
+        valid.replace("Host: svc.test\r\n", ""),
+        valid.replace("Host: svc.test", "Host: "),
+        valid.replace("Host: svc.test", "Host: bad host"),
+        valid.replace("Host: svc.test", "Host: bad\thost"),
+        valid.replace("Host: svc.test", "Host: svc.test\r\nHost: other.test"),
+        valid.replace("dGhlIHNhbXBsZSBub25jZQ==", "x"),
+        valid.replace("Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==", "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ=="),
+    ] {
+        let framer = WsFramer::new(1024);
+        let mut out = Out::default();
+        let state = framer.open(Side::Accept, "", &mut out).unwrap();
+        framer.ingest(state, request.as_bytes(), false, &mut out).unwrap();
+        let expected = if request == valid { b"HTTP/1.1 101" } else { b"HTTP/1.1 400" };
+        assert!(out.sent.starts_with(expected), "{}", String::from_utf8_lossy(&out.sent));
+        assert_eq!(out.ended, request != valid);
+    }
 }

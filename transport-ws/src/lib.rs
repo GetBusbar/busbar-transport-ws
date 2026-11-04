@@ -13,6 +13,8 @@ mod meta;
 mod transport;
 
 /// The transport axis entry the composition root folds for this wire — its key, the layers it
+/// declares, and its door, which the root builds the wire from (the `transport-door` axis) and
+/// opens on the one connector (the `connector-door` axis).
 pub mod linked {
     pub use crate::door::{door, MACRO_DOOR};
 

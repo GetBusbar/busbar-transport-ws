@@ -20,6 +20,9 @@ pub(super) struct Admission {
     selected: Option<Arc<Policy>>,
     unit: UnitRef,
     opening: Zeroizing<Vec<u8>>,
+    head_end: Option<usize>,
+    line_has_content: bool,
+    has_request_line: bool,
     ticket: Option<Ticket>,
     scheme: u8,
     failed: bool,
@@ -31,6 +34,14 @@ enum Progress {
     Refused(RefusalCopy),
 }
 
+fn invalid_opening() -> Progress {
+    Progress::Refused(RefusalCopy {
+        status: 400,
+        fields: vec![("connection".into(), b"close".to_vec())],
+        body: Vec::new(),
+    })
+}
+
 impl Admission {
     pub(super) fn new(loans: Loans, scheme: u8) -> Self {
         Self {
@@ -38,6 +49,9 @@ impl Admission {
             selected: None,
             unit: UnitRef::NONE,
             opening: Zeroizing::new(Vec::new()),
+            head_end: None,
+            line_has_content: false,
+            has_request_line: false,
             ticket: None,
             scheme,
             failed: false,
@@ -50,11 +64,34 @@ impl Admission {
 
     fn append(&mut self, bytes: &[u8]) {
         if self.opening.capacity() - self.opening.len() < bytes.len() {
-            let mut grown = Zeroizing::new(Vec::with_capacity(self.opening.len() + bytes.len()));
+            let required = self.opening.len().saturating_add(bytes.len());
+            let capacity = required
+                .max(self.opening.capacity().saturating_mul(2))
+                .max(256);
+            let mut grown = Zeroizing::new(Vec::with_capacity(capacity));
             grown.extend_from_slice(&self.opening);
             self.opening = grown;
         }
+        let offset = self.opening.len();
         self.opening.extend_from_slice(bytes);
+        if self.head_end.is_none() {
+            for (index, byte) in bytes.iter().enumerate() {
+                if *byte == b'\n' {
+                    if !self.line_has_content && self.has_request_line {
+                        self.head_end = Some(offset + index + 1);
+                        break;
+                    }
+                    self.has_request_line |= self.line_has_content;
+                    self.line_has_content = false;
+                } else if *byte != b'\r' {
+                    self.line_has_content = true;
+                }
+            }
+        }
+    }
+
+    fn complete_opening(&self) -> Option<&[u8]> {
+        self.head_end.map(|_| self.opening.as_slice())
     }
 
     fn hand_in(
@@ -189,18 +226,24 @@ pub(super) fn ingest(
             admission.append(input.bytes());
         }
 
-        let parsed = Request::try_parse(&admission.opening)
-            .map_err(|_| Refusal::failed("ingest: the upgrade request is invalid"))?;
-        let Some((head_len, request)) = parsed else {
+        let Some(opening) = admission.complete_opening() else {
             if input.end != 0 || admission.opening.len() > 65536 {
-                return Err(Refusal::failed(
-                    "ingest: the upgrade request is incomplete or too large",
-                ));
+                return Ok(invalid_opening());
             }
             return Ok(Progress::Waiting);
         };
-        if head_len > 65536 {
-            return Err(Refusal::failed("ingest: the upgrade request is too large"));
+        if admission.head_end.is_some_and(|length| length > 65536) {
+            return Ok(invalid_opening());
+        }
+        let parsed = match Request::try_parse(opening) {
+            Ok(parsed) => parsed,
+            Err(_) => return Ok(invalid_opening()),
+        };
+        let Some((head_len, request)) = parsed else {
+            return Ok(invalid_opening());
+        };
+        if head_len > 65536 || !crate::transport::valid_opening_fields(&request) {
+            return Ok(invalid_opening());
         }
         admission.ticket = Some(ticket);
         let selected = admission
@@ -239,7 +282,7 @@ pub(super) fn ingest(
             owed.ended = true;
             owed.pieces.push_back(Piece {
                 failed: true,
-                ..Piece::plain(0, b"the host refused the upgrade".to_vec(), true)
+                ..Piece::plain(0, b"the upgrade was refused".to_vec(), true)
             });
             fill(&mut owed, input.field(|x| &x.sink), out);
             Some(Outcome::Ready)
@@ -362,3 +405,7 @@ impl SafeSlot for Cancel {
         Outcome::Ready
     }
 }
+
+#[cfg(test)]
+#[path = "../tests/policy_growth_tests.rs"]
+mod tests;

@@ -2,6 +2,8 @@
 // Copyright (C) 2026 Busbar Inc and contributors
 
 //! What the framer hands the door, and what the door hands the framer: the crate's own shapes
+//! between `transport` (the RFC 6455 state machine) and `door` (the memory-ABI framer door, the
+//! one way this crate reaches the host).
 
 use busbar_contract::ids::StreamId;
 use busbar_contract::transport::wire::WireStatusClass;
@@ -81,6 +83,7 @@ pub(crate) struct HostTime {
 }
 
 /// Where the framer puts what a call produced: bytes owed to the far side, frame pieces for the
+/// layer above, and the end of the connection's frames.
 pub(crate) trait FramerOut {
     /// Bytes for the far side, in order.
     fn send(&mut self, bytes: &[u8]);

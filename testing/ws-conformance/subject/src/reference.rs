@@ -1,28 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Busbar Inc and contributors
 
-//! THE CONTROL PEER: a strict RFC 6455 echo server on the standard library alone, so the control
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
+//! THE CONTROL PEER: a strict RFC 6455 echo server on the standard library alone, so the
+//! control leg proves the harness grades a correct peer green BEFORE any busbar verdict is
+//! believed.
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{Shutdown, TcpListener, TcpStream};
@@ -38,8 +19,10 @@ const INVALID_PAYLOAD: u16 = 1007;
 /// The longest handshake head this peer reads before refusing it.
 const MAX_HEAD: usize = 16 * 1024;
 
-fn main() {
+/// Bound a control-peer message to the protocol library's default message ceiling.
+const MAX_MESSAGE: usize = 64 * 1024 * 1024;
 
+fn main() {
     assert_eq!(
         accept_key("dGhlIHNhbXBsZSBub25jZQ=="),
         "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=",
@@ -57,7 +40,10 @@ fn main() {
             Ok(stream) => {
                 std::thread::spawn(move || serve(stream));
             }
-            Err(e) => eprintln!("ws-conformance-reference: accept error: {e}"),
+            Err(e) => {
+                eprintln!("ws-conformance-reference: accept error: {e}");
+                std::thread::sleep(Duration::from_millis(50));
+            }
         }
     }
 }
@@ -88,15 +74,23 @@ fn serve(stream: TcpStream) {
 }
 
 /// Read the request head and return its `Sec-WebSocket-Key`, or `None` for anything that is not
+/// a version-13 upgrade.
 fn read_handshake(reader: &mut impl BufRead) -> Option<String> {
     let mut key = None;
     let mut version_ok = false;
     let mut upgrade_ok = false;
+    let mut connection_ok = false;
+    let mut host = false;
+    let mut version_seen = false;
     let mut total = 0usize;
     let mut first = true;
     loop {
         let mut line = String::new();
-        let n = reader.read_line(&mut line).ok()?;
+        let remaining = MAX_HEAD.checked_sub(total)?;
+        let n = (&mut *reader)
+            .take((remaining + 1) as u64)
+            .read_line(&mut line)
+            .ok()?;
         if n == 0 {
             return None;
         }
@@ -104,10 +98,18 @@ fn read_handshake(reader: &mut impl BufRead) -> Option<String> {
         if total > MAX_HEAD {
             return None;
         }
-        let line = line.trim_end_matches(['\r', '\n']);
+        let line = line.strip_suffix('\n')?;
+        let line = line.strip_suffix('\r').unwrap_or(line);
         if first {
             first = false;
-            if !line.starts_with("GET ") {
+            let mut parts = line.split(' ');
+            if parts.next() != Some("GET")
+                || !parts.next().is_some_and(|target| {
+                    !target.is_empty() && !target.bytes().any(|b| b.is_ascii_control())
+                })
+                || parts.next() != Some("HTTP/1.1")
+                || parts.next().is_some()
+            {
                 return None;
             }
             continue;
@@ -115,18 +117,57 @@ fn read_handshake(reader: &mut impl BufRead) -> Option<String> {
         if line.is_empty() {
             break;
         }
-        let Some((name, value)) = line.split_once(':') else {
-            continue;
-        };
-        let value = value.trim();
-        match name.trim().to_ascii_lowercase().as_str() {
-            "sec-websocket-key" => key = Some(value.to_string()),
-            "sec-websocket-version" => version_ok = value == "13",
-            "upgrade" => upgrade_ok = value.eq_ignore_ascii_case("websocket"),
+        let (name, value) = line.split_once(':')?;
+        if name.is_empty()
+            || !name
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&b))
+            || value.bytes().any(|b| b.is_ascii_control() && b != b'\t')
+        {
+            return None;
+        }
+        let value = value.trim_matches([' ', '\t']);
+        match name.to_ascii_lowercase().as_str() {
+            "sec-websocket-key" => {
+                let bytes = value.as_bytes();
+                if bytes.len() != 24
+                    || !bytes.ends_with(b"==")
+                    || !bytes[..22]
+                        .iter()
+                        .all(|b| b.is_ascii_alphanumeric() || b"+/".contains(b))
+                    || !b"AQgw".contains(&bytes[21])
+                    || key.replace(value.to_string()).is_some()
+                {
+                    return None;
+                }
+            }
+            "sec-websocket-version" => {
+                if version_seen {
+                    return None;
+                }
+                version_seen = true;
+                version_ok = value == "13";
+            }
+            "host" => {
+                if host || value.is_empty() || value.bytes().any(|b| b.is_ascii_whitespace()) {
+                    return None;
+                }
+                host = true;
+            }
+            "connection" => {
+                connection_ok |= value
+                    .split(',')
+                    .any(|token| token.trim().eq_ignore_ascii_case("upgrade"))
+            }
+            "upgrade" => {
+                upgrade_ok |= value
+                    .split(',')
+                    .any(|token| token.trim().eq_ignore_ascii_case("websocket"))
+            }
             _ => {}
         }
     }
-    if version_ok && upgrade_ok {
+    if version_ok && upgrade_ok && connection_ok && host {
         key
     } else {
         None
@@ -186,13 +227,17 @@ impl Session {
             126 => {
                 let mut b = [0u8; 2];
                 reader.read_exact(&mut b)?;
-                u64::from(u16::from_be_bytes(b))
+                let n = u16::from_be_bytes(b);
+                if n < 126 {
+                    return Ok(Some(End::Fail(PROTOCOL_ERROR)));
+                }
+                u64::from(n)
             }
             127 => {
                 let mut b = [0u8; 8];
                 reader.read_exact(&mut b)?;
                 let n = u64::from_be_bytes(b);
-                if n >> 63 != 0 {
+                if n >> 63 != 0 || n <= u64::from(u16::MAX) {
                     return Ok(Some(End::Fail(PROTOCOL_ERROR)));
                 }
                 n
@@ -219,7 +264,6 @@ impl Session {
             };
         }
 
-
         let text = match (opcode, self.open) {
             (0x0, Some(text)) => text,
             (0x0, None) | (_, Some(_)) => return Ok(Some(End::Fail(PROTOCOL_ERROR))),
@@ -232,8 +276,9 @@ impl Session {
             }
         };
 
-
-
+        if len > MAX_MESSAGE.saturating_sub(self.message.len()) as u64 {
+            return Ok(Some(End::Fail(1009)));
+        }
         let mut left = len;
         let mut offset = 0usize;
         while left > 0 {
@@ -288,12 +333,14 @@ impl Session {
     }
 }
 
-/// Codes a peer may send in a close frame (RFC 6455 section 7.4, the IANA registry): the defined
+/// Codes a peer may send in a close frame (RFC 6455 section 7.4, the IANA registry): the
+/// defined codes that are not reserved for local use, and the registered and private ranges.
 fn close_code_valid(code: u16) -> bool {
     matches!(code, 1000..=1003 | 1007..=1014 | 3000..=4999)
 }
 
 /// Write the failure's close if there is one, then half-close and drain, so the peer reads
+/// everything written before the socket goes (a close with unread input would reset it).
 fn finish(reader: &mut impl Read, writer: &mut TcpStream, end: End) {
     if let End::Fail(code) = end {
         let _ = write_frame(writer, 0x8, &code.to_be_bytes());
@@ -489,165 +536,5 @@ fn base64(bytes: &[u8]) -> String {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// A masked client frame, as Autobahn sends one.
-    fn client_frame(first: u8, payload: &[u8]) -> Vec<u8> {
-        let mask = [0x37, 0xFA, 0x21, 0x3D];
-        let mut f = vec![first];
-        match payload.len() {
-            n if n < 126 => f.push(0x80 | n as u8),
-            n if n <= 0xFFFF => {
-                f.push(0x80 | 126);
-                f.extend_from_slice(&(n as u16).to_be_bytes());
-            }
-            n => {
-                f.push(0x80 | 127);
-                f.extend_from_slice(&(n as u64).to_be_bytes());
-            }
-        }
-        f.extend_from_slice(&mask);
-        let mut body = payload.to_vec();
-        unmask(&mut body, mask, 0);
-        f.extend_from_slice(&body);
-        f
-    }
-
-    /// Run a session over `input`; the bytes it wrote and how it ended.
-    fn session(input: &[u8]) -> (Vec<u8>, End) {
-        let mut reader = BufReader::new(input);
-        let mut out = Vec::new();
-        let end = Session::default().run(&mut reader, &mut out);
-        (out, end)
-    }
-
-    #[test]
-    fn sha1_and_the_accept_key_match_the_published_vectors() {
-        let hex: String = sha1(b"abc").iter().map(|b| format!("{b:02x}")).collect();
-        assert_eq!(hex, "a9993e364706816aba3e25717850c26c9cd0d89d");
-        let hex: String = sha1(b"").iter().map(|b| format!("{b:02x}")).collect();
-        assert_eq!(hex, "da39a3ee5e6b4b0d3255bfef95601890afd80709");
-        assert_eq!(
-            accept_key("dGhlIHNhbXBsZSBub25jZQ=="),
-            "s3pPLMBiTxaQ9kYGzzhZRbK+xOo="
-        );
-        assert_eq!(base64(b"f"), "Zg==");
-        assert_eq!(base64(b"fo"), "Zm8=");
-        assert_eq!(base64(b"foo"), "Zm9v");
-    }
-
-    #[test]
-    fn utf8_fails_at_the_first_impossible_byte() {
-
-        let text = "κόσμε\u{10FFFF}".as_bytes();
-        for cut in 0..text.len() {
-            let mut v = Utf8::default();
-            assert!(
-                v.feed(&text[..cut]) && v.feed(&text[cut..]) && v.complete(),
-                "cut {cut}"
-            );
-        }
-
-        for bad in [[0xED, 0xA0], [0xE0, 0x80], [0xF4, 0x90], [0xC0, 0x80]] {
-            let mut v = Utf8::default();
-            assert!(!v.feed(&bad), "{bad:02x?}");
-        }
-
-        let mut v = Utf8::default();
-        assert!(v.feed(&[0xE2, 0x82]) && !v.complete());
-    }
-
-    #[test]
-    fn a_message_is_echoed_in_kind_and_a_ping_is_answered() {
-        let mut input = client_frame(0x81, b"hello");
-        input.extend(client_frame(0x89, b"p"));
-        input.extend(client_frame(0x82, &[1, 2, 3]));
-        input.extend(client_frame(0x88, &1000u16.to_be_bytes()));
-        let (out, end) = session(&input);
-        assert_eq!(end, End::Closed);
-        let mut want = vec![0x81, 5];
-        want.extend_from_slice(b"hello");
-        want.extend_from_slice(&[0x8A, 1, b'p', 0x82, 3, 1, 2, 3, 0x88, 2, 0x03, 0xE8]);
-        assert_eq!(out, want);
-    }
-
-    #[test]
-    fn a_fragmented_message_is_echoed_whole_and_a_large_one_uses_the_long_length() {
-        let mut input = client_frame(0x01, b"ab");
-        input.extend(client_frame(0x89, b""));
-        input.extend(client_frame(0x80, b"cd"));
-        let big = vec![b'x'; 70_000];
-        input.extend(client_frame(0x82, &big));
-        let (out, end) = session(&input);
-        assert_eq!(end, End::Gone);
-        assert_eq!(&out[..8], &[0x8A, 0, 0x81, 4, b'a', b'b', b'c', b'd']);
-        assert_eq!(&out[8..10], &[0x82, 127]);
-        assert_eq!(&out[10..18], &70_000u64.to_be_bytes());
-        assert_eq!(out.len(), 18 + 70_000);
-    }
-
-    #[test]
-    fn a_good_message_ahead_of_a_bad_frame_is_answered_before_the_failure() {
-
-
-
-        for bad in [
-            client_frame(0xA1, b"x"),
-            client_frame(0x85, b"x"),
-            client_frame(0x8B, b"x"),
-            client_frame(0x00, b"x"),
-            client_frame(0x09, b"x"),
-            client_frame(0x89, &[0; 126]),
-            client_frame(0x88, &[3]),
-            client_frame(0x88, &1005u16.to_be_bytes()),
-        ] {
-            let mut input = client_frame(0x81, b"ok");
-            input.extend(bad);
-            let (out, end) = session(&input);
-            assert_eq!(end, End::Fail(PROTOCOL_ERROR));
-            assert_eq!(out, vec![0x81, 2, b'o', b'k']);
-        }
-    }
-
-    #[test]
-    fn invalid_text_fails_1007_before_the_rest_of_the_frame_arrives() {
-
-
-        let mut f = client_frame(0x81, &[0xCE, 0xBA, 0xED, 0xA0, 0x80]);
-        f[1] = 0x80 | 100;
-        let (out, end) = session(&f);
-        assert!(out.is_empty());
-        assert_eq!(end, End::Fail(INVALID_PAYLOAD));
-
-        assert_eq!(
-            session(&client_frame(0x81, &[0xE2, 0x82])).1,
-            End::Fail(INVALID_PAYLOAD)
-        );
-        let mut reason = 1000u16.to_be_bytes().to_vec();
-        reason.extend_from_slice(&[0xFF]);
-        assert_eq!(
-            session(&client_frame(0x88, &reason)).1,
-            End::Fail(INVALID_PAYLOAD)
-        );
-    }
-
-    #[test]
-    fn an_unmasked_frame_is_a_protocol_error() {
-        let mut f = client_frame(0x81, b"x");
-        f[1] &= 0x7F;
-        assert_eq!(session(&f).1, End::Fail(PROTOCOL_ERROR));
-    }
-
-    #[test]
-    fn the_handshake_wants_a_version_13_upgrade() {
-        let good = "GET / HTTP/1.1\r\nHost: x\r\nUpgrade: WebSocket\r\nConnection: Upgrade\r\n\
-                    Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n";
-        assert_eq!(
-            read_handshake(&mut BufReader::new(good.as_bytes())).as_deref(),
-            Some("dGhlIHNhbXBsZSBub25jZQ==")
-        );
-        let old = good.replace("Version: 13", "Version: 8");
-        assert_eq!(read_handshake(&mut BufReader::new(old.as_bytes())), None);
-    }
-}
+#[path = "reference_tests.rs"]
+mod tests;

@@ -13,6 +13,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import tomllib
 import unittest
 
 
@@ -181,6 +182,10 @@ class Manifest(unittest.TestCase):
                 manifest = Path(result.stdout.strip()).read_text(encoding="utf-8")
                 self.assertEqual((root / "subject/src/doors.rs").read_text(encoding="utf-8"), adapter)
                 self.assertIn(dependency, manifest)
+                workspace = tomllib.loads((HARNESS.parents[1] / "Cargo.toml").read_text())
+                generated = tomllib.loads(manifest)
+                self.assertEqual(generated.get("patch", {}).get("crates-io"), workspace["patch"]["crates-io"],
+                                 "the conformance subject must use the product's patched protocol library")
                 for core_source in [
                     "https://github.com/GetBusbar/busbar",
                     "https://github.com/GetBusbar/busbar",

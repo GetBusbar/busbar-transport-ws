@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Busbar Inc and contributors
 
-//! THE `ws` DOOR: this transport's framer ([`WsFramer`], tungstenite over an in-memory pipe) on the
+//! THE `ws` DOOR: this transport's framer ([`WsFramer`], tungstenite over an in-memory pipe) on
+//! the transport kind's table (`busbar_contract::abi::transport`), compiled in or dropped in
+//! through the one door.
 
 mod policy;
 
@@ -53,7 +55,8 @@ pub const BODY_MAX_BYTES: &str = "limits.request_body_max_bytes";
 /// The transport's own key (`meta.rs`).
 const KEY: &str = meta::KEY;
 
-/// The secured form of the scheme: a `wss` target is a `ws` one whose bytes the connector secures
+/// The secured form of the scheme: a `wss` target is a `ws` one whose bytes the connector
+/// secures before they leave (`ws` claims `ws` and `wss`).
 pub const SECURE_KEY: &str = "wss";
 
 /// The schemes `ws` claims, by name: the Statement's `claims`, the one place they are stated.
@@ -75,7 +78,7 @@ const EGRESS_SELECTOR_CODES: [u8; crate::claims::EGRESS_SELECTOR_FORMS.len()] =
     form_codes(meta::EGRESS_SELECTOR_FORMS);
 const FACTS: [AbiStr; meta::TRANSPORT_FACTS.len()] = strs(meta::TRANSPORT_FACTS);
 
-/// The claim row, rendered from the transport's one declaration (`meta.rs`, `claims.rs`). `ws` and
+/// The claim row, rendered from the transport's one declaration (`meta.rs`, `claims.rs`).
 const ROW: Claim = {
     let mut c = Claim::EMPTY.with_facts(&FACTS);
     c.selector_forms = AbiStr::of_bytes(&SELECTOR_CODES);
@@ -97,6 +100,9 @@ const SETTING_ROWS: [SettingRow; 1] = [SettingRow {
 const SETTINGS: &[SettingDecl] = &setting_decls(&SETTING_ROWS);
 
 /// The op facts are the ops the door serves: the framer begins on the accepting side and on the
+/// dialling side, and adopts a stream another framer detached (`FACT_ACCEPTS`, `FACT_DIALS`,
+/// `FACT_ADOPTS`); it detaches nothing (nothing upgrades out of a WebSocket) and decodes no
+/// payload.
 const TAIL: TransportTail = {
     let mut t = TransportTail::EMPTY
         .with_claim_rows(CLAIMS)
@@ -124,26 +130,32 @@ busbar_contract::statement_extensions!(EXTENSIONS: [
 struct Piece {
     stream: u64,
     bytes: Vec<u8>,
-    /// The bytes before this offset are handed over already: a piece taken in parts moves nothing
+    /// The bytes before this offset are handed over already: a piece taken in parts moves
+    /// nothing down, it reads on from here.
     at: usize,
     end_of_frame: bool,
     /// The bytes belong to a text message (`PIECE_TEXT`).
     text: bool,
-    /// The stream's end is a FAILURE (`PIECE_STREAM_FAILED`): the far side broke the protocol, sent
+    /// The stream's end is a FAILURE (`PIECE_STREAM_FAILED`): the far side broke the
+    /// protocol, sent text that is not UTF-8 or a message over the ceiling, sent an upgrade
+    /// request this end refused, or ended a refused upgrade's answer short; the carrier
+    /// ended with no closing handshake; or an op ended the framing's state.
     failed: bool,
-    /// The stream ends WHOLE here (`PIECE_END`): the empty last piece of its frames. An empty
+    /// The stream ends WHOLE here (`PIECE_END`): the empty last piece of its frames.
     end: bool,
     /// The bytes are a response field block (`PIECE_FIELDS`), interim or final.
     fields: bool,
     /// Informational `1xx` other than the upgrade's `101` (`PIECE_INTERIM` on every part).
     interim: bool,
     /// A full sink cut this field block inside a value: `bytes` open by continuing it
+    /// (`PIECE_CONTINUED`).
     continued: bool,
     /// The status the piece states (`PIECE_HAS_CODE`): its number and its class (`STATUS_*`).
     status: Option<(u32, u8)>,
     /// The wait the far end asked for (`PIECE_HAS_RETRY_AFTER`), on a refused upgrade's head.
     retry_after: Option<u64>,
     /// The dialled head's reason phrase, as the far end sent it: stated in the head's slots
+    /// (`HeadSlots::reason`) beside its first piece.
     reason: Option<Vec<u8>>,
 }
 
@@ -212,7 +224,9 @@ fn class_code(class: Option<WireStatusClass>) -> u8 {
     }
 }
 
-/// How much of a field block's `bytes` a sink with `room` may take: all of it when it fits, else
+/// How much of a field block's `bytes` a sink with `room` may take: all of it when it fits,
+/// else the furthest cut at a line's start or inside a value, so a continued piece always
+/// extends a value (the host refuses any other continuation).
 fn field_cut(bytes: &[u8], room: usize, in_value: bool) -> usize {
     if bytes.len() <= room {
         return bytes.len();
@@ -234,7 +248,7 @@ fn field_cut(bytes: &[u8], room: usize, in_value: bool) -> usize {
     best
 }
 
-/// How much of a piece's unhanded `rest` a sink with `room` takes. A field block is cut only where
+/// How much of a piece's unhanded `rest` a sink with `room` takes.
 fn take_of(piece: &Piece, rest: &[u8], room: usize, alone: bool) -> usize {
     if piece.fields {
         match field_cut(rest, room, piece.continued) {
@@ -446,6 +460,8 @@ impl Drop for Owed {
 const SPARE_MAX: usize = 8;
 
 /// The capacity a kept piece buffer holds at most: what one large message grew it past this is
+/// given back, so a framing keeps working-size spares, not its high-water mark (as stdio's
+/// `KEEP_BYTES`).
 const KEEP_BYTES: usize = 256 * 1024;
 
 impl Owed {
@@ -544,7 +560,8 @@ impl Owed {
         &self.wire[self.wire_at..]
     }
 
-    /// Owe `bytes` to the far side (`secret`: the framing's opening), never leaving a copy of a
+    /// Owe `bytes` to the far side (`secret`: the framing's opening), never leaving a copy
+    /// of a secret byte behind in a buffer it outgrows.
     fn push(&mut self, bytes: &[u8], secret: bool) {
         if self.wire.capacity() - self.wire.len() < bytes.len() {
             let owed = self.wire.len() - self.wire_at;
@@ -563,7 +580,10 @@ impl Owed {
         }
     }
 
-    /// Mark the next `n` owed bytes handed to the host, wiping the secret ones in place; once all
+    /// Mark the next `n` owed bytes handed to the host, wiping the secret ones in place;
+    /// once all are handed over the buffer empties, and gives back what one large message
+    /// grew it past [`KEEP_BYTES`] (as a kept piece buffer does): a working-size buffer is
+    /// kept whole.
     fn consume(&mut self, n: usize) {
         let end = self.wire_at + n;
         if self.secret > self.wire_at {
@@ -604,7 +624,7 @@ impl Owed {
 /// One framing's queue behind its own lock.
 type OwedSlot = Arc<Mutex<Owed>>;
 
-/// THE INSTANCE: the framer and what each framing owes. The map's lock is held only to find, add
+/// THE INSTANCE: the framer and what each framing owes.
 pub struct Ws {
     framer: WsFramer,
     owed: Mutex<HashMap<u64, OwedSlot>>,
@@ -621,7 +641,8 @@ impl Ws {
 const BAD_BODY_MAX: &str =
     "settings: limits.request_body_max_bytes must be a count of bytes above 0";
 
-/// The settings blob read: a JSON object (empty bytes = `{}`) whose every key is one this transport
+/// The settings blob read: a JSON object (empty bytes = `{}`) whose every key is one this
+/// transport declares, its ceiling a count above 0.
 fn read_settings(bytes: &[u8]) -> Result<usize, Refusal> {
     let object = settings_reading(bytes, &SETTING_ROWS).map_err(|why| {
         if why.text() == Some("settings: limits.request_body_max_bytes must be a count above 0") {
@@ -641,7 +662,8 @@ fn read_settings(bytes: &[u8]) -> Result<usize, Refusal> {
     }
 }
 
-/// The lifecycle: `validate`, `open` and `refresh` read the settings; a refresh's ceiling applies
+/// The lifecycle: `validate`, `open` and `refresh` read the settings; a refresh's ceiling
+/// applies to framings begun after it (each framing keeps the ceiling it began under).
 impl Life for Ws {
     const CANCEL: u32 = CANCEL_NOTHING_MOVED;
 
@@ -720,7 +742,9 @@ impl frame::FramerOut for Collect<'_> {
     }
 }
 
-/// A dial's opening head fields (`BeginIn::fields`), owned for the one `begin` call: they may carry
+/// A dial's opening head fields (`BeginIn::fields`), owned for the one `begin` call: they may
+/// carry the binding's credential (its `Authorization` line), so every byte of this copy is
+/// wiped when it drops, refused or not.
 struct OpeningFields(Vec<(String, Vec<u8>)>);
 
 impl Drop for OpeningFields {
@@ -774,7 +798,8 @@ fn reason_of(code: u32) -> CloseReason {
     }
 }
 
-/// The stubs: a framer is not a carrier, so every carrier op is refused, and nothing upgrades out
+/// The stubs: a framer is not a carrier, so every carrier op is refused, and nothing upgrades
+/// out of a WebSocket.
 mod stubs {
     use super::{
         AcceptIn, AcceptOut, ArrivalIn, ArrivalOut, ConnIn, ConnOut, DialIn, FramerOut, FramingIn,
@@ -811,12 +836,15 @@ macro_rules! op {
     };
 }
 
-/// The protocol an accepting listener offers, and a secured dial too: the opening handshake is a
+/// The protocol an accepting listener offers, and a secured dial too: the opening handshake is
+/// a version-1.1 upgrade.
 const OFFER: &[u8] = b"\x08http/1.1";
 
 const SMALL: &str = "locate: a host buffer is too small";
 
-/// A dial with an opening field the upgrade request cannot carry (an invalid name, or a value with a
+/// A dial with an opening field the upgrade request cannot carry (an invalid name, or a value
+/// with a line break or a disallowed control byte): neither the field's value (it may be a credential) nor
+/// a handshake that never ran is named.
 const BEGIN_UNCARRIABLE: &str =
     "begin: an opening field is not a valid HTTP field, and the upgrade request cannot carry it";
 
@@ -954,6 +982,8 @@ fn carries_userinfo(target: &str) -> bool {
 }
 
 /// A connection the far side FAILED ends its stream failed, not cleanly: the reader is told
+/// (`PIECE_STREAM_FAILED` on the end piece, whose bytes say why), and the close carries the
+/// code.
 fn end_failed(f: &WsFramer, token: u64, owed: &mut Owed, ended_before: bool) {
     if ended_before || !owed.ended {
         return;

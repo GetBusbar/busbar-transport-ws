@@ -2,20 +2,7 @@
 // Copyright (C) 2026 Busbar Inc and contributors
 
 //! THE AUTOBAHN|TESTSUITE SUBJECT: busbar's `ws` door, framed by the connector's own listener,
-
-
-
-
-
-
-
-
-
-
-
-
-
-
+//! echoing on loopback.
 
 use std::future::poll_fn;
 use std::sync::Arc;
@@ -73,6 +60,7 @@ fn carrier() -> busbar_core_connector::compose::Via {
 }
 
 /// Offer one whole message on `stream`, waiting for the socket to take what the write buffer
+/// cannot hold yet.
 async fn send(conn: &mut Connection, stream: u64, bytes: &[u8], text: bool) -> Result<(), Failure> {
     let mut off = 0;
     poll_fn(|cx| loop {
@@ -98,9 +86,6 @@ async fn echo(mut conn: Connection) {
 
     let mut text = false;
     while let Ok(Some(piece)) = poll_fn(|cx| conn.poll_piece(cx)).await {
-
-
-
         if piece.fields || piece.failed || piece.ends_stream() {
             continue;
         }
@@ -112,7 +97,8 @@ async fn echo(mut conn: Connection) {
             continue;
         }
         let whole = std::mem::take(&mut message);
-        if send(&mut conn, piece.stream, &whole, text).await.is_err() {
+        if let Err(error) = send(&mut conn, piece.stream, &whole, text).await {
+            eprintln!("ws-conformance-subject: echo failed: {error:?}");
             break;
         }
     }
@@ -120,7 +106,6 @@ async fn echo(mut conn: Connection) {
 }
 
 fn main() {
-
     let worker = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -144,7 +129,10 @@ fn main() {
                 Ok(accepted) => {
                     tokio::task::spawn_local(echo(accepted.conn));
                 }
-                Err(e) => eprintln!("ws-conformance-subject: accept error: {e:?}"),
+                Err(e) => {
+                    eprintln!("ws-conformance-subject: accept error: {e:?}");
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                }
             }
         }
     });

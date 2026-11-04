@@ -76,4 +76,10 @@ busbar-contract = { path = "$B/crates/busbar-contract" }
 [patch."https://github.com/GetBusbar/busbar-transport-ws"]
 busbar-transport-ws = { path = "$repo/transport-ws" }
 TOML
+# Cargo ignores patches declared by dependencies: retain the product workspace's protocol fixes.
+awk '
+  /^\[patch\."?crates-io"?\]$/ { copying = 1; print ""; print; next }
+  /^\[/ { copying = 0 }
+  copying { print }
+' "$repo/Cargo.toml" >> "$dir/Cargo.toml"
 echo "$dir/Cargo.toml"

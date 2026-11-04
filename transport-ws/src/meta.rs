@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Busbar Inc and contributors
 
-//! What this transport declares about itself, read once by the door's Statement and sealed. Held
+//! What this transport declares about itself, read once by the door's Statement and sealed.
 
 use busbar_contract::grammar::SelectorForm;
 use busbar_contract::transport::registry::facts as tfacts;
@@ -14,7 +14,7 @@ pub(crate) const KEY: &str = "ws";
 pub(crate) const SELECTOR_FORMS: &[SelectorForm] = claims::SELECTOR_FORMS;
 /// The selector forms evaluated when dialling out.
 pub(crate) const EGRESS_SELECTOR_FORMS: &[SelectorForm] = claims::EGRESS_SELECTOR_FORMS;
-/// None: no transport names another. The carrier is the
+/// None: no transport names another.
 pub(crate) const COMPOSES_OVER: &[&str] = &[];
 /// A WebSocket carries a session, and the session caches its principal.
 pub(crate) const SESSION: bool = true;

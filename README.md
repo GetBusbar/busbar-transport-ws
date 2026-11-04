@@ -26,12 +26,16 @@ existing connections retain the ceiling they opened with.
 The plugin negotiates no WebSocket extensions, including permessage-deflate. A dial requesting an
 extension, or a server response selecting one, is refused. Accepted upgrades select no subprotocol;
 dials carry the offered subprotocols and require the server's selection to be one of them. The
-host connector supplies sockets and TLS for `wss`; this plugin frames the bytes.
+host connector supplies sockets and TLS for `wss`; this plugin frames the bytes. Malformed
+accepted HTTP openings receive an HTTP error before policy admission. Accepted upgrades require
+a Host field and one valid WebSocket nonce; fragmented policy openings are scanned incrementally.
 
 The Autobahn harness's `--selftest` checks synthetic parser fixtures and builds its subject, so it
 requires Node, Cargo and `BUSBAR_CHECKOUT` at the pinned core source. Docker-live control, negative
 control and subject legs run through `testing/conformance/ws.sh` in CI. A negative control counts
 only when Autobahn records the deliberately broken peer's echo corruption, not an unrelated failure.
+The generated subject workspace retains this repository's protocol-library patches. Its control
+peer bounds opening headers to 16 KiB and aggregate messages to 64 MiB.
 
 ## Build
 

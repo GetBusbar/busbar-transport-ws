@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Busbar Inc and contributors
 
-//! THE TRANSPORT'S FAULT EDGES, one binary so one run judges them all:
+//! Fault isolation, secret wiping, and allocation checks for the transport.
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
@@ -266,6 +266,7 @@ fn a_panic_in_one_framing_leaves_the_others_working() {
 }
 
 /// Counts every allocation (and reallocation) the CURRENT thread makes while its count is on, so
+/// the tests of this binary running side by side never count each other.
 struct Counting;
 
 /// An allocation's base, its greatest known initialized prefix, and its secret marker.
@@ -306,7 +307,8 @@ thread_local! {
     static REENTERED: Cell<bool> = const { Cell::new(false) };
 }
 
-/// Watch a live allocation's base and a prefix known to have been initialized, even if its Vec
+/// Watch a live allocation's base and a prefix known to have been initialized, even if its Vec was
+/// subsequently cleared.
 pub(crate) fn watch_free(ptr: *const u8, len: usize, secret: &'static [u8]) {
     assert!(!ptr.is_null() && len >= secret.len());
     assert!((1..=SECRET_MAX).contains(&secret.len()));
@@ -329,7 +331,7 @@ pub(crate) fn watch_free(ptr: *const u8, len: usize, secret: &'static [u8]) {
     });
 }
 
-/// Require the actual free on every platform and a complete Linux byte observation. Other
+/// Require the actual free on every platform and a complete Linux byte observation.
 pub(crate) fn assert_freed_wiped() {
     let observed = WATCHED.with(Cell::get);
     assert!(
@@ -404,7 +406,8 @@ fn observe((address, len, secret): Watch, allocation_size: usize) -> Observation
     }
 }
 
-/// The kernel copies only the registered initialized prefix into initialized stack storage,
+/// The kernel copies only the registered initialized prefix into initialized stack storage, before
+/// the allocator releases it.
 fn inspect(ptr: *mut u8, allocation_size: usize) {
     let _ = WATCH.try_with(|w| {
         let Some(watch) = w.get().filter(|(at, _, _)| *at == ptr as usize) else {
@@ -504,6 +507,7 @@ fn z<T>() -> T {
 }
 
 /// The door's own slots, entered as its trampoline enters them but outside it: the count is the
+/// door's and the framer's logic, not the crossing's log capture (whose cost is the SDK's).
 struct Host {
     inst: *mut c_void,
     wire: Vec<u8>,
@@ -834,4 +838,32 @@ fn a_watched_growth_observes_the_actual_old_free_before_the_new_payload_is_wiped
     payload.zeroize();
     drop(payload);
     assert_freed_wiped();
+}
+
+#[test]
+fn validating_opening_credentials_allocates_no_value_copy() {
+    let mut empty = vec![("authorization".to_owned(), Vec::new())];
+    let mut credential = vec![("authorization".to_owned(), vec![b'x'; 128])];
+    let mut validate = |fields: &mut Vec<(String, Vec<u8>)>| {
+        std::hint::black_box(crate::transport::carries_all(fields));
+    };
+    let baseline = per_call(&mut empty, &mut validate);
+    let populated = per_call(&mut credential, &mut validate);
+    assert_eq!(
+        populated, baseline,
+        "validation must not allocate a credential copy"
+    );
+}
+
+#[test]
+fn opening_value_validation_matches_the_http_byte_grammar() {
+    use tungstenite::http::HeaderValue;
+    for byte in 0..=u8::MAX {
+        let fields = vec![("authorization".to_owned(), vec![byte])];
+        assert_eq!(
+            crate::transport::carries_all(&fields),
+            HeaderValue::from_bytes(&[byte]).is_ok(),
+            "byte {byte}"
+        );
+    }
 }
