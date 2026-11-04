@@ -320,8 +320,11 @@ pub(super) fn ingest(
 
 fn refusal_wire(refusal: RefusalCopy) -> Result<Vec<u8>, Refusal> {
     use tungstenite::http::{HeaderName, HeaderValue, StatusCode};
-    let status = StatusCode::from_u16(refusal.status)
-        .map_err(|_| Refusal::failed("ingest: the host refusal has an invalid status"))?;
+    let status = u16::try_from(refusal.status)
+        .ok()
+        .filter(|status| (100..=599).contains(status))
+        .and_then(|status| StatusCode::from_u16(status).ok())
+        .ok_or_else(|| Refusal::failed("ingest: the host refusal has an invalid status"))?;
     let mut wire = format!(
         "HTTP/1.1 {} {}\r\n",
         status.as_u16(),

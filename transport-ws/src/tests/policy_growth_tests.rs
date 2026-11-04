@@ -68,3 +68,26 @@ fn admission_parses_a_fragmented_head_only_after_its_terminator() {
         assert_eq!(parsed_bytes, request.len());
     }
 }
+
+#[test]
+fn opening_refusal_status_is_checked_by_the_http_handshake_owner() {
+    for status in [0, 99, 600, 70_123, u32::MAX] {
+        assert!(
+            refusal_wire(RefusalCopy {
+                status,
+                fields: Vec::new(),
+                body: Vec::new(),
+            })
+            .is_err(),
+            "{status}"
+        );
+    }
+    let wire = refusal_wire(RefusalCopy {
+        status: 403,
+        fields: Vec::new(),
+        body: b"denied".to_vec(),
+    })
+    .unwrap();
+    assert!(wire.starts_with(b"HTTP/1.1 403 "));
+    assert!(wire.ends_with(b"denied"));
+}

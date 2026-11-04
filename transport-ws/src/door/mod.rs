@@ -124,6 +124,7 @@ pub const STATEMENT: Statement = Statement {
 
 busbar_contract::statement_extensions!(EXTENSIONS: [
     (EXT_ADOPTED_SESSION, SUPPORT_ADOPTED_SESSION),
+    (busbar_contract::abi::transport::status::EXT_HANDOFF_STATUS, br#"[{"claim":"ws","namespace":"http"},{"claim":"wss","namespace":"http"}]"#),
 ]);
 
 /// One frame piece waiting for the host.
@@ -204,7 +205,7 @@ impl Piece {
             }
         }
         if self.status.is_some() {
-            flags |= PIECE_HAS_CODE;
+            flags |= PIECE_HAS_CODE | busbar_contract::abi::transport::PIECE_CODE_HANDOFF;
             if self.retry_after.is_some() {
                 flags |= PIECE_HAS_RETRY_AFTER;
             }
@@ -855,10 +856,6 @@ op!(
     /// `locate`. A LISTENER names no far end (`LocateIn::accept`): the answer is the offer it
     /// makes, with no authority and no name.
     Locate(LocateIn => LocateOut) |p, i, o| {
-        let Some(inst) = p.get().map(Held::life) else {
-            o.error(LOCATE.no_instance);
-            return Outcome::Failed;
-        };
         if i.accept != 0 {
             let mut alpn = i.alpn_buf();
             alpn.extend(OFFER);
@@ -874,7 +871,11 @@ op!(
             o.error("locate: the target is not text");
             return Outcome::Failed;
         };
-        let Ok(at) = inst.framer.locate(target) else {
+        let located = match p.get().map(Held::life) {
+            Some(inst) => inst.framer.locate(target),
+            None => WsFramer::default().locate(target),
+        };
+        let Ok(at) = located else {
             o.error(if carries_userinfo(target) {
                 LOCATE.userinfo
             } else {
