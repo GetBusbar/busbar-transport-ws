@@ -18,6 +18,7 @@
 
 _ct_root="${MODERNCI_CACHE_DIR:-$HOME/.cache}/conformance-tools"
 _ct_node_ver=v22.23.3
+_ct_node_major="${_ct_node_ver#v}"; _ct_node_major="${_ct_node_major%%.*}"
 _ct_rustup_ver=1.28.2
 
 _ct_sha256() {
@@ -28,10 +29,39 @@ _ct_sha256() {
 _ct_fetch() {
   if [ -f "$3" ] && [ "$(_ct_sha256 "$3")" = "$2" ]; then return 0; fi
   mkdir -p "$(dirname "$3")" || return 1
-  curl -fsSL --retry 3 -o "$3.part.$$" "$1" || { echo "tools.sh: download of $1 failed" >&2; rm -f "$3.part.$$"; return 1; }
+  # A stalled transfer (under 1 KiB/s for a minute) fails instead of holding the check forever.
+  curl -fsSL --retry 3 --connect-timeout 30 --speed-limit 1024 --speed-time 60 -o "$3.part.$$" "$1" || { echo "tools.sh: download of $1 failed" >&2; rm -f "$3.part.$$"; return 1; }
   local got; got="$(_ct_sha256 "$3.part.$$")"
   [ "$got" = "$2" ] || { echo "tools.sh: sha256 mismatch for $1: expected $2, got $got" >&2; rm -f "$3.part.$$"; return 1; }
   mv "$3.part.$$" "$3"
+}
+
+# _ct_publish <staged dir> <dir> <probe>: move a fully staged install into place in one rename; true
+# only when <dir>/<probe> is executable after it. Concurrent runs share the cache: a run that finds
+# <dir> never sees it half written, and the loser of a race drops its own copy and uses the winner's.
+# A <dir> without its probe (an install interrupted before staging existed) is moved aside and
+# replaced, never used.
+_ct_publish() {
+  python3 -I - "$1" "$2" "$3" <<'PY'
+import os, shutil, sys
+stage, dest, probe = sys.argv[1:4]
+done = lambda: os.access(os.path.join(dest, probe), os.X_OK)
+for _ in range(2):
+    try:
+        os.rename(stage, dest)
+        break
+    except OSError:
+        if done():
+            break
+        stale = f"{dest}.stale.{os.getpid()}"
+        try:
+            os.rename(dest, stale)
+        except OSError:
+            pass
+        shutil.rmtree(stale, ignore_errors=True)
+shutil.rmtree(stage, ignore_errors=True)
+sys.exit(0 if done() else 1)
+PY
 }
 
 _ct_plat() { # <os>-<arch> as nodejs.org names them
@@ -44,7 +74,7 @@ _ct_plat() { # <os>-<arch> as nodejs.org names them
 _ct_node() {
   local have plat sha dir
   have="$(node -p 'process.versions.node.split(".")[0]' 2>/dev/null || echo 0)"
-  [ "$have" = 22 ] && return 0
+  [ "$have" = "$_ct_node_major" ] && return 0
   plat="$(_ct_plat)" || { echo "tools.sh: no pinned node for $(uname -s)-$(uname -m)" >&2; return 1; }
   case "$plat" in
     linux-x64)    sha=1084aa36196bba4c3a5e69a1ee388a6e4ff729dad09445fbcd434b28fe3c24af ;;
@@ -56,7 +86,11 @@ _ct_node() {
   dir="$_ct_root/node-$_ct_node_ver-$plat"
   if [ ! -x "$dir/bin/node" ]; then
     _ct_fetch "https://nodejs.org/dist/$_ct_node_ver/node-$_ct_node_ver-$plat.tar.gz" "$sha" "$_ct_root/node-$_ct_node_ver-$plat.tar.gz" || return 1
-    tar -xzf "$_ct_root/node-$_ct_node_ver-$plat.tar.gz" -C "$_ct_root" || return 1
+    local stage="$_ct_root/.node-stage.$$"
+    rm -rf "$stage"; mkdir -p "$stage" || return 1
+    tar -xzf "$_ct_root/node-$_ct_node_ver-$plat.tar.gz" -C "$stage" || { rm -rf "$stage"; return 1; }
+    _ct_publish "$stage/node-$_ct_node_ver-$plat" "$dir" bin/node || { rm -rf "$stage"; return 1; }
+    rm -rf "$stage"
   fi
   PATH="$dir/bin:$PATH"; export PATH
 }
@@ -70,12 +104,17 @@ _ct_rust() {
     Darwin-arm64)  t=aarch64-apple-darwin;      sha=20ef5516c31b1ac2290084199ba77dbbcaa1406c45c1d978ca68558ef5964ef5 ;;
     *) echo "tools.sh: no pinned rustup for $(uname -s)-$(uname -m)" >&2; return 1 ;;
   esac
-  RUSTUP_HOME="$_ct_root/rustup-$_ct_rustup_ver/rustup"; CARGO_HOME="$_ct_root/rustup-$_ct_rustup_ver/cargo"
+  local home="$_ct_root/rustup-$_ct_rustup_ver"
+  RUSTUP_HOME="$home/rustup"; CARGO_HOME="$home/cargo"
   export RUSTUP_HOME CARGO_HOME
   if [ ! -x "$CARGO_HOME/bin/cargo" ]; then
     _ct_fetch "https://static.rust-lang.org/rustup/archive/$_ct_rustup_ver/$t/rustup-init" "$sha" "$_ct_root/rustup-init-$t" || return 1
     chmod +x "$_ct_root/rustup-init-$t"
-    "$_ct_root/rustup-init-$t" -y --no-modify-path --default-toolchain none || return 1
+    local stage="$_ct_root/.rustup-stage.$$"
+    rm -rf "$stage"
+    RUSTUP_HOME="$stage/rustup" CARGO_HOME="$stage/cargo" "$_ct_root/rustup-init-$t" -y --no-modify-path --default-toolchain none \
+      || { rm -rf "$stage"; return 1; }
+    _ct_publish "$stage" "$home" cargo/bin/cargo || return 1
   fi
   PATH="$CARGO_HOME/bin:$PATH"; export PATH
   rustup toolchain install || { echo "tools.sh: rustup toolchain install failed" >&2; return 1; }
