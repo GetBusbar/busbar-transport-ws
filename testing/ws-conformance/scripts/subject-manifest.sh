@@ -70,9 +70,6 @@ futures = "0.3"
 [patch."https://github.com/GetBusbar/busbar"]
 busbar-contract = { path = "$B/crates/busbar-contract" }
 
-[patch."https://github.com/GetBusbar/busbar"]
-busbar-contract = { path = "$B/crates/busbar-contract" }
-
 [patch."https://github.com/GetBusbar/busbar-transport-ws"]
 busbar-transport-ws = { path = "$repo/transport-ws" }
 TOML

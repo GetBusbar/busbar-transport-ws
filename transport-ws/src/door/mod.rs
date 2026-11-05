@@ -114,8 +114,12 @@ const TAIL: TransportTail = {
     t
 };
 
+/// The published lifecycle settings schema.
+const SETTINGS_SCHEMA: &[u8] = include_bytes!("../../settings.schema.json");
+
 /// The door's Statement: the `ws` framer.
 pub const STATEMENT: Statement = Statement {
+    settings_schema: busbar_contract::abi::mechanism::call::Blob::json(SETTINGS_SCHEMA),
     extensions: EXTENSIONS,
     ..statement(KEY, env!("CARGO_PKG_VERSION"), 64)
         .with_kind_tail(&TAIL)
@@ -1523,3 +1527,7 @@ busbar_contract::plugin_door! {
 #[allow(unsafe_code)]
 #[path = "../tests/door_fill_tests.rs"]
 mod fill_tests;
+
+#[cfg(test)]
+#[path = "tests/settings_schema_tests.rs"]
+mod settings_schema_tests;
