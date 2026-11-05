@@ -542,17 +542,21 @@ fn imf_fixdate_secs(s: &str) -> Option<u64> {
         .map(|d| d.as_secs())
 }
 
-/// Whether an answer's body is `chunked` (RFC 9112 §6.1, §6.3: the LAST transfer coding the
-/// answer names is `chunked`, which then frames the body whatever `Content-Length` says).
-fn is_chunked(headers: &HeaderMap) -> bool {
-    headers
-        .get_all("transfer-encoding")
-        .iter()
-        .filter_map(|v| v.to_str().ok())
-        .flat_map(|v| v.split(','))
-        .map(str::trim)
-        .rfind(|c| !c.is_empty())
-        .is_some_and(|c| c.eq_ignore_ascii_case("chunked"))
+/// Validate the complete transfer-coding sequence before publishing decoded body bytes.
+/// This framer decodes only a single chunked coding. Removing Transfer-Encoding while
+/// leaving another coding applied would misrepresent the payload handed to the host.
+fn transfer_chunked(headers: &HeaderMap) -> Result<bool, TransportError> {
+    let mut chunked = false;
+    for value in headers.get_all("transfer-encoding") {
+        let value = value.to_str().map_err(|_| TransportError::Framing)?;
+        for coding in value.split(',') {
+            if chunked || !coding.trim().eq_ignore_ascii_case("chunked") {
+                return Err(TransportError::Framing);
+            }
+            chunked = true;
+        }
+    }
+    Ok(chunked)
 }
 
 /// The longest chunk-size or trailer line a refused upgrade's chunked body may carry; a longer
@@ -1542,6 +1546,12 @@ impl WsFramer {
                 Err(HandshakeError::Failure(WsError::Http(response))) => {
                     let reason = shaken.as_ref().and_then(|(seen, _)| reason_phrase(seen));
                     let code = response.status().as_u16();
+                    let bodiless = matches!(code, 100..=199 | 204 | 304);
+                    let chunked = if bodiless {
+                        None
+                    } else {
+                        transfer_chunked(response.headers())?.then(Box::<Dechunk>::default)
+                    };
                     let block = head_block(
                         response.headers(),
                         shaken.as_ref().map_or(&[][..], |(seen, _)| seen.as_slice()),
@@ -1562,10 +1572,6 @@ impl WsFramer {
                         ended: carrier_ended,
                         ..Pipe::default()
                     };
-
-                    let bodiless = matches!(code, 100..=199 | 204 | 304);
-                    let chunked =
-                        (!bodiless && is_chunked(response.headers())).then(Box::<Dechunk>::default);
 
                     let declared = if bodiless {
                         Ok(Some(0))

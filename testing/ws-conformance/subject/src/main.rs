@@ -53,7 +53,7 @@ fn carrier() -> busbar_core_connector::compose::Via {
     busbar_core_connector::compose::Via {
         door: open(
             busbar_transport_tcp::linked::KEY,
-            busbar_transport_tcp::door::door,
+            busbar_transport_tcp::door,
         ),
         io: busbar_core_connector::hostio::process(),
     }
@@ -106,6 +106,10 @@ async fn echo(mut conn: Connection) {
 }
 
 fn main() {
+    tracing_subscriber::fmt()
+        .with_max_level(tracing_subscriber::filter::LevelFilter::WARN)
+        .with_writer(std::io::stderr)
+        .init();
     let worker = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()

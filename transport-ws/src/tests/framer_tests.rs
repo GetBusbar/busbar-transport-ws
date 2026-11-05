@@ -2,7 +2,7 @@
 // Copyright (C) 2026 Busbar Inc and contributors
 
 use crate::frame::{Framed, FramerOut, HostTime, Side};
-use busbar_contract::transport::wire::WireStatusClass;
+use busbar_contract::transport::wire::{TransportError, WireStatusClass};
 use tungstenite::handshake::derive_accept_key;
 
 use crate::transport::WsFramer;
@@ -900,12 +900,57 @@ fn an_invalid_or_conflicting_content_length_ends_failed() {
     }
 }
 
-/// A `Transfer-Encoding` whose final coding is not `chunked` leaves the body to run to the
-/// carrier's end, `Content-Length` ignored (RFC 9112 §6.3).
+/// A transfer coding the framer cannot decode must not become an unlabelled payload.
 #[test]
-fn a_non_chunked_transfer_encoding_overrides_content_length() {
+fn unsupported_transfer_codings_fail_before_publishing_a_refusal() {
+    // gzip("denied"), including its header and checksum: this is encoded content,
+    // not a plain-text fixture merely labelled as gzip.
+    let compressed: &[u8] = &[
+        31, 139, 8, 0, 0, 0, 0, 0, 0, 255, 75, 73, 205, 203, 76, 77, 1, 0, 238, 94, 223, 189, 6, 0,
+        0, 0,
+    ];
+    for coding in [
+        "gzip",
+        "gzip, chunked",
+        "chunked, gzip",
+        "chunked, chunked",
+        "unknown",
+        "",
+    ] {
+        let framer = WsFramer::new(0);
+        let state = framer
+            .open(Side::Dial, "ws://svc.test/session", &mut Out::default())
+            .unwrap();
+        let mut wire = format!("HTTP/1.1 401 Unauthorized\r\nTransfer-Encoding: {coding}\r\n\r\n")
+            .into_bytes();
+        if coding.ends_with("chunked") {
+            wire.extend_from_slice(format!("{:x}\r\n", compressed.len()).as_bytes());
+            wire.extend_from_slice(compressed);
+            wire.extend_from_slice(b"\r\n0\r\n\r\n");
+        } else {
+            wire.extend_from_slice(compressed);
+        }
+        let mut heard = Out::default();
+        assert!(
+            matches!(
+                framer.ingest(state, &wire, true, &mut heard),
+                Err(TransportError::Framing)
+            ),
+            "{coding}"
+        );
+        assert!(
+            heard.frames.is_empty(),
+            "no normal refusal head or body: {coding}"
+        );
+        assert!(!framer.holds(state), "the failed framing is discarded");
+    }
+}
+
+/// Decoding the supported transfer coding still overrides a conflicting length.
+#[test]
+fn chunked_transfer_encoding_overrides_content_length() {
     let (framer, state, heard) = refused_with(
-        b"HTTP/1.1 401 Unauthorized\r\nTransfer-Encoding: gzip\r\nContent-Length: 2\r\n\r\nokmore",
+        b"HTTP/1.1 401 Unauthorized\r\nTransfer-Encoding: ChUnKeD\r\nContent-Length: 2\r\n\r\n6\r\nokmore\r\n0\r\n\r\n",
         true,
     );
     assert!(heard.ended && !framer.failed(state));

@@ -66,6 +66,7 @@ busbar-transport-tcp = { git = "$tcp_source", rev = "$tcp_rev" }
 serde_json = "1"
 tokio = { version = "1", features = ["rt", "macros", "net", "io-util", "sync", "time"] }
 futures = "0.3"
+tracing-subscriber = "0.3.23"
 
 [patch."https://github.com/GetBusbar/busbar"]
 busbar-contract = { path = "$B/crates/busbar-contract" }
