@@ -213,8 +213,8 @@ skip = [
     { crate = "r-efi@6.0.0", reason = "busbar's own lock holds this duplicate" },
     { crate = "rand_core@0.6.4", reason = "busbar's own lock holds this duplicate" },
     { crate = "rand_core@0.9.5", reason = "busbar's own lock holds this duplicate" },
-    { crate = "syn@2.0.117", reason = "busbar's own lock holds this duplicate" },
-    { crate = "syn@3.0.3", reason = "busbar's own lock holds this duplicate" },
+    { crate = "syn@2.0.119", reason = "busbar's own lock holds this duplicate semver line; this plugin locks the exact version" },
+    { crate = "syn@3.0.9", reason = "busbar's own lock holds this duplicate semver line; this plugin locks the exact version" },
 ]
 
 [sources]
