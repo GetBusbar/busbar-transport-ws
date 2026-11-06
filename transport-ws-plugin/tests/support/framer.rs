@@ -108,6 +108,97 @@ fn lossy(b: &[u8]) -> String {
     }
 }
 
+/// Check the real nonce, then substitute only that nonce for transcript comparison.
+/// The response must answer the real request, including for an unseeded release cdylib.
+fn dial_handshake(wire: &mut Vec<u8>, fixture: &[u8], response: &[u8]) -> Vec<u8> {
+    use base64::Engine as _;
+    fn key(request: &str) -> &str {
+        let mut keys = request.split("\r\n").filter_map(|line| {
+            let (name, value) = line.split_once(": ")?;
+            name.eq_ignore_ascii_case("sec-websocket-key")
+                .then_some(value)
+        });
+        let key = keys.next().expect("one WebSocket nonce");
+        assert!(keys.next().is_none(), "one WebSocket nonce");
+        assert_eq!(
+            base64::engine::general_purpose::STANDARD
+                .decode(key)
+                .expect("base64 nonce")
+                .len(),
+            16
+        );
+        key
+    }
+    let request = std::str::from_utf8(wire).expect("HTTP request");
+    let fixture = std::str::from_utf8(fixture).expect("fixture request");
+    let actual = key(request);
+    let expected = key(fixture);
+    let actual_accept = tungstenite::handshake::derive_accept_key(actual.as_bytes());
+    let fixture_accept = tungstenite::handshake::derive_accept_key(expected.as_bytes());
+    let response = std::str::from_utf8(response).expect("fixture response");
+    assert_eq!(
+        response.matches(&fixture_accept).count(),
+        1,
+        "one fixture accept"
+    );
+    let answer = response
+        .replace(&fixture_accept, &actual_accept)
+        .into_bytes();
+    *wire = request.replace(actual, expected).into_bytes();
+    answer
+}
+
+/// Preserve every frame/header/payload byte except the random mask and its XOR.
+/// An absent mask, truncated frame or changed opcode/payload still fails the fixture.
+fn canonical_client_frames(wire: &mut [u8]) {
+    let mut at = 0;
+    while at < wire.len() {
+        let mut cursor = std::io::Cursor::new(&wire[at..]);
+        let (header, len) = tungstenite::protocol::frame::FrameHeader::parse(&mut cursor)
+            .expect("valid client frame header")
+            .expect("complete client frame header");
+        let mask = header.mask.expect("client frames must be masked");
+        let body = at + usize::try_from(cursor.position()).unwrap();
+        let end = body
+            .checked_add(usize::try_from(len).unwrap())
+            .expect("frame length");
+        let payload = wire
+            .get_mut(body..end)
+            .expect("complete client frame payload");
+        for (i, byte) in payload.iter_mut().enumerate() {
+            *byte ^= mask[i % 4];
+        }
+        wire[body - 4..body].fill(0);
+        at = end;
+    }
+}
+
+#[test]
+fn client_mask_comparison_preserves_protocol_and_payload_errors() {
+    let expected = [0x82, 0x82, 0, 0, 0, 0, b'h', b'i'];
+    let mut actual = [0x82, 0x82, 1, 2, 3, 4, b'h' ^ 1, b'i' ^ 2];
+    canonical_client_frames(&mut actual);
+    assert_eq!(actual, expected);
+    for (changed_byte, difference) in [(0, 3), (6, 1)] {
+        let mut changed = expected;
+        changed[changed_byte] ^= difference;
+        canonical_client_frames(&mut changed);
+        assert_ne!(
+            changed, expected,
+            "changed opcode/payload must not normalize away"
+        );
+    }
+    for mut malformed in [vec![0x82, 2, b'h', b'i'], expected[..7].to_vec()] {
+        assert!(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                canonical_client_frames(&mut malformed);
+            }))
+            .is_err(),
+            "unmasked/truncated client frames must fail"
+        );
+    }
+}
+
 fn sinkfuls(len: usize, cap: usize) -> u64 {
     len.div_ceil(cap).max(1) as u64
 }
@@ -641,12 +732,14 @@ fn exercise(p: &Plugin<Transport>, d: &busbar_plugin_loader::dispatch::Dispatche
 
     let want = begin_dial_want(dial, armed("begin"));
     let pinned = sinkfuls(opening.len(), TIGHT_WIRE);
+    let mut dial_answer = opt_text(&dial["answer"], "dial.answer");
     let token = {
         let label = "begin dial";
 
         let before = count(p);
         let value = {
-            let y = pump(p, 0, Op::Begin(SIDE_DIAL, &target), &mut tight);
+            let mut y = pump(p, 0, Op::Begin(SIDE_DIAL, &target), &mut tight);
+            dial_answer = dial_handshake(&mut y.wire, &opening, &dial_answer);
             (y.line(), y.framing)
         };
         assert_eq!(count(p) - before, pinned, "{label} crossings");
@@ -660,7 +753,7 @@ fn exercise(p: &Plugin<Transport>, d: &busbar_plugin_loader::dispatch::Dispatche
     };
 
     if !dial["answer"].is_null() {
-        let answer = text(&dial["answer"], "dial.answer");
+        let answer = dial_answer;
         let heard = if dial["answer_frames"].is_null() {
             Vec::new()
         } else {
@@ -755,7 +848,9 @@ fn exercise(p: &Plugin<Transport>, d: &busbar_plugin_loader::dispatch::Dispatche
         let label = "emit";
 
         let before = count(p);
-        let value = pump(p, token, Op::Emit(&emit, true), &mut tight).line();
+        let mut yielded = pump(p, token, Op::Emit(&emit, true), &mut tight);
+        canonical_client_frames(&mut yielded.wire);
+        let value = yielded.line();
         assert_eq!(
             count(p) - before,
             sinkfuls(wire.len(), TIGHT_WIRE),
@@ -779,7 +874,9 @@ fn exercise(p: &Plugin<Transport>, d: &busbar_plugin_loader::dispatch::Dispatche
         let label = "ingest";
 
         let before = count(p);
-        let value = pump(p, token, Op::Ingest(&ingest, false), &mut tight).line();
+        let mut yielded = pump(p, token, Op::Ingest(&ingest, false), &mut tight);
+        canonical_client_frames(&mut yielded.wire);
+        let value = yielded.line();
         assert_eq!(count(p) - before, ingest_calls, "{label} crossings");
         let answer = value;
         match want {

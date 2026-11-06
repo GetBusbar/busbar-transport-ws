@@ -742,7 +742,10 @@ fn prewire_partial_adoption_marks_acceptance_once_and_blocks_uncommitted_data() 
     assert_eq!(l.pieces[0].status_class, STATUS_SUCCESS);
     assert_eq!(
         l.pieces[0].flags,
-        PIECE_FIELDS | PIECE_HAS_CODE | PIECE_END_OF_FRAME
+        PIECE_FIELDS
+            | PIECE_HAS_CODE
+            | PIECE_END_OF_FRAME
+            | busbar_contract::abi::transport::PIECE_CODE_HANDOFF
     );
     assert!(accepted.wire.starts_with(b"HTTP/1.1 101"));
     let again = ingest(p, token, &[], false, &mut l);

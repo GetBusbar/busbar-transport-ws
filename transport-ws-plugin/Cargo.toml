@@ -21,6 +21,8 @@ busbar-transport-ws = { path = "../transport-ws" }
 busbar-contract = { workspace = true }
 
 [dev-dependencies]
+base64 = { workspace = true }
+tungstenite = { workspace = true, features = ["handshake"] }
 serde_json = { workspace = true }
 # The conformance test loads the linked door and dlopens the built cdylib over the REAL loader:
 # dev-only, never in the shipped artifact. Same pinned rev, so one busbar source resolves.
