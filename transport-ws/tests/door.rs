@@ -665,49 +665,52 @@ fn locate_for_a_listener_answers_the_accepting_offer() {
     host.close();
 }
 
-/// Secure dial location crosses the table with its certificate name and ALPN offer.
+/// Secure dial location has the same authority, certificate name, ALPN and buffer requirements
+/// before OPEN as it does with an opened instance (the SDK's pure pre-open LOCATE contract).
 #[test]
 fn locate_for_a_secure_dial_reports_every_output_and_short_buffer() {
     use busbar_contract::abi::transport::{LocateIn, LocateOut};
     let host = Host::open(linked(), (1024, 1024, 4));
     let target = b"wss://svc.test/stream";
-    for caps in [[0, 64, 16], [64, 0, 16], [64, 64, 0], [64, 64, 16]] {
-        let mut authority = [0_u8; 64];
-        let mut name = [0_u8; 64];
-        let mut alpn = [0_u8; 16];
-        let mut i: LocateIn = z();
-        i.target = AbiStr {
-            ptr: target.as_ptr(),
-            len: target.len(),
-        };
-        i.authority_buf = authority.as_mut_ptr();
-        i.authority_cap = caps[0];
-        i.name_buf = name.as_mut_ptr();
-        i.name_cap = caps[1];
-        i.alpn_buf = alpn.as_mut_ptr();
-        i.alpn_cap = caps[2];
-        let mut o: LocateOut = z();
-        let r = call(host.ops.locate, host.inst, &mut i, &mut o, slot::LOCATE);
-        assert_eq!((o.secure, o.has_name), (1, 1));
-        if caps.contains(&0) {
-            assert_eq!(r, Outcome::Failed);
-            assert_eq!(
-                (o.authority_needed, o.name_needed, o.alpn_needed),
-                (12, 8, 9)
-            );
-            assert_eq!(
-                (o.authority_written, o.name_written, o.alpn_written),
-                (0, 0, 0)
-            );
-        } else {
-            assert_eq!(r, Outcome::Ready);
-            assert_eq!(
-                (o.authority_needed, o.name_needed, o.alpn_needed),
-                (0, 0, 0)
-            );
-            assert_eq!(&authority[..o.authority_written as usize], b"svc.test:443");
-            assert_eq!(&name[..o.name_written as usize], b"svc.test");
-            assert_eq!(&alpn[..o.alpn_written as usize], b"\x08http/1.1");
+    for instance in [std::ptr::null_mut(), host.inst] {
+        for caps in [[0, 64, 16], [64, 0, 16], [64, 64, 0], [64, 64, 16]] {
+            let mut authority = [0_u8; 64];
+            let mut name = [0_u8; 64];
+            let mut alpn = [0_u8; 16];
+            let mut i: LocateIn = z();
+            i.target = AbiStr {
+                ptr: target.as_ptr(),
+                len: target.len(),
+            };
+            i.authority_buf = authority.as_mut_ptr();
+            i.authority_cap = caps[0];
+            i.name_buf = name.as_mut_ptr();
+            i.name_cap = caps[1];
+            i.alpn_buf = alpn.as_mut_ptr();
+            i.alpn_cap = caps[2];
+            let mut o: LocateOut = z();
+            let r = call(host.ops.locate, instance, &mut i, &mut o, slot::LOCATE);
+            assert_eq!((o.secure, o.has_name), (1, 1));
+            if caps.contains(&0) {
+                assert_eq!(r, Outcome::Failed);
+                assert_eq!(
+                    (o.authority_needed, o.name_needed, o.alpn_needed),
+                    (12, 8, 9)
+                );
+                assert_eq!(
+                    (o.authority_written, o.name_written, o.alpn_written),
+                    (0, 0, 0)
+                );
+            } else {
+                assert_eq!(r, Outcome::Ready);
+                assert_eq!(
+                    (o.authority_needed, o.name_needed, o.alpn_needed),
+                    (0, 0, 0)
+                );
+                assert_eq!(&authority[..o.authority_written as usize], b"svc.test:443");
+                assert_eq!(&name[..o.name_written as usize], b"svc.test");
+                assert_eq!(&alpn[..o.alpn_written as usize], b"\x08http/1.1");
+            }
         }
     }
     host.close();
@@ -1353,11 +1356,12 @@ fn a_carrier_op_is_refused_by_name() {
     host.close();
 }
 
-/// An operation without an instance fails by name without reading through a null pointer.
+/// A stateful operation without an instance fails by name without reading a null pointer.
+/// LOCATE is pure before OPEN and is covered by the location tests above.
 #[test]
 fn an_op_with_no_instance_fails_by_name() {
     use busbar_contract::abi::mechanism::lifecycle::RefreshIn;
-    use busbar_contract::abi::transport::{FramingIn, LocateIn, LocateOut};
+    use busbar_contract::abi::transport::FramingIn;
     let ops = linked();
     let none = std::ptr::null_mut();
     macro_rules! failed {
@@ -1370,21 +1374,9 @@ fn an_op_with_no_instance_fails_by_name() {
             assert_eq!((r, said(&head.error)), (Outcome::Failed, $text.to_owned()));
         }};
     }
-    let (locate, begin, adopt, ingest) = (ops.locate, ops.begin, ops.adopt, ops.ingest);
+    let (begin, adopt, ingest) = (ops.begin, ops.adopt, ops.ingest);
     let (emit, refuse, finish, timer) = (ops.emit, ops.refuse, ops.finish, ops.timer);
     let refresh = ops.head.refresh;
-    let target = "ws://svc.test/";
-    let mut i: LocateIn = z();
-    i.target = AbiStr {
-        ptr: target.as_ptr(),
-        len: target.len(),
-    };
-    let mut o: LocateOut = z();
-    let r = call(locate, none, &mut i, &mut o, slot::LOCATE);
-    assert_eq!(
-        (r, said(&o.head.error)),
-        (Outcome::Failed, "locate: no open instance".to_owned())
-    );
     failed!(
         begin,
         slot::BEGIN,
@@ -1475,15 +1467,17 @@ fn locate_refuses_a_target_carrying_userinfo() {
     i.authority_cap = auth.len();
     i.name_buf = name.as_mut_ptr();
     i.name_cap = name.len();
-    let mut o: LocateOut = z();
-    let r = call(host.ops.locate, host.inst, &mut i, &mut o, slot::LOCATE);
-    assert_eq!(
-        (r, said(&o.head.error)),
-        (
-            Outcome::Failed,
-            "locate: the target carries userinfo; credentials never ride a URL".to_owned()
-        )
-    );
+    for instance in [std::ptr::null_mut(), host.inst] {
+        let mut o: LocateOut = z();
+        let r = call(host.ops.locate, instance, &mut i, &mut o, slot::LOCATE);
+        assert_eq!(
+            (r, said(&o.head.error)),
+            (
+                Outcome::Failed,
+                "locate: the target carries userinfo; credentials never ride a URL".to_owned()
+            )
+        );
+    }
     host.close();
 }
 
