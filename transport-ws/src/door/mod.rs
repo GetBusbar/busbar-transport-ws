@@ -19,6 +19,7 @@ use busbar_contract::abi::mechanism::lifecycle::{CancelIn, CancelOut, RefreshIn}
 use busbar_contract::abi::sdk::door::{abi_str, statement};
 use busbar_contract::abi::sdk::life::{self, Held, Life, Refreshed, Refusal};
 use busbar_contract::abi::sdk::transport::policy::Loans;
+use busbar_contract::abi::sdk::transport::sink::field_cut;
 use busbar_contract::abi::sdk::transport::{
     form_codes, setting_decls, settings_reading, SettingRow, DEFAULT_BODY_MAX,
 };
@@ -227,30 +228,6 @@ fn class_code(class: Option<WireStatusClass>) -> u8 {
         Some(WireStatusClass::FarEndFault) => STATUS_FAR_END_FAULT,
         Some(WireStatusClass::Other) => STATUS_OTHER,
     }
-}
-
-/// How much of a field block's `bytes` a sink with `room` may take: all of it when it fits,
-/// else the furthest cut at a line's start or inside a value, so a continued piece always
-/// extends a value (the host refuses any other continuation).
-fn field_cut(bytes: &[u8], room: usize, in_value: bool) -> usize {
-    if bytes.len() <= room {
-        return bytes.len();
-    }
-
-    let mut at = if in_value { 2 } else { 0 };
-    let mut best = 0;
-    for (i, &b) in bytes[..room].iter().enumerate() {
-        at = match (at, b) {
-            (0 | 1, b':') => 2,
-            (0 | 1, _) => 1,
-            (_, b'\n') => 0,
-            _ => 2,
-        };
-        if at != 1 {
-            best = i + 1;
-        }
-    }
-    best
 }
 
 /// How much of a piece's unhanded `rest` a sink with `room` takes.
