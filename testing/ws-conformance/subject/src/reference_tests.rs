@@ -153,17 +153,20 @@ fn the_handshake_wants_a_version_13_upgrade() {
                 Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n";
     assert_eq!(
         read_handshake(&mut BufReader::new(good.as_bytes())).as_deref(),
-        Some("dGhlIHNhbXBsZSBub25jZQ==")
+        Ok("dGhlIHNhbXBsZSBub25jZQ==")
     );
     let old = good.replace("Version: 13", "Version: 8");
-    assert_eq!(read_handshake(&mut BufReader::new(old.as_bytes())), None);
+    assert_eq!(
+        read_handshake(&mut BufReader::new(old.as_bytes())),
+        Err(Refusal::Version)
+    );
 }
 
 #[test]
 fn handshake_line_is_bounded_before_allocation() {
     let input = vec![b'x'; MAX_HEAD * 2];
     let mut reader = std::io::Cursor::new(input);
-    assert_eq!(read_handshake(&mut reader), None);
+    assert_eq!(read_handshake(&mut reader), Err(Refusal::Malformed));
     assert_eq!(reader.position(), (MAX_HEAD + 1) as u64);
 }
 
@@ -196,7 +199,7 @@ fn fragmented_message_uses_the_remaining_budget() {
 #[test]
 fn invalid_opening_requirements_are_refused() {
     let good = "GET / HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\nConnection: keep-alive, Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n";
-    assert!(read_handshake(&mut std::io::Cursor::new(good)).is_some());
+    assert!(read_handshake(&mut std::io::Cursor::new(good)).is_ok());
     for bad in [
         good.replace("HTTP/1.1", "HTTP/1.0"),
         good.replace("\r\n\r\n", "\r\n\r"),
@@ -211,7 +214,7 @@ fn invalid_opening_requirements_are_refused() {
             "Sec-WebSocket-Version: 13\r\nSec-WebSocket-Version: 13",
         ),
     ] {
-        assert!(read_handshake(&mut std::io::Cursor::new(bad)).is_none());
+        assert!(read_handshake(&mut std::io::Cursor::new(bad)).is_err());
     }
 }
 

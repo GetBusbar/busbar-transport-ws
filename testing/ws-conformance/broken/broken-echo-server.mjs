@@ -2,10 +2,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Busbar Inc and contributors
 //
-// THE NEGATIVE CONTROL: a deliberately broken WebSocket peer. `autobahn-negative-control` runs
-// Autobahn against this and MUST see it graded RED -- proving the harness can fail a peer, not
-// only pass one, the same "a deliberately broken peer MUST be red" discipline
-// `mcp-conformance.yml`'s `battery-negative-control` leg holds the in-house battery to.
+// THE NEGATIVE CONTROL: a deliberately broken WebSocket peer. The `--negative-control` leg of
+// scripts/run.sh (run by testing/conformance/ws.sh) runs Autobahn against this and MUST see it
+// graded RED -- proving the harness can fail a peer, not only pass one.
 //
 // The defect: this peer echoes every message TRUNCATED by one byte, which corrupts UTF-8 text
 // frames and drops the trailing byte of every binary frame -- both of which flip clearly OK

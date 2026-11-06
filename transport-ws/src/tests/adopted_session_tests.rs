@@ -90,16 +90,11 @@ fn adoption_keeps_the_inherited_stream_from_initial_leftovers_through_finish() {
         let previous = accepted(p);
         let mut extension = extensions::encode(&[(EXT_ADOPTED_SESSION, &context(stream).encode())]);
         let leftover = UPGRADE.to_vec();
-        let original = leftover.clone();
         let mut l = Lend::new(1, 3, 1, 1);
         let (mut answer, token) = adopt(p, &extension, &leftover, &mut l);
         assert_eq!(answer.outcome, Outcome::Ready);
         assert_ne!(token, 0, "the framer allocated its own local token");
         assert_ne!(token, previous, "adoption allocated a fresh local token");
-        assert_eq!(
-            leftover, original,
-            "the upgrade and leftover bytes are unchanged"
-        );
         extension.fill(0);
         drop(extension);
         drop(leftover);
@@ -286,7 +281,6 @@ fn accepted_connection_lists_are_combined_without_changing_original_request_byte
         "Connection: keep-alive, Upgrade\r\n",
     ] {
         let request = format!("GET /echo HTTP/1.1\r\nHost: svc.test\r\nUpgrade: websocket\r\n{connection}Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\nX-Hop: untouched\r\nAuthorization: Bearer original\r\n\r\n").into_bytes();
-        let original = request.clone();
         for adopted in [false, true] {
             for split in 0..=request.len() {
                 let p = instance();
@@ -315,7 +309,6 @@ fn accepted_connection_lists_are_combined_without_changing_original_request_byte
                 let heard = ingest(p, token, &masked(b"after-101"), false, &mut l);
                 assert_eq!(heard.pieces[0].0, b"after-101");
                 streams(&l, &heard, if adopted { 37 } else { 0 });
-                assert_eq!(request, original, "policy and hand-off bytes stay original");
                 finish(p, token, &mut l);
                 shut(p);
             }
@@ -841,5 +834,294 @@ fn prewire_bodyless_prehead_no_content_refusal_omits_framing_fields() {
     assert_ne!(invalid.outcome, Outcome::Ready);
     assert!(invalid.wire.is_empty());
     finish(p, token, &mut l);
+    shut(p);
+}
+
+fn awaiting() -> Owed {
+    let mut owed = Owed::default();
+    owed.prewire = Prewire::Awaiting;
+    owed
+}
+
+fn is_framing<T>(result: Result<T, TransportError>) -> bool {
+    matches!(result, Err(TransportError::Framing))
+}
+
+#[test]
+fn an_http_answer_head_refuses_every_framing_it_cannot_state() {
+    for (status, block, end) in [
+        (200, &b"x-a: b"[..], false),
+        (200, b"content-length: abc\r\n", false),
+        (200, b"content-length: \r\n", false),
+        (200, b"content-length: 1\r\ncontent-length: 2\r\n", false),
+        (200, b"transfer-encoding: gzip\r\n", false),
+        (
+            200,
+            b"transfer-encoding: chunked\r\ntransfer-encoding: chunked\r\n",
+            false,
+        ),
+        (
+            200,
+            b"content-length: 1\r\ntransfer-encoding: chunked\r\n",
+            false,
+        ),
+        (200, b"content-length: 1\r\ntrailer: x\r\n", false),
+        (204, b"content-length: 0\r\n", false),
+        (204, b"transfer-encoding: chunked\r\n", false),
+        (200, b"content-length: 3\r\n", true),
+    ] {
+        assert!(
+            is_framing(HttpAnswer::head(status, block, end)),
+            "{status} {:?}",
+            String::from_utf8_lossy(block)
+        );
+    }
+}
+
+#[test]
+fn an_http_answer_head_states_chunking_and_ends_it_with_the_head() {
+    let (answer, wire) = HttpAnswer::head(200, b"transfer-encoding: chunked\r\n", true).unwrap();
+    assert!(answer.chunked);
+    assert_eq!(
+        wire,
+        b"HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\n\r\n0\r\n\r\n"
+    );
+    let (answer, wire) = HttpAnswer::head(429, b"trailer: x-final\r\n", false).unwrap();
+    assert!(answer.chunked);
+    assert!(wire.ends_with(b"trailer: x-final\r\ntransfer-encoding: chunked\r\n\r\n"));
+    let (answer, wire) = HttpAnswer::head(304, b"content-length: 7\r\n", true).unwrap();
+    assert!(answer.bodyless);
+    assert_eq!(
+        wire,
+        b"HTTP/1.1 304 Not Modified\r\ncontent-length: 7\r\n\r\n"
+    );
+}
+
+#[test]
+fn an_http_answer_body_keeps_to_its_declared_framing() {
+    let (mut bodyless, _) = HttpAnswer::head(304, b"", false).unwrap();
+    assert_eq!(bodyless.body(b"", false, false).unwrap(), b"");
+    assert!(is_framing(bodyless.body(b"x", false, false)));
+    assert!(is_framing(bodyless.body(b"", true, true)));
+
+    let (mut plain, _) = HttpAnswer::head(200, b"content-length: 3\r\n", false).unwrap();
+    assert!(
+        is_framing(plain.body(b"", true, true)),
+        "trailers need chunking"
+    );
+    assert!(
+        is_framing(plain.body(b"four", false, false)),
+        "past its length"
+    );
+    assert_eq!(plain.body(b"ab", false, false).unwrap(), b"ab");
+    assert!(is_framing(plain.body(b"", true, false)), "ended short");
+    assert_eq!(plain.body(b"c", true, false).unwrap(), b"c");
+
+    let (mut chunked, _) = HttpAnswer::head(200, b"transfer-encoding: chunked\r\n", false).unwrap();
+    assert!(
+        is_framing(chunked.body(b"x: y\r\n", false, true)),
+        "not at the end"
+    );
+    assert!(is_framing(chunked.body(
+        b"connection: close\r\n",
+        true,
+        true
+    )));
+    assert!(is_framing(chunked.body(
+        b"Content-Length: 1\r\n",
+        true,
+        true
+    )));
+    assert!(
+        is_framing(chunked.body(b"bad", true, true)),
+        "not a field block"
+    );
+    assert_eq!(chunked.body(b"", false, false).unwrap(), b"");
+    assert_eq!(
+        chunked.body(b"slow", true, false).unwrap(),
+        b"4\r\nslow\r\n0\r\n\r\n"
+    );
+    assert_eq!(chunked.body(b"", true, false).unwrap(), b"0\r\n\r\n");
+    assert_eq!(
+        chunked.body(b"x-final: 1\r\n", true, true).unwrap(),
+        b"0\r\nx-final: 1\r\n\r\n"
+    );
+}
+
+#[test]
+fn prewire_emit_state_machine_refuses_what_its_state_cannot_take() {
+    let framer = WsFramer::new(0);
+    let legacy = |status, flags| {
+        Owed::default()
+            .prewire_emit(&framer, 1, status, b"", false, flags)
+            .unwrap()
+    };
+    assert!(!legacy(0, 0), "a legacy framing is left to the machine");
+
+    let mut owed = awaiting();
+    assert!(owed.prewire_emit(&framer, 1, 0, b"", false, 0).unwrap());
+    assert!(owed.wire_owed().is_empty() && owed.pieces.is_empty());
+    assert!(is_framing(owed.prewire_emit(&framer, 1, 0, b"x", false, 0)));
+    assert!(is_framing(owed.prewire_emit(&framer, 1, 0, b"", true, 0)));
+    assert!(is_framing(owed.prewire_emit(
+        &framer,
+        1,
+        0,
+        b"",
+        false,
+        EMIT_TRAILERS
+    )));
+    assert!(
+        is_framing(owed.prewire_emit(&framer, 1, 401, b"", true, EMIT_TEXT)),
+        "an HTTP head states no message flags"
+    );
+    assert!(
+        is_framing(owed.prewire_emit(&framer, 1, 101, b"", true, 0)),
+        "no acceptance marker or handshake to commit"
+    );
+    owed.prewire = Prewire::Committed;
+    assert!(
+        is_framing(owed.prewire_emit(&framer, 1, 401, b"", true, 0)),
+        "a committed upgrade cannot become an HTTP answer"
+    );
+}
+
+#[test]
+fn an_http_answer_discards_the_held_upgrade_and_ends_exactly_once() {
+    let framer = WsFramer::new(0);
+    let mut owed = awaiting();
+    owed.push(b"HTTP/1.1 101 Switching Protocols\r\n\r\n", false);
+    let mut held = Piece::plain(0, b"private".to_vec(), true);
+    held.reason = Some(b"private-reason".to_vec());
+    owed.pieces.push_back(held);
+    assert!(owed
+        .prewire_emit(&framer, 1, 401, b"content-length: 2\r\n", false, 0)
+        .unwrap());
+    assert!(owed.pieces.is_empty(), "the held pieces are discarded");
+    assert_eq!(
+        owed.wire_owed(),
+        b"HTTP/1.1 401 Unauthorized\r\ncontent-length: 2\r\n\r\n"
+    );
+    assert!(!owed.ended);
+    assert!(is_framing(
+        owed.prewire_emit(&framer, 1, 403, b"", false, 0)
+    ));
+    assert!(is_framing(
+        owed.prewire_emit(&framer, 1, 0, b"no", false, EMIT_TEXT)
+    ));
+    assert!(owed.prewire_emit(&framer, 1, 0, b"no", true, 0).unwrap());
+    assert!(owed.ended);
+    assert!(is_framing(
+        owed.prewire_emit(&framer, 1, 0, b"more", false, 0)
+    ));
+    assert!(is_framing(owed.prewire_emit(&framer, 1, 0, b"", true, 0)));
+}
+
+#[test]
+fn a_kept_piece_buffer_pool_never_holds_more_than_its_cap() {
+    let mut owed = Owed::default();
+    for _ in 0..SPARE_MAX + 4 {
+        owed.recycle(vec![1, 2, 3]);
+    }
+    assert_eq!(owed.spare.len(), SPARE_MAX);
+}
+
+#[test]
+fn a_framed_head_with_no_stated_class_reaches_the_piece_with_no_class() {
+    use crate::frame::FramerOut as _;
+    let mut owed = Owed::default();
+    let mut collect = Collect {
+        owed: &mut owed,
+        now: HostTime::default(),
+        opening: false,
+    };
+    collect.frame(Framed {
+        status_code: Some(200),
+        status: None,
+        ..Framed::plain(StreamId(0), b"x: y\r\n", true)
+    });
+    collect.frame(Framed {
+        status_code: Some(502),
+        status: Some(WireStatusClass::FarEndFault),
+        ..Framed::plain(StreamId(0), b"", true)
+    });
+    assert_eq!(owed.pieces[0].status, Some((200, STATUS_NONE)));
+    assert_eq!(owed.pieces[1].status, Some((502, STATUS_FAR_END_FAULT)));
+}
+
+#[test]
+fn a_refusal_after_an_http_answer_head_ends_it_without_new_bytes() {
+    let (p, token, _) = staged();
+    let mut l = Lend::roomy();
+    let head = prewire_emit(p, token, 401, b"content-length: 4\r\n", false, 0, &mut l);
+    assert_eq!(head.outcome, Outcome::Ready);
+    assert_eq!(head.flags & YIELD_ENDED, 0);
+    let refused = prewire_refuse(p, token, 403, b"other", true, &mut l);
+    assert_eq!(refused.outcome, Outcome::Ready);
+    assert!(refused.wire.is_empty(), "the answer already began as HTTP");
+    assert_ne!(refused.flags & YIELD_ENDED, 0);
+    finish(p, token, &mut l);
+    shut(p);
+}
+
+#[test]
+fn begin_and_adopt_refuse_a_side_that_is_neither_accept_nor_dial() {
+    let p = instance();
+    let (begun, _) = begin(p, 99, "", &[], &mut Lend::roomy());
+    assert_eq!(begun.outcome, Outcome::Failed);
+    let (adopted, _) = {
+        // SAFETY: plain C data; all-zero is valid.
+        let mut i: AdoptIn = unsafe { std::mem::zeroed() };
+        i.side = 99;
+        let mut l = Lend::roomy();
+        i.sink = l.sink();
+        // SAFETY: plain C data; all-zero is valid.
+        let mut o: DoorOut = unsafe { std::mem::zeroed() };
+        // SAFETY: the live instance and all buffers remain lent for the call.
+        let r = unsafe { Safe::<Adopt>::enter(p, slot::ADOPT, &i, &mut o) };
+        (r, o.framing)
+    };
+    assert_eq!(adopted, Outcome::Failed);
+    shut(p);
+}
+
+#[test]
+fn encode_refuses_a_message_larger_than_the_wire_buffer_and_otherwise_copies_it() {
+    let encode = |body: &[u8], wire: usize| {
+        let mut l = Lend::new(wire, 64, 1, 0);
+        // SAFETY: plain C data; all-zero is valid.
+        let mut i: busbar_contract::abi::transport::EncodeIn = unsafe { std::mem::zeroed() };
+        i.body = body.as_ptr();
+        i.body_len = body.len();
+        i.sink = l.sink();
+        // SAFETY: plain C data; all-zero is valid.
+        let mut o: DoorOut = unsafe { std::mem::zeroed() };
+        // SAFETY: no instance is used by encode; the body and sink are lent for the call.
+        let r = unsafe { Safe::<Encode>::enter(std::ptr::null_mut(), slot::ENCODE, &i, &mut o) };
+        (r, o.yielded.wire_len, l.wire)
+    };
+    let (outcome, _, _) = encode(b"0123456789", 4);
+    assert_eq!(outcome, Outcome::Failed);
+    let (outcome, len, wire) = encode(b"0123456789", 16);
+    assert_eq!(outcome, Outcome::Ready);
+    assert_eq!(len, 10);
+    assert_eq!(&wire[..10], b"0123456789");
+}
+
+#[test]
+fn locate_refuses_a_target_that_is_not_text() {
+    let p = instance();
+    // SAFETY: plain C data; all-zero is valid.
+    let mut i: busbar_contract::abi::transport::LocateIn = unsafe { std::mem::zeroed() };
+    let bad = [0xff_u8, 0xfe];
+    i.target = AbiStr {
+        ptr: bad.as_ptr(),
+        len: bad.len(),
+    };
+    // SAFETY: plain C data; all-zero is valid.
+    let mut o: busbar_contract::abi::transport::LocateOut = unsafe { std::mem::zeroed() };
+    // SAFETY: the live instance and the lent target stay valid for the call.
+    let r = unsafe { Safe::<Locate>::enter(p, slot::LOCATE, &i, &mut o) };
+    assert_eq!(r, Outcome::Failed);
     shut(p);
 }

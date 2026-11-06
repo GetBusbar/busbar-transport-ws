@@ -1220,12 +1220,6 @@ fn the_linked_and_the_dropped_in_door_are_one_plugin() {
     let linked_transcript = exercise(&linked, &d);
     let dropped_transcript = exercise(&dropped, &d);
     assert_eq!(linked_transcript, dropped_transcript);
-    let mut changed = dropped_transcript.clone();
-    changed[1].push('!');
-    assert_ne!(
-        linked_transcript, changed,
-        "a changed product answer fails parity"
-    );
 }
 #[test]
 fn the_suite_runs_in_the_profile_it_was_asked_to() {

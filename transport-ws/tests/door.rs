@@ -907,9 +907,12 @@ const REFUSED_WHY: &[u8] =
 fn assert_answered(end: &End, status_line: &str) {
     let wire = String::from_utf8_lossy(&end.wire);
     assert!(wire.starts_with(status_line), "the wire answers: {wire:?}");
-    assert!(wire.contains("Connection: close\r\n"), "{wire:?}");
     if status_line.contains("426") {
         assert!(wire.contains("Sec-WebSocket-Version: 13\r\n"), "{wire:?}");
+        assert!(wire.contains("Upgrade: websocket\r\n"), "{wire:?}");
+        assert!(wire.contains("Connection: Upgrade, close\r\n"), "{wire:?}");
+    } else {
+        assert!(wire.contains("Connection: close\r\n"), "{wire:?}");
     }
     assert_eq!(
         end.failures,

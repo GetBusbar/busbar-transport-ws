@@ -34,6 +34,21 @@ enum Progress {
     Refused(RefusalCopy),
 }
 
+/// The library's 64 KiB handshake limit on an opening.
+const OPENING_MAX: usize = 65536;
+
+fn upgrade_required() -> Progress {
+    Progress::Refused(RefusalCopy {
+        status: 426,
+        fields: vec![
+            ("sec-websocket-version".into(), b"13".to_vec()),
+            ("upgrade".into(), b"websocket".to_vec()),
+            ("connection".into(), b"Upgrade, close".to_vec()),
+        ],
+        body: Vec::new(),
+    })
+}
+
 fn invalid_opening() -> Progress {
     Progress::Refused(RefusalCopy {
         status: 400,
@@ -227,12 +242,15 @@ pub(super) fn ingest(
         }
 
         let Some(opening) = admission.complete_opening() else {
-            if input.end != 0 || admission.opening.len() > 65536 {
+            if input.end != 0 || admission.opening.len() > OPENING_MAX {
                 return Ok(invalid_opening());
             }
             return Ok(Progress::Waiting);
         };
-        if admission.head_end.is_some_and(|length| length > 65536) {
+        if admission
+            .head_end
+            .is_some_and(|length| length > OPENING_MAX)
+        {
             return Ok(invalid_opening());
         }
         let parsed = match Request::try_parse(opening) {
@@ -242,8 +260,13 @@ pub(super) fn ingest(
         let Some((head_len, request)) = parsed else {
             return Ok(invalid_opening());
         };
-        if head_len > 65536 || !crate::transport::valid_opening_fields(&request) {
+        if head_len > OPENING_MAX || !crate::transport::valid_opening_fields(&request) {
             return Ok(invalid_opening());
+        }
+        match crate::transport::opening_refusal(&request) {
+            Some(false) => return Ok(invalid_opening()),
+            Some(true) => return Ok(upgrade_required()),
+            None => {}
         }
         admission.ticket = Some(ticket);
         let selected = admission

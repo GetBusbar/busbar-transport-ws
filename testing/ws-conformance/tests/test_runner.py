@@ -117,6 +117,10 @@ for index, arg in enumerate(sys.argv):
         self.environment["CONTROL_REPORT"] = json.dumps({"broken": {"2.1": {"behavior": "FAILED"}}})
         result = self.run_driver("--negative-control")
         self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn(
+            "the report did not catch the broken peer's echo corruption",
+            result.stdout + result.stderr,
+        )
 
     def test_the_recorded_echo_failure_remains_a_successful_negative_control(self):
         result = self.run_driver("--negative-control")
@@ -159,10 +163,7 @@ for index, arg in enumerate(sys.argv):
 class Manifest(unittest.TestCase):
     def test_the_subject_preserves_the_core_tcp_source_and_revision(self):
         revision = "de7af6404e1e281841c39a01d48fd2b405e2f1bc"
-        for source in [
-            "https://github.com/GetBusbar/busbar-transport-tcp",
-            "https://github.com/GetBusbar/busbar-transport-tcp",
-        ]:
+        for source in ["https://github.com/GetBusbar/busbar-transport-tcp"]:
             with self.subTest(source=source), tempfile.TemporaryDirectory(prefix="ws-manifest-") as temporary:
                 root = Path(temporary)
                 core = root / "core"
@@ -186,10 +187,7 @@ class Manifest(unittest.TestCase):
                 generated = tomllib.loads(manifest)
                 self.assertEqual(generated.get("patch", {}).get("crates-io"), workspace["patch"]["crates-io"],
                                  "the conformance subject must use the product's patched protocol library")
-                for core_source in [
-                    "https://github.com/GetBusbar/busbar",
-                    "https://github.com/GetBusbar/busbar",
-                ]:
+                for core_source in ["https://github.com/GetBusbar/busbar"]:
                     self.assertIn(
                         f'[patch."{core_source}"]\nbusbar-contract = {{ path = "{core}/crates/busbar-contract" }}',
                         manifest,

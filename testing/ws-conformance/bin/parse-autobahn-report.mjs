@@ -3,9 +3,9 @@
 // Copyright (C) 2026 Busbar Inc and contributors
 //
 // Reads Autobahn|Testsuite's `index.json` (the fuzzingclient's per-agent, per-case summary) and
-// decides pass/fail, then (optionally) writes a `verdict.json` in the schema
-// `docs/design/... CONFORMANCE-SYNC-DESIGN.md` §2 defines for every conformance suite's
-// aggregator to publish.
+// decides pass/fail, then (optionally) writes a `verdict.json` in the
+// `busbar.conformance.verdict/1` schema (the one testing/conformance/run.sh validates) for
+// the aggregator to publish.
 //
 // THE RULE: any case whose `behavior` is not `OK` is RED, with one allow-listed exception
 // (`INFORMATIONAL` — Autobahn's own "no verdict, informational only" cases, e.g. reserved-bits
@@ -14,7 +14,7 @@
 // would be grading on a curve nobody asked for.
 //
 // `UNIMPLEMENTED` IS A THIRD BUCKET, NEITHER PASS NOR FAIL. This suite's claim
-// (`conformance/registry.toml`) is RFC 6455 alone; Autobahn's default case set also drives its
+// (busbar's `conformance/registry.toml`) is RFC 6455 alone; Autobahn's default case set also drives its
 // separate permessage-deflate module (RFC 7692, case groups 12/13), and a peer that never
 // negotiates that extension is correctly scored `UNIMPLEMENTED` there, not `OK` and not `FAILED`.
 // Counting it as a pass would claim an extension busbar never negotiated; counting it as a
@@ -24,8 +24,8 @@
 //
 // FLOOR: an empty report (no agents, or an agent with zero cases) is RED. A suite that returns
 // vacuously green over a run that tested nothing is the exact failure mode
-// `testing/verdict-covers-every-leg.py`'s docstring is about, one level down: the aggregator
-// trusted a leg that "passed" by not running.
+// the aggregator could otherwise be fooled by, one level down: trusting a leg that "passed"
+// by not running.
 
 import { readFileSync, writeFileSync, realpathSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';

@@ -223,6 +223,18 @@ impl Read for Pipe {
     }
 }
 
+impl Drop for Pipe {
+    /// The recorded upgrade head can carry credentials (Authorization, Cookie); wipe it, and the
+    /// buffered bytes beside it, however the machine holding this pipe ends.
+    fn drop(&mut self) {
+        self.seen.zeroize();
+        // Consumed bytes stay in the ring's spare capacity: wipe the whole allocation.
+        let mut inbound: Vec<u8> = std::mem::take(&mut self.inbound).into();
+        inbound.zeroize();
+        self.outbound.zeroize();
+    }
+}
+
 impl Pipe {
     fn discard_heads(&mut self) {
         if self.head_at != 0 {
@@ -363,20 +375,12 @@ impl std::fmt::Debug for WsFramer {
 /// The RFC 6455 close code a [`CloseReason`] puts on the wire.
 pub(crate) fn close_code_for(reason: CloseReason) -> CloseCode {
     match reason {
-        CloseReason::Normal => CloseCode::Normal,
-
-        CloseReason::PeerClosed => CloseCode::Normal,
-
+        CloseReason::Normal | CloseReason::PeerClosed => CloseCode::Normal,
         CloseReason::Drain => CloseCode::Restart,
-
         CloseReason::Poisoned => CloseCode::Error,
-
         CloseReason::Revoked => CloseCode::Policy,
-
         CloseReason::Timeout => CloseCode::Again,
-
         CloseReason::TransportFailed => CloseCode::Protocol,
-
         CloseReason::CapacityExhausted => CloseCode::Size,
     }
 }
@@ -513,8 +517,8 @@ fn status_class(code: u16) -> WireStatusClass {
 }
 
 /// The `Retry-After` an answer states, in whole seconds from `now_secs` (Unix seconds), in
-/// either of RFC 9110's forms, as the http framer reads it: `delay-seconds`, or an IMF-fixdate
-/// converted to the seconds left until it (`0` once past).
+/// either of RFC 9110's forms, as the http framer reads it: `delay-seconds`, or an HTTP-date (any
+/// of its three forms) converted to the seconds left until it (`0` once past).
 pub(crate) fn retry_after(headers: &HeaderMap, now_secs: u64) -> Option<u64> {
     let raw = headers.get("retry-after")?.to_str().ok()?.trim();
     if let Some(n) = digits(raw, 10) {
@@ -532,8 +536,8 @@ fn digits(s: &str, radix: u32) -> Option<u64> {
     u64::from_str_radix(s, radix).ok()
 }
 
-/// An HTTP-date (RFC 9110 §5.6.7: the IMF-fixdate, and the two obsolete forms a recipient must
-/// accept) as Unix seconds, read by the protocol library (`httpdate`).
+/// An HTTP-date (RFC 9110 5.6.7: the IMF-fixdate, and the two obsolete forms a recipient must
+/// accept) as Unix seconds, read by `httpdate`, which accepts all three forms.
 fn imf_fixdate_secs(s: &str) -> Option<u64> {
     httpdate::parse_http_date(s)
         .ok()?
@@ -740,19 +744,23 @@ fn normalized_response(response: &UpgradeResponse, seen: &[u8]) -> Option<Vec<u8
     Some(normalized)
 }
 
-/// RFC 9110 combines repeated Connection fields into one ordered token list.
-fn normalized_request(request: &UpgradeRequest, seen: &[u8]) -> Option<Vec<u8>> {
-    let values: Vec<_> = request.headers().get_all("connection").iter().collect();
-    if values.len() < 2 {
-        return None;
-    }
-    let mut joined = Vec::new();
-    for (index, value) in values.into_iter().enumerate() {
-        if index != 0 {
-            joined.extend_from_slice(b", ");
-        }
+/// The values of a repeated field joined with `, ` in order (RFC 9110 5.3); `None` unless the field
+/// appears at least twice.
+fn joined_values(headers: &HeaderMap, name: &str) -> Option<Vec<u8>> {
+    let mut values = headers.get_all(name).iter();
+    let first = values.next()?;
+    let second = values.next()?;
+    let mut joined = first.as_bytes().to_vec();
+    for value in [second].into_iter().chain(values) {
+        joined.extend_from_slice(b", ");
         joined.extend_from_slice(value.as_bytes());
     }
+    Some(joined)
+}
+
+/// RFC 9110 combines repeated Connection fields into one ordered token list.
+fn normalized_request(request: &UpgradeRequest, seen: &[u8]) -> Option<Vec<u8>> {
+    let joined = joined_values(request.headers(), "connection")?;
     let mut normalized = Vec::with_capacity(seen.len());
     let mut inserted = false;
     for line in seen.split_inclusive(|byte| *byte == b'\n') {
@@ -798,6 +806,22 @@ pub(crate) fn valid_opening_fields(request: &UpgradeRequest) -> bool {
         && b"AQgw".contains(&key[21])
 }
 
+/// The refusal the accept path would give an opening after admission: `None` when acceptable,
+/// `Some(true)` for the 426 (unsupported version), `Some(false)` for any other 400. It runs the
+/// same checks the legacy path does: repeated Connection fields joined, then the library's.
+pub(crate) fn opening_refusal(request: &UpgradeRequest) -> Option<bool> {
+    let mut copy = request.clone();
+    if let Some(joined) = joined_values(request.headers(), "connection") {
+        let joined = HeaderValue::from_bytes(&joined).ok()?;
+        copy.headers_mut().insert("connection", joined);
+    }
+    match tungstenite::handshake::server::create_response(&copy) {
+        Ok(_) => None,
+        Err(WsError::Protocol(ProtocolError::MissingSecWebSocketVersionHeader)) => Some(true),
+        Err(_) => Some(false),
+    }
+}
+
 /// Answer a malformed accepted upgrade with the same refusal as the server handshake machine.
 fn refused_upgrade(
     error: WsError,
@@ -823,7 +847,7 @@ fn refused_opening(
     out: &mut dyn FramerOut,
 ) -> (Phase, bool, Option<Vec<u8>>) {
     let answer: &[u8] = if unsupported_version {
-        b"HTTP/1.1 426 Upgrade Required\r\nSec-WebSocket-Version: 13\r\nConnection: close\r\nContent-Length: 0\r\n\r\n"
+        b"HTTP/1.1 426 Upgrade Required\r\nSec-WebSocket-Version: 13\r\nUpgrade: websocket\r\nConnection: Upgrade, close\r\nContent-Length: 0\r\n\r\n"
     } else {
         b"HTTP/1.1 400 Bad Request\r\nConnection: close\r\nContent-Length: 0\r\n\r\n"
     };
@@ -1003,7 +1027,6 @@ impl WsFramer {
     pub(crate) fn refusal_with(
         &self,
         state: u64,
-        _stream: Option<StreamId>,
         bytes: &[u8],
         status: u32,
         out: &mut dyn FramerOut,
@@ -1017,7 +1040,7 @@ impl WsFramer {
                 }
             }
         }
-        let sent = self.emit(state, StreamId(0), bytes, true, false, out);
+        let sent = self.emit(state, bytes, true, false, out);
         self.close_with(state, close_code_of_status(status), out);
         sent?;
         out.end();
@@ -1198,9 +1221,10 @@ impl WsFramer {
                 match tungstenite::accept_with_config(Pipe::default(), config) {
                     Err(HandshakeError::Interrupted(mid)) => Phase::Accepting {
                         mid,
-                        request: Some(HandshakeMachine::start_read(Pipe {
-                            record_request: true,
-                            ..Pipe::default()
+                        request: Some(HandshakeMachine::start_read({
+                            let mut pipe = Pipe::default();
+                            pipe.record_request = true;
+                            pipe
                         })),
                         max,
                     },
@@ -1262,10 +1286,14 @@ impl WsFramer {
             .unwrap_or(0);
         match tungstenite::client::client_with_config(
             request,
-            Pipe {
+            {
+                #[allow(unused_mut)]
+                let mut pipe = Pipe::default();
                 #[cfg(feature = "test-seeded")]
-                seeded: self.seeded,
-                ..Pipe::default()
+                {
+                    pipe.seeded = self.seeded;
+                }
+                pipe
             },
             config,
         ) {
@@ -1353,9 +1381,9 @@ impl WsFramer {
                         .len()
                         .checked_sub(stream.inbound.len().saturating_add(tail.len()))
                         .ok_or(TransportError::HandshakeFailed)?;
-                    for byte in tail.into_iter().rev() {
-                        stream.inbound.push_front(byte);
-                    }
+                    let n = tail.len();
+                    stream.inbound.extend(tail);
+                    stream.inbound.rotate_right(n);
                     *response = Some(HandshakeMachine::start_read(stream));
                 }
                 RoundResult::StageFinished(StageResult::DoneWriting(_)) => {
@@ -1567,11 +1595,9 @@ impl WsFramer {
                     });
                     let (seen, carrier_ended) = shaken.unwrap_or_default();
                     let at = head_end(&seen).unwrap_or(seen.len());
-                    let pipe = Pipe {
-                        inbound: seen[at..].iter().copied().collect(),
-                        ended: carrier_ended,
-                        ..Pipe::default()
-                    };
+                    let mut pipe = Pipe::default();
+                    pipe.inbound = seen[at..].iter().copied().collect();
+                    pipe.ended = carrier_ended;
 
                     let declared = if bodiless {
                         Ok(Some(0))
@@ -1856,7 +1882,6 @@ impl WsFramer {
     pub(crate) fn emit(
         &self,
         state: u64,
-        _stream: StreamId,
         bytes: &[u8],
         end_of_frame: bool,
         text: bool,

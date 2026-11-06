@@ -7,6 +7,8 @@
 # member: this copies it to <dir>, points the busbar crates at the checkout, the ws logic crate at this repo,
 # and the tcp carrier at the rev busbar pins, and `[patch]`es the git forms of both so exactly one copy
 # of each links.
+# The subject is a TESTKIT, not product path: it drives only the connector's existing public listener API.
+# `ws-conformance-reference` is the independent control peer (std only, no busbar crate) the `--control` leg grades first.
 #
 #   subject-manifest.sh <dir>    prints <dir>/Cargo.toml on stdout
 set -euo pipefail

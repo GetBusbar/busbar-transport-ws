@@ -23,7 +23,7 @@
 # SCOPE: busbar's ws transport does not negotiate RFC 7692 permessage-deflate, so Autobahn scores
 # every case in groups 12/13 (its permessage-deflate module) `UNIMPLEMENTED` against a peer that
 # never asked for the extension — correctly, since nothing there is broken. This suite's claim
-# (`conformance/registry.toml`, this crate's own `standard` field) is RFC 6455 alone, so the parser
+# (busbar's `conformance/registry.toml`, this crate's own `standard` field) is RFC 6455 alone, so the parser
 # (`bin/parse-autobahn-report.mjs`) counts `UNIMPLEMENTED` as its own outcome, neither a pass nor a
 # failure, rather than either excluding those cases (which would hide a REAL regression the day
 # busbar starts answering the extension's handshake) or failing the suite over a spec it never
@@ -143,7 +143,7 @@ run_autobahn() {
     return 3
   fi
   cfg="$(mktemp)"
-  sed -e "s/__TAG__/$tag/" -e "s/__AGENT__/$agent/" -e "s/__PORT__/$port/" \
+  sed -e "s/__AGENT__/$agent/" -e "s/__PORT__/$port/" \
     "$ROOT/config/fuzzingclient.json.tmpl" > "$cfg"
   local docker_rc=0
   docker run --rm --network host \
@@ -174,7 +174,7 @@ case "$mode" in
     stop_peer
     [ "$rc" -eq 3 ] && exit 3
     [ "$rc" -eq 0 ] || exit "$rc"
-    node "$PARSER" --report "$REPORTS_DIR/control/index.json" --armed true --commit "${GITHUB_SHA:-local}" --out "$REPORTS_DIR/control/verdict.json"
+    node "$PARSER" --report "$REPORTS_DIR/control/index.json" --armed true --commit "${GITHUB_SHA:-$(git -C "$REPO_ROOT" rev-parse HEAD 2>/dev/null || echo local)}" --out "$REPORTS_DIR/control/verdict.json"
     ;;
   --negative-control)
     echo "$mode: Docker-live mode; runs in CI (crossbario/autobahn-testsuite vs the deliberately broken peer)." >&2
@@ -237,7 +237,7 @@ case "$mode" in
     [ "$rc" -eq 3 ] && exit 3
     [ "$rc" -eq 0 ] || { echo "RED: docker exited $rc -- the subject run did not complete" >&2; exit "$rc"; }
     mkdir -p "$REPORTS_DIR/subject"
-    node "$PARSER" --report "$REPORTS_DIR/subject/index.json" --armed "$armed" --commit "${GITHUB_SHA:-local}" --out "$REPORTS_DIR/subject/verdict.json"
+    node "$PARSER" --report "$REPORTS_DIR/subject/index.json" --armed "$armed" --commit "${GITHUB_SHA:-$(git -C "$REPO_ROOT" rev-parse HEAD 2>/dev/null || echo local)}" --out "$REPORTS_DIR/subject/verdict.json"
     exit $?
     ;;
   *)

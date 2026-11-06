@@ -2,6 +2,7 @@
 // Copyright (C) 2026 Busbar Inc and contributors
 
 use crate::frame::{Framed, FramerOut, HostTime, Side};
+use busbar_contract::transport::wire::CloseReason;
 use busbar_contract::transport::wire::{TransportError, WireStatusClass};
 use tungstenite::handshake::derive_accept_key;
 
@@ -733,7 +734,7 @@ fn a_refusal_closes_with_the_code_its_status_maps_to() {
             .expect("open");
         let mut refused = Out::default();
         framer
-            .refusal_with(state, None, b"no", status, &mut refused)
+            .refusal_with(state, b"no", status, &mut refused)
             .expect("refused");
         assert_eq!(close_code(&refused.sent), Some(code), "status {status}");
     }
@@ -806,7 +807,7 @@ fn a_refusal_is_not_glued_onto_a_gathered_partial_message() {
         .expect("gathered");
     let mut refused = Out::default();
     framer
-        .refusal_with(state, None, b"refused", 401, &mut refused)
+        .refusal_with(state, b"refused", 401, &mut refused)
         .expect("refused");
     let (_, payload) = first_data_payload(&refused.sent).expect("a data frame");
     assert_eq!(payload, b"refused".to_vec());
@@ -1143,5 +1144,164 @@ fn accepting_requires_host_and_one_valid_nonce() {
         let expected = if request == valid { b"HTTP/1.1 101" } else { b"HTTP/1.1 400" };
         assert!(out.sent.starts_with(expected), "{}", String::from_utf8_lossy(&out.sent));
         assert_eq!(out.ended, request != valid);
+    }
+}
+
+const ACCEPT_REQUEST: &[u8] = b"GET / HTTP/1.1\r\nHost: svc.test\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n";
+
+/// An accepted framing past its upgrade, and what answered it.
+fn upgraded(framer: &WsFramer) -> u64 {
+    let mut out = Out::default();
+    let state = framer.open(Side::Accept, "", &mut out).unwrap();
+    framer
+        .ingest(state, ACCEPT_REQUEST, false, &mut out)
+        .unwrap();
+    assert!(out.sent.starts_with(b"HTTP/1.1 101"));
+    state
+}
+
+#[test]
+fn a_framer_debug_states_its_message_ceiling_and_nothing_else() {
+    assert_eq!(
+        format!("{:?}", WsFramer::new(8)),
+        "WsFramer { max_message_bytes: 8, .. }"
+    );
+    assert_eq!(
+        format!("{:?}", WsFramer::new(0)),
+        "WsFramer { max_message_bytes: 0, .. }"
+    );
+}
+
+#[test]
+fn only_a_framing_past_its_upgrade_is_accepted() {
+    let framer = WsFramer::new(0);
+    assert!(!framer.accepted(999), "an unknown framing is not accepted");
+    let state = framer.open(Side::Accept, "", &mut Out::default()).unwrap();
+    assert!(!framer.accepted(state), "before its upgrade");
+    let open = upgraded(&framer);
+    assert!(framer.accepted(open));
+}
+
+#[test]
+fn bytes_after_a_refused_opening_are_dropped_unanswered() {
+    let framer = WsFramer::new(0);
+    let mut first = Out::default();
+    let state = framer.open(Side::Accept, "", &mut first).unwrap();
+    framer
+        .ingest(state, b"GET / HTTP/1.1\r\n\r\n", false, &mut first)
+        .unwrap();
+    assert!(first.sent.starts_with(b"HTTP/1.1 400"));
+    assert!(first.ended);
+    let mut later = Out::default();
+    framer
+        .ingest(state, &[0x82, 0x80, 1, 2, 3, 4], false, &mut later)
+        .unwrap();
+    assert!(later.sent.is_empty() && later.frames.is_empty());
+    assert!(!later.ended, "the refusal ended the stream once");
+    assert_eq!(framer.inbound_len(state), Some(0), "nothing is retained");
+    assert!(!framer.accepted(state));
+}
+
+#[test]
+fn a_dial_refuses_an_opening_field_the_request_cannot_carry() {
+    let framer = WsFramer::new(0);
+    for value in [&b"a\nb"[..], b"a\rb", b"a\0b"] {
+        let fields = vec![("x-note".to_string(), value.to_vec())];
+        assert!(
+            matches!(
+                framer.open_with(
+                    Side::Dial,
+                    "ws://127.0.0.1:9/x",
+                    &fields,
+                    &mut Out::default()
+                ),
+                Err(TransportError::HandshakeFailed)
+            ),
+            "{value:?}"
+        );
+    }
+    let fields = vec![("x-note".to_string(), b"fine".to_vec())];
+    assert!(framer
+        .open_with(
+            Side::Dial,
+            "ws://127.0.0.1:9/x",
+            &fields,
+            &mut Out::default()
+        )
+        .is_ok());
+}
+
+#[test]
+fn a_reserved_opcode_from_the_peer_fails_the_connection_with_a_protocol_close() {
+    for opcode in [0x3_u8, 0xb] {
+        let framer = WsFramer::new(0);
+        let state = upgraded(&framer);
+        let mut out = Out::default();
+        framer
+            .ingest(state, &[0x80 | opcode, 0x80, 1, 2, 3, 4], false, &mut out)
+            .unwrap();
+        assert!(
+            out.frames.is_empty(),
+            "opcode {opcode:#x} carries no message"
+        );
+        assert!(out.ended);
+        assert!(framer.failed(state), "opcode {opcode:#x}");
+        let mut closed = Out::default();
+        framer.close(state, CloseReason::Normal, &mut closed);
+        assert_eq!(
+            closed.sent,
+            [0x88, 0x02, 0x03, 0xea],
+            "closed with 1002, whatever the caller's reason"
+        );
+    }
+}
+
+#[test]
+fn an_accepted_framing_cannot_send_before_its_upgrade_completes() {
+    let framer = WsFramer::new(0);
+    let state = framer.open(Side::Accept, "", &mut Out::default()).unwrap();
+    let mut out = Out::default();
+    assert!(matches!(
+        framer.emit_text(state, b"early", true, false, &mut out),
+        Err(TransportError::Closed)
+    ));
+    assert!(out.sent.is_empty());
+}
+
+#[cfg(feature = "test-seeded")]
+#[test]
+fn a_seeded_dial_unmasks_medium_and_large_frames_under_the_zero_key() {
+    let framer = WsFramer::new(0);
+    let mut out = Out::default();
+    let state = framer
+        .open_with(Side::Dial, "ws://127.0.0.1:9/x", &[], &mut out)
+        .unwrap();
+    let request = String::from_utf8(out.sent).unwrap();
+    framer
+        .ingest(state, &switching(&request), false, &mut Out::default())
+        .unwrap();
+    for (len, head) in [
+        (200_usize, vec![0x82, 0xfe, 0x00, 0xc8]),
+        (
+            70_000,
+            [&[0x82, 0xff][..], &70_000_u64.to_be_bytes()].concat(),
+        ),
+    ] {
+        let payload: Vec<u8> = (0..len).map(|i| (i % 251) as u8).collect();
+        let mut sent = Out::default();
+        framer
+            .emit_text(state, &payload, true, false, &mut sent)
+            .unwrap();
+        assert_eq!(sent.sent[..head.len()], head[..], "{len}");
+        assert_eq!(
+            sent.sent[head.len()..head.len() + 4],
+            [0, 0, 0, 0],
+            "zero mask"
+        );
+        assert_eq!(
+            &sent.sent[head.len() + 4..],
+            &payload[..],
+            "payload in the clear"
+        );
     }
 }

@@ -36,11 +36,10 @@ tungstenite = { workspace = true, features = ["handshake"] }
 zeroize = { workspace = true }
 # The HTTP-date a refused upgrade's Retry-After states, read by the protocol library.
 httpdate = { workspace = true }
-# The door's settings blob is JSON (`door::read_settings`).
-serde_json = { workspace = true }
 
 [lints]
 workspace = true
 
 [dev-dependencies]
 jsonschema = { workspace = true }
+serde_json = { workspace = true }

@@ -85,7 +85,15 @@ async fn echo(mut conn: Connection) {
     let mut message: Vec<u8> = Vec::new();
 
     let mut text = false;
-    while let Ok(Some(piece)) = poll_fn(|cx| conn.poll_piece(cx)).await {
+    loop {
+        let piece = match poll_fn(|cx| conn.poll_piece(cx)).await {
+            Ok(Some(piece)) => piece,
+            Ok(None) => break,
+            Err(error) => {
+                eprintln!("ws-conformance-subject: poll_piece failed: {error:?}");
+                break;
+            }
+        };
         if piece.fields || piece.failed || piece.ends_stream() {
             continue;
         }

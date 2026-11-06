@@ -252,16 +252,7 @@ fn a_panic_in_one_framing_leaves_the_others_working() {
         out.wire.starts_with(b"HTTP/1.1 101"),
         "and answers its upgrade"
     );
-    let later = catch_unwind(AssertUnwindSafe(|| {
-        f.emit(
-            b,
-            busbar_contract::ids::StreamId(0),
-            b"ok",
-            true,
-            false,
-            &mut out,
-        )
-    }));
+    let later = catch_unwind(AssertUnwindSafe(|| f.emit(b, b"ok", true, false, &mut out)));
     assert!(matches!(later, Ok(Ok(()))), "and writes");
 }
 
@@ -756,14 +747,7 @@ fn an_emit_after_the_peers_close_finds_the_connection_closed() {
     f.ingest(s, &[0x88, 0x02, 0x03, 0xe8], false, &mut closed)
         .expect("the far end closes");
     assert!(closed.ended);
-    let r = f.emit(
-        s,
-        busbar_contract::ids::StreamId(0),
-        b"late",
-        true,
-        false,
-        &mut out,
-    );
+    let r = f.emit(s, b"late", true, false, &mut out);
     assert_eq!(r, Err(TransportError::Closed));
 }
 

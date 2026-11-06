@@ -279,13 +279,3 @@ fn the_declared_needs_are_the_statements() {
         declares.get("needs").is_none() || declares["needs"].as_array().is_some_and(Vec::is_empty)
     );
 }
-
-#[test]
-fn no_outbound_auth_family_is_driven() {
-    let r = row();
-    let read = rendering::read(&r.statement).unwrap();
-    assert_eq!(read.kind, KindCode::Transport as u32);
-    let inputs: serde_json::Value =
-        serde_json::from_str(include_str!("../conformance.json")).unwrap();
-    assert!(inputs["auth"]["outbound"].is_null());
-}

@@ -709,6 +709,31 @@ fn a_dialled_heads_reason_reaches_the_head_slots() {
     shut(p);
 }
 
+/// A head's reason phrase that finds the host's head slots taken is deferred, not dropped.
+#[test]
+fn a_second_heads_reason_is_deferred_when_the_head_slots_are_taken() {
+    let p = instance();
+    let (_, token) = begin(p, SIDE_DIAL, "ws://svc.test/x", &[], &mut Lend::roomy());
+    let mut lend = Lend::new(64 * 1024, 64 * 1024, 16, 1);
+    let mut heard = ingest(
+        p,
+        token,
+        b"HTTP/1.1 103 Early Hints\r\nX-Hint: yes\r\n\r\nHTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\n\r\n",
+        false,
+        &mut lend,
+    );
+    let mut reasons = heard.reasons.clone();
+    for _ in 0..8 {
+        if heard.flags & YIELD_MORE == 0 {
+            break;
+        }
+        heard = ingest(p, token, &[], false, &mut lend);
+        reasons.extend(heard.reasons.clone());
+    }
+    assert_eq!(reasons, [b"Early Hints".to_vec(), b"Unauthorized".to_vec()]);
+    shut(p);
+}
+
 /// An opening buffer is freed and wiped on Linux.
 #[test]
 fn an_opening_buffer_is_freed_and_wiped_on_linux() {
@@ -722,4 +747,35 @@ fn an_opening_buffer_is_freed_and_wiped_on_linux() {
     watch_free(owed.wire.as_ptr(), owed.wire.len(), SECRET);
     drop(owed);
     assert_freed_wiped();
+}
+
+/// A failed piece too big for the room left behind other bytes waits for a fill of its own, and is
+/// cut to that fill's room.
+#[test]
+fn a_failed_piece_too_big_for_the_room_left_waits_for_a_fill_of_its_own() {
+    let run = |owed: &mut Owed| {
+        let (mut frame, mut pieces, mut heads) = (
+            vec![0_u8; 10],
+            unsafe { std::mem::zeroed::<[FramePiece; 4]>() },
+            [HeadSlots::default(); 1],
+        );
+        let o = fill_from(owed, sink(&mut frame, &mut pieces, &mut heads));
+        let lens: Vec<_> = pieces[..o.yielded.pieces_len as usize]
+            .iter()
+            .map(|piece| piece.len)
+            .collect();
+        (lens, frame)
+    };
+    let mut owed = Owed::default();
+    owed.pieces
+        .push_back(Piece::plain(1, b"0123".to_vec(), true));
+    let mut failed = Piece::plain(1, vec![b'x'; 20], true);
+    failed.failed = true;
+    owed.pieces.push_back(failed);
+    let (lens, _) = run(&mut owed);
+    assert_eq!(lens, [4], "only the first piece went");
+    assert_eq!(owed.pieces.len(), 1);
+    let (lens, frame) = run(&mut owed);
+    assert_eq!(lens, [10], "the failed piece is cut to the room");
+    assert_eq!(frame, vec![b'x'; 10]);
 }

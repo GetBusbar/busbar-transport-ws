@@ -15,6 +15,7 @@ const GUID: &str = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 /// Close codes this peer sends.
 const PROTOCOL_ERROR: u16 = 1002;
 const INVALID_PAYLOAD: u16 = 1007;
+const MESSAGE_TOO_BIG: u16 = 1009;
 
 /// The longest handshake head this peer reads before refusing it.
 const MAX_HEAD: usize = 16 * 1024;
@@ -56,9 +57,19 @@ fn serve(stream: TcpStream) {
     };
     let mut reader = BufReader::with_capacity(64 * 1024, read_half);
     let mut writer = stream;
-    let Some(key) = read_handshake(&mut reader) else {
-        let _ = writer.write_all(b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n");
-        return;
+    let key = match read_handshake(&mut reader) {
+        Ok(key) => key,
+        Err(Refusal::Version) => {
+            // RFC 6455 section 4.4: an unsupported version is answered with the supported one.
+            let _ = writer.write_all(
+                b"HTTP/1.1 426 Upgrade Required\r\nSec-WebSocket-Version: 13\r\nContent-Length: 0\r\n\r\n",
+            );
+            return;
+        }
+        Err(Refusal::Malformed) => {
+            let _ = writer.write_all(b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n");
+            return;
+        }
     };
     let response = format!(
         "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\
@@ -73,9 +84,22 @@ fn serve(stream: TcpStream) {
     finish(&mut reader, &mut writer, end);
 }
 
-/// Read the request head and return its `Sec-WebSocket-Key`, or `None` for anything that is not
-/// a version-13 upgrade.
-fn read_handshake(reader: &mut impl BufRead) -> Option<String> {
+/// Why an opening was refused.
+#[derive(Debug, PartialEq)]
+enum Refusal {
+    /// A well-formed upgrade whose `Sec-WebSocket-Version` is not 13 (answered 426).
+    Version,
+    /// Anything else that is not a version-13 upgrade (answered 400).
+    Malformed,
+}
+
+/// Read the request head and return its `Sec-WebSocket-Key`, or why it is not a version-13 upgrade.
+fn read_handshake(reader: &mut impl BufRead) -> Result<String, Refusal> {
+    read_head(reader).unwrap_or(Err(Refusal::Malformed))
+}
+
+/// `None` for a malformed head; otherwise the key, or `Version` when only the version is wrong.
+fn read_head(reader: &mut impl BufRead) -> Option<Result<String, Refusal>> {
     let mut key = None;
     let mut version_ok = false;
     let mut upgrade_ok = false;
@@ -167,10 +191,13 @@ fn read_handshake(reader: &mut impl BufRead) -> Option<String> {
             _ => {}
         }
     }
-    if version_ok && upgrade_ok && connection_ok && host {
-        key
-    } else {
-        None
+    if !(upgrade_ok && connection_ok && host) {
+        return None;
+    }
+    match key {
+        Some(key) if version_ok => Some(Ok(key)),
+        Some(_) if version_seen => Some(Err(Refusal::Version)),
+        _ => None,
     }
 }
 
@@ -277,7 +304,7 @@ impl Session {
         };
 
         if len > MAX_MESSAGE.saturating_sub(self.message.len()) as u64 {
-            return Ok(Some(End::Fail(1009)));
+            return Ok(Some(End::Fail(MESSAGE_TOO_BIG)));
         }
         let mut left = len;
         let mut offset = 0usize;

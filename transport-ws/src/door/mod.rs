@@ -1322,10 +1322,7 @@ op!(
                 c.owed.ended = true;
                 return Ok(());
             }
-            let stream = stream.map(|stream| {
-                if c.owed.adopted.is_some() { StreamId(0) } else { stream }
-            });
-            f.refusal_with(token, stream, bytes, status, c)
+            f.refusal_with(token, bytes, status, c)
         })
     }
 );
@@ -1428,6 +1425,10 @@ fn fill(owed: &mut Owed, sink: Lent<'_, FramerSink>, o: &mut Out<'_, FramerOut>)
             take = take_of(piece, rest, room, true);
         }
         if take == 0 && !rest.is_empty() {
+            break;
+        }
+        // A reason that missed only for want of room this fill waits for the next one.
+        if piece.reason.is_some() && !with_reason && (frame_len > 0 || heads > 0) {
             break;
         }
         if let Some(reason) = piece.reason.take().filter(|_| with_reason) {
