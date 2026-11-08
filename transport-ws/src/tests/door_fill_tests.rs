@@ -30,10 +30,15 @@ thread_local! {
 /// A test slot: [`fill`] of the queue in [`OWED`] into the lent sink, as every framer op answers.
 struct Fill;
 impl SafeSlot for Fill {
+    type Kind = busbar_contract::plugin::markers::TransportKind;
     type In = FramingIn;
     type Out = DoorOut;
     type State = Held<Ws>;
-    fn call(_: Instance<'_, Held<Ws>>, i: Lent<'_, FramingIn>, mut o: Out<'_, DoorOut>) -> Outcome {
+    fn call(
+        _: Instance<'_, Held<Ws>, busbar_contract::plugin::markers::TransportKind>,
+        i: Lent<'_, FramingIn>,
+        mut o: Out<'_, DoorOut>,
+    ) -> Outcome {
         OWED.with(|c| {
             let mut owed = c.borrow_mut();
             fill(
@@ -49,10 +54,15 @@ impl SafeSlot for Fill {
 /// A test slot: the closure in [`POKE`], run on the open instance's state.
 struct Poke;
 impl SafeSlot for Poke {
+    type Kind = busbar_contract::plugin::markers::TransportKind;
     type In = FramingIn;
     type Out = DoorOut;
     type State = Held<Ws>;
-    fn call(p: Instance<'_, Held<Ws>>, _: Lent<'_, FramingIn>, _: Out<'_, DoorOut>) -> Outcome {
+    fn call(
+        p: Instance<'_, Held<Ws>, busbar_contract::plugin::markers::TransportKind>,
+        _: Lent<'_, FramingIn>,
+        _: Out<'_, DoorOut>,
+    ) -> Outcome {
         let ws = p.get().map(Held::life).expect("an open instance");
         POKE.with(|c| c.borrow_mut().take().expect("a closure to run"))(ws);
         Outcome::Ready

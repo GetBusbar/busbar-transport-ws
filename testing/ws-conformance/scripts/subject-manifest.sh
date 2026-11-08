@@ -39,7 +39,6 @@ done
 [ -n "$tcp_rev" ] || { echo "subject-manifest: no busbar-transport-tcp pin in $B/dist/default/Cargo.toml or $B/Cargo.toml" >&2; exit 1; }
 mkdir -p "$dir/src"
 cp "$here/src/"*.rs "$dir/src/"
-cp "$B/crates/busbar/src/root/doors.rs" "$dir/src/doors.rs"
 [ -f "$B/Cargo.lock" ] && cp "$B/Cargo.lock" "$dir/Cargo.lock"
 cat > "$dir/Cargo.toml" <<TOML
 [workspace]
@@ -62,7 +61,6 @@ path = "src/reference.rs"
 busbar-contract = { path = "$B/crates/busbar-contract" }
 busbar-core-connector = { path = "$B/crates/busbar-core-connector" }
 busbar-plugin-loader = { path = "$B/crates/plugin-loader" }
-busbar-kernel = { path = "$B/crates/busbar-kernel", default-features = false }
 busbar-transport-ws = { path = "$repo/transport-ws" }
 busbar-transport-tcp = { git = "$tcp_source", rev = "$tcp_rev" }
 serde_json = "1"

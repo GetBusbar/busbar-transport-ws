@@ -12,14 +12,7 @@ use busbar_core_connector::compose::{Connection, Failure};
 use busbar_core_connector::framer::FramerDoor;
 use busbar_core_connector::listen::{AcceptLimits, Listening};
 
-#[allow(dead_code)]
-mod doors;
-
-/// The loader reached by the copied root adapter.
-#[allow(unused_imports)]
-mod loader {
-    pub use busbar_plugin_loader::*;
-}
+use busbar_core_connector::doors;
 
 /// A door, admitted through the one dispatcher under its row's name and opened.
 fn open(key: &str, door: busbar_contract::abi::mechanism::door::DoorFn) -> Arc<dyn FramerDoor> {
@@ -42,19 +35,13 @@ fn open(key: &str, door: busbar_contract::abi::mechanism::door::DoorFn) -> Arc<d
 
 /// The `ws` door.
 fn ws_door() -> Arc<dyn FramerDoor> {
-    open(
-        busbar_transport_ws::linked::KEY,
-        busbar_transport_ws::door::door,
-    )
+    open("ws", busbar_transport_ws::door)
 }
 
 /// The carrier it frames over: the `tcp` door, served from the host's I/O.
 fn carrier() -> busbar_core_connector::compose::Via {
     busbar_core_connector::compose::Via {
-        door: open(
-            busbar_transport_tcp::linked::KEY,
-            busbar_transport_tcp::door,
-        ),
+        door: open("tcp", busbar_transport_tcp::door),
         io: busbar_core_connector::hostio::process(),
     }
 }

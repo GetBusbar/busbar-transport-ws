@@ -275,7 +275,10 @@ fn script(p: &Plugin<Transport>, caps: (usize, usize, usize)) -> Script {
 
 #[test]
 fn the_linked_and_the_dropped_in_door_are_one_framer() {
-    let d = Dispatcher::new(DispatchConfig::default());
+    let d = Dispatcher::new(
+        DispatchConfig::default(),
+        busbar_contract::services::test_caller_binding(),
+    );
     let linked: Plugin<Transport> = load_linked(&row(), bind(&d)).expect("the linked door loads");
     let dropped: Plugin<Transport> =
         load_dropped(&cdylib(), &row().statement, bind(&d)).expect("the dropped-in door loads");
@@ -299,7 +302,10 @@ fn the_linked_and_the_dropped_in_door_are_one_framer() {
 
 #[test]
 fn the_door_asked_for_as_another_kind_is_refused_both_ways() {
-    let d = Dispatcher::new(DispatchConfig::default());
+    let d = Dispatcher::new(
+        DispatchConfig::default(),
+        busbar_contract::services::test_caller_binding(),
+    );
     let want = (KindCode::Transport, KindCode::Hook);
     match load_linked::<Hook>(&row(), bind(&d)) {
         Err(LoadError::ManifestKind {

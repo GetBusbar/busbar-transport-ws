@@ -647,6 +647,7 @@ fn read_settings(bytes: &[u8]) -> Result<usize, Refusal> {
 /// The lifecycle: `validate`, `open` and `refresh` read the settings; a refresh's ceiling
 /// applies to framings begun after it (each framing keeps the ceiling it began under).
 impl Life for Ws {
+    type Kind = busbar_contract::plugin::markers::TransportKind;
     const CANCEL: u32 = CANCEL_NOTHING_MOVED;
 
     fn validate(settings: &[u8]) -> Result<(), Refusal> {
@@ -669,10 +670,15 @@ impl Life for Ws {
 /// `refresh`: the SDK's, and with no instance FAILED by name (the SDK's answers FAULT).
 pub(crate) struct Refresh;
 impl SafeSlot for Refresh {
+    type Kind = busbar_contract::plugin::markers::TransportKind;
     type In = RefreshIn;
     type Out = OutHead;
     type State = Held<Ws>;
-    fn call(p: Instance<'_, Held<Ws>>, i: Lent<'_, RefreshIn>, mut o: Out<'_, OutHead>) -> Outcome {
+    fn call(
+        p: Instance<'_, Held<Ws>, busbar_contract::plugin::markers::TransportKind>,
+        i: Lent<'_, RefreshIn>,
+        mut o: Out<'_, OutHead>,
+    ) -> Outcome {
         if p.get().is_none() {
             o.error("refresh: no open instance");
             return Outcome::Failed;
@@ -809,10 +815,11 @@ macro_rules! op {
         $(#[$doc])*
         pub(crate) struct $name;
         impl SafeSlot for $name {
+    type Kind = busbar_contract::plugin::markers::TransportKind;
             type In = $in;
             type Out = $out;
             type State = Held<Ws>;
-            fn call($p: Instance<'_, Held<Ws>>, $i: Lent<'_, $in>, mut $o: Out<'_, $out>) -> Outcome
+            fn call($p: Instance<'_, Held<Ws>, busbar_contract::plugin::markers::TransportKind>, $i: Lent<'_, $in>, mut $o: Out<'_, $out>) -> Outcome
                 $body
         }
     };
@@ -985,7 +992,7 @@ fn end_failed(f: &WsFramer, token: u64, owed: &mut Owed, ended_before: bool) {
 
 /// Run a framer method that opens a framing, then answer what it produced.
 fn opening(
-    p: &Instance<'_, Held<Ws>>,
+    p: &Instance<'_, Held<Ws>, busbar_contract::plugin::markers::TransportKind>,
     texts: &OpTexts,
     adopted: Option<Adoption>,
     policy: Option<policy::Admission>,
@@ -1047,7 +1054,7 @@ struct FramingInput {
 
 /// Run a framer method on framing `token`, then answer what it produced (and what was owed).
 fn framing(
-    p: &Instance<'_, Held<Ws>>,
+    p: &Instance<'_, Held<Ws>, busbar_contract::plugin::markers::TransportKind>,
     texts: &OpTexts,
     token: u64,
     sink: Lent<'_, FramerSink>,

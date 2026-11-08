@@ -237,7 +237,10 @@ fn answer(
 
 #[test]
 fn interim_heads_are_flagged_before_the_final_answer_linked_and_dropped() {
-    let dispatcher = Dispatcher::new(DispatchConfig::default());
+    let dispatcher = Dispatcher::new(
+        DispatchConfig::default(),
+        busbar_contract::services::test_caller_binding(),
+    );
     let linked: Plugin<Transport> = load_linked(&row(), bind(&dispatcher)).expect("linked door");
     let dropped: Plugin<Transport> =
         load_dropped(&cdylib(), &row().statement, bind(&dispatcher)).expect("dropped door");

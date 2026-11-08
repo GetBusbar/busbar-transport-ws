@@ -6,10 +6,10 @@
 
 #![deny(unsafe_code)]
 
-pub use busbar_transport_ws::*;
+pub use busbar_transport_ws::{door, linked, MACRO_DOOR};
 
 /// The exported door: the macro's `#[no_mangle]` symbol is the one exemption.
 #[allow(unsafe_code)]
 mod exported {
-    busbar_contract::export_door!(busbar_transport_ws::door::door);
+    busbar_contract::export_door!(busbar_transport_ws::door);
 }

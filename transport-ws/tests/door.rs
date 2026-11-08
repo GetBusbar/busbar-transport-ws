@@ -572,7 +572,7 @@ fn an_upgrade_answered_with_no_field_left_is_an_empty_head() {
 }
 
 fn linked() -> &'static Ops {
-    let d = busbar_transport_ws::door::door();
+    let d = busbar_transport_ws::door();
     // SAFETY: the door's `'static` table.
     unsafe { &*(*d).ops().cast::<Ops>() }
 }
@@ -591,7 +591,8 @@ fn a_recalled_exchange_answers_nothing_twice_and_drops_nothing() {
 #[test]
 fn the_ws_claim_opens_at_the_upgrade_and_composes_over_nothing() {
     use busbar_contract::abi::transport::{Claim, TransportTail, UNIT0_UPGRADE};
-    let st = busbar_transport_ws::door::STATEMENT;
+    // SAFETY: the actual door owns an immutable static Statement.
+    let st = unsafe { *busbar_transport_ws::door().parts().statement };
     // SAFETY: the Statement's kind tail is this crate's `'static` `TransportTail`, and its claim
     // rows are `claim_rows_len` `'static` rows.
     let tail = unsafe { &*st.kind_tail.cast::<TransportTail>() };
@@ -1609,7 +1610,8 @@ fn a_dial_asking_for_an_extension_is_refused_in_words() {
 #[test]
 fn the_tail_states_the_ops_the_door_serves() {
     use busbar_contract::abi::transport::{TransportTail, FACT_ACCEPTS, FACT_ADOPTS, FACT_DIALS};
-    let st = busbar_transport_ws::door::STATEMENT;
+    // SAFETY: the actual door owns an immutable static Statement.
+    let st = unsafe { *busbar_transport_ws::door().parts().statement };
     // SAFETY: the Statement's kind tail is this crate's `'static` `TransportTail`.
     let tail = unsafe { &*st.kind_tail.cast::<TransportTail>() };
     assert_eq!(tail.facts, FACT_ACCEPTS | FACT_DIALS | FACT_ADOPTS);

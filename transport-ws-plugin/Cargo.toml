@@ -26,12 +26,13 @@ tungstenite = { workspace = true, features = ["handshake"] }
 serde_json = { workspace = true }
 # The conformance test loads the linked door and dlopens the built cdylib over the REAL loader:
 # dev-only, never in the shipped artifact. Same pinned rev, so one busbar source resolves.
-busbar-plugin-loader = { workspace = true }
+busbar-plugin-loader = { workspace = true , features = ["test-support"] }
 # The published suite's scripted dial reads fixed bytes: the logic crate's test-only seed (a fixed
 # handshake key, all-zero masks). Cargo (resolver 2) unifies it onto every test build of the
 # workspace, the cdylib `cargo test` builds included; a shipped (non-test) build never has it. The
 # logic crate's framer tests build an unseeded framer (`WsFramer::unseeded`) for the shipped path.
 busbar-transport-ws = { path = "../transport-ws", features = ["test-seeded"] }
 
+busbar-contract = { workspace = true, features = ["test-seal"] }
 [lints]
 workspace = true

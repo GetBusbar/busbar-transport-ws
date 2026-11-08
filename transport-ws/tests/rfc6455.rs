@@ -82,7 +82,7 @@ impl Host {
 
     /// An instance opened with `settings` (JSON; empty = the host handed none).
     fn with_settings(settings: &[u8]) -> Self {
-        let d = busbar_transport_ws::door::door();
+        let d = busbar_transport_ws::door();
         // SAFETY: the door's `'static` table.
         let ops: &'static Ops = unsafe { &*(*d).ops().cast::<Ops>() };
         let mut i: OpenIn = z();
@@ -893,7 +893,7 @@ fn fragmented_messages_share_the_settings_ceiling() {
 fn validate_refuses_a_non_numeric_ceiling() {
     use busbar_contract::abi::mechanism::call::Blob;
     use busbar_contract::abi::mechanism::lifecycle::ValidateIn;
-    let d = busbar_transport_ws::door::door();
+    let d = busbar_transport_ws::door();
     // SAFETY: the door's `'static` table.
     let ops: &'static Ops = unsafe { &*(*d).ops().cast::<Ops>() };
     for (settings, want) in [

@@ -7,7 +7,7 @@
 #![deny(missing_docs)]
 
 mod claims;
-pub mod door;
+mod door;
 mod frame;
 mod meta;
 mod transport;
@@ -38,3 +38,6 @@ mod utf8_fail_fast_tests;
 #[allow(unsafe_code)]
 #[path = "tests/faults_tests.rs"]
 mod faults_tests;
+
+/// The validated entry and generated registration descriptor.
+pub use door::{door, MACRO_DOOR};

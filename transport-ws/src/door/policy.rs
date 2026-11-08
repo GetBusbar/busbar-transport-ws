@@ -112,7 +112,7 @@ impl Admission {
     fn hand_in(
         &mut self,
         request: &Request,
-        services: &Services,
+        services: &Services<busbar_contract::plugin::markers::TransportKind>,
         ticket: Ticket,
         conn: u64,
     ) -> Result<Option<RefusalCopy>, Refusal> {
@@ -210,7 +210,7 @@ impl Admission {
 
 /// `None` leaves an already admitted, adopted, dialled, or legacy framing to its usual path.
 pub(super) fn ingest(
-    p: &Instance<'_, Held<Ws>>,
+    p: &Instance<'_, Held<Ws>, busbar_contract::plugin::markers::TransportKind>,
     input: Lent<'_, IngestIn>,
     out: &mut Out<'_, FramerOut>,
 ) -> Option<Outcome> {
@@ -377,12 +377,13 @@ fn refusal_wire(refusal: RefusalCopy) -> Result<Vec<u8>, Refusal> {
 pub(super) struct Cancel;
 
 impl SafeSlot for Cancel {
+    type Kind = busbar_contract::plugin::markers::TransportKind;
     type In = CancelIn;
     type Out = CancelOut;
     type State = Held<Ws>;
 
     fn call(
-        p: Instance<'_, Self::State>,
+        p: Instance<'_, Self::State, busbar_contract::plugin::markers::TransportKind>,
         input: Lent<'_, CancelIn>,
         mut out: Out<'_, CancelOut>,
     ) -> Outcome {
