@@ -45,6 +45,7 @@ os.execv(os.environ['REAL_NODE'], [os.environ['REAL_NODE'], *sys.argv[1:]])
         self.executable("docker", """
 import json, os, sys, time
 from pathlib import Path
+Path(os.environ['DOCKER_ARGUMENTS']).write_text(json.dumps(sys.argv[1:]))
 if os.environ.get('BLOCK_DOCKER'):
     Path(os.environ['DOCKER_STARTED']).touch()
     while not Path(os.environ['DOCKER_RELEASE']).exists():
@@ -67,6 +68,7 @@ for index, arg in enumerate(sys.argv):
             PATH=str(self.bin) + os.pathsep + os.environ["PATH"],
             REAL_NODE=self.real_node,
             PEER_PID=str(self.root / "peer.pid"),
+            DOCKER_ARGUMENTS=str(self.root / "docker.arguments.json"),
             DOCKER_STARTED=str(self.root / "docker.started"),
             DOCKER_RELEASE=str(self.root / "docker.release"),
             CONTROL_REPORT=json.dumps({"broken": {"1.1.2": {"behavior": "FAILED"}}}),
@@ -125,6 +127,13 @@ for index, arg in enumerate(sys.argv):
     def test_the_recorded_echo_failure_remains_a_successful_negative_control(self):
         result = self.run_driver("--negative-control")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_autobahn_runs_as_the_host_report_owner(self):
+        result = self.run_driver("--negative-control")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        arguments = json.loads((self.root / "docker.arguments.json").read_text())
+        self.assertIn("--user", arguments, "Docker must not leave root-owned reports in the checkout")
+        self.assertEqual(arguments[arguments.index("--user") + 1], f"{os.getuid()}:{os.getgid()}")
 
     def owned_peer_is_running(self, pid):
         result = subprocess.run(["ps", "-p", str(pid), "-o", "command="], capture_output=True, text=True, check=False)

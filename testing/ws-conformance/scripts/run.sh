@@ -146,7 +146,9 @@ run_autobahn() {
   sed -e "s/__AGENT__/$agent/" -e "s/__PORT__/$port/" \
     "$ROOT/config/fuzzingclient.json.tmpl" > "$cfg"
   local docker_rc=0
-  docker run --rm --network host \
+  # Bind-mounted reports must stay owned by the runner, including on failed runs, so the
+  # next checkout can clean them without privileged teardown.
+  docker run --rm --network host --user "$(id -u):$(id -g)" \
     -v "$cfg:/config/fuzzingclient.json:ro" \
     -v "$outdir:/reports" \
     crossbario/autobahn-testsuite@sha256:519915fb568b04c9383f70a1c405ae3ff44ab9e35835b085239c258b6fac3074 \
