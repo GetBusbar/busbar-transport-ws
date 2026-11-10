@@ -341,6 +341,7 @@ pub(super) fn ingest(
                 admission.loans.cancel(ticket);
             }
             admission.opening.zeroize();
+            owed.ended = true;
             inst.framer.forget(input.framing);
             Some(out.fail(error))
         }
@@ -372,11 +373,14 @@ fn refusal_wire(refusal: RefusalCopy) -> Result<Vec<u8>, Refusal> {
         wire.extend_from_slice(value.as_bytes());
         wire.extend_from_slice(b"\r\n");
     }
-    if !length && status.as_u16() != 204 {
+    let bodiless = matches!(status.as_u16(), 204 | 304);
+    if !length && !bodiless {
         wire.extend_from_slice(format!("content-length: {}\r\n", refusal.body.len()).as_bytes());
     }
     wire.extend_from_slice(b"\r\n");
-    wire.extend_from_slice(&refusal.body);
+    if !bodiless {
+        wire.extend_from_slice(&refusal.body);
+    }
     Ok(wire)
 }
 

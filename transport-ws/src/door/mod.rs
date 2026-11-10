@@ -337,6 +337,11 @@ impl HttpAnswer {
                         .rsplit(|byte| *byte == b',')
                         .next()
                         .is_some_and(|last| last.trim_ascii().eq_ignore_ascii_case(b"chunked"))
+                    || value
+                        .split(|byte| *byte == b',')
+                        .filter(|t| t.trim_ascii().eq_ignore_ascii_case(b"chunked"))
+                        .count()
+                        > 1
                 {
                     return Err(TransportError::Framing);
                 }
@@ -414,7 +419,7 @@ impl HttpAnswer {
             return Err(TransportError::Framing);
         }
         self.remaining = remaining;
-        if !self.chunked || self.bodyless {
+        if !self.chunked {
             return Ok(bytes.to_vec());
         }
         let mut wire = Vec::new();
@@ -1096,6 +1101,13 @@ fn framing(
             fill(owed, sink, o);
             return Outcome::Ready;
         }
+        // A framing whose framer state was already removed (e.g. an HTTP prewire answer)
+        // and whose output has been fully drained is finished: a stale timer or drain re-call
+        // is a no-op, not an error.
+        if !alive && !input.fresh && owed.ended {
+            fill(owed, sink, o);
+            return Outcome::Ready;
+        }
 
         if inst.framer.holds(token) || !alive {
             o.error((texts.why)(&e));
@@ -1415,7 +1427,11 @@ fn fill(owed: &mut Owed, sink: Lent<'_, FramerSink>, o: &mut Out<'_, FramerOut>)
         if piece.reason.is_some() && !with_reason && (frame_len > 0 || heads > 0) {
             break;
         }
-        if let Some(reason) = piece.reason.take().filter(|_| with_reason) {
+        if let Some(reason) = if with_reason {
+            piece.reason.take()
+        } else {
+            None
+        } {
             frame.extend(&reason);
             slots.push(HeadSlots {
                 stream,
