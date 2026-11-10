@@ -1101,10 +1101,10 @@ fn framing(
             fill(owed, sink, o);
             return Outcome::Ready;
         }
-        // A framing whose framer state was already removed (e.g. an HTTP prewire answer)
-        // and whose output has been fully drained is finished: a stale timer or drain re-call
-        // is a no-op, not an error.
-        if !alive && !input.fresh && owed.ended {
+        // An HTTP prewire answer removes its WebSocket state before completing the
+        // response. Once drained, stale timers remain harmless for that HTTP answer only;
+        // a closed WebSocket still reports its closed state.
+        if !alive && !input.fresh && owed.ended && matches!(owed.prewire, Prewire::Http(_)) {
             fill(owed, sink, o);
             return Outcome::Ready;
         }

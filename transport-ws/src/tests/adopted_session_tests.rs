@@ -83,6 +83,18 @@ fn streams(l: &Lend, answer: &Said, stream: u64) {
     }
 }
 
+fn timer(p: *mut c_void, token: u64, l: &mut Lend) -> Said {
+    // SAFETY: plain C data; all-zero is valid.
+    let mut i: FramingIn = unsafe { std::mem::zeroed() };
+    i.framing = token;
+    i.sink = l.sink();
+    // SAFETY: plain C data; all-zero is valid.
+    let mut o: DoorOut = unsafe { std::mem::zeroed() };
+    // SAFETY: the live instance and sink buffers remain lent for the call.
+    let r = unsafe { Safe::<Timer>::enter(p, slot::TIMER, &i, &mut o) };
+    said(r, &o, l)
+}
+
 #[test]
 fn adoption_keeps_the_inherited_stream_from_initial_leftovers_through_finish() {
     for stream in [0, 1, 37, u64::MAX] {
@@ -562,6 +574,7 @@ fn prewire_commit_uses_existing_emit_and_postcommit_refusal_stays_websocket() {
     assert!(refused.wire.starts_with(b"\x82\x06denied"));
     assert!(!refused.wire.starts_with(b"HTTP/"));
     assert_ne!(refused.flags & YIELD_ENDED, 0);
+    assert_eq!(timer(p, token, &mut l).outcome, Outcome::Failed);
     finish(p, token, &mut l);
     shut(p);
 }
@@ -587,6 +600,10 @@ fn prewire_refuse_before_head_is_http_and_discards_owed_upgrade_and_frames() {
     assert!(!refused.wire.windows(12).any(|v| v == b"HTTP/1.1 101"));
     assert!(refused.pieces.is_empty());
     assert_ne!(refused.flags & YIELD_ENDED, 0);
+    let stale = timer(p, token, &mut roomy);
+    assert_eq!(stale.outcome, Outcome::Ready);
+    assert_eq!(stale.flags, YIELD_ENDED);
+    assert!(stale.wire.is_empty() && stale.pieces.is_empty());
     finish(p, token, &mut roomy);
     poke(p, move |inst| {
         assert!(!inst.queues().contains_key(&token));
