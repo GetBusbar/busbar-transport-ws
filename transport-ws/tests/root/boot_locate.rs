@@ -16,20 +16,18 @@ fn actual_ws_locates_before_open_without_network_or_runtime_state() {
         dispatcher: on.adopter(),
         conns: ConnTable::NoNeeds,
     };
-    for (door, target, secure) in [(
+    let (door, target, secure) = (
         busbar_transport_ws::door as busbar_contract::abi::mechanism::door::DoorFn,
         "wss://unreachable.invalid:9443/path",
         true,
-    )] {
-        let plugin = crate::root::test_plugins::linked_transport(door, binding());
-        assert!(!plugin.is_open());
-        let located =
-            crate::root::doors::locate_bound(&plugin, target).expect("pure pre-open locate");
-        assert_eq!(located.secure, secure);
-        assert!(located.authority.ends_with(":9443"));
-        assert!(
-            !plugin.is_open(),
-            "LOCATE must not transition lifecycle state"
-        );
-    }
+    );
+    let plugin = crate::root::test_plugins::linked_transport(door, binding());
+    assert!(!plugin.is_open());
+    let located = crate::root::doors::locate_bound(&plugin, target).expect("pure pre-open locate");
+    assert_eq!(located.secure, secure);
+    assert!(located.authority.ends_with(":9443"));
+    assert!(
+        !plugin.is_open(),
+        "LOCATE must not transition lifecycle state"
+    );
 }
