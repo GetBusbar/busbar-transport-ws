@@ -34,7 +34,7 @@
 #
 # THIS SCRIPT then holds each verdict to the schema (an absent, unreadable or mismatched verdict is
 # `fail`, never skipped), stamps what the suite's freshness is judged by (`repo`, `commit`,
-# `core_pin`, `run_id`, `evidence`: the ModernCI move, `generated_at`) and writes it to
+# `core_pin`, `run_id`, `evidence`: the native CI job or ModernCI move, `generated_at`) and writes it to
 # target/conformance/verdicts/<id>.json, the check's output. A successful nonempty run also writes
 # invocation.json binding its source inputs and verdict hashes; completed failed suites also carry
 # their actual exit code. Importing PASS requires the job's green result and receipt exit zero.
@@ -54,7 +54,7 @@ say() { printf 'conformance: %s\n' "$*" >&2; }
 # judge <raw verdict> <suite id> <command rc> <out file>: the verdict as published, or exit 1.
 judge() {
   python3 -I - "$@" <<'PY'
-import json, sys, os, stat, datetime, urllib.parse
+import json, sys, os, stat, datetime, urllib.parse, re
 raw, suite, rc, out = sys.argv[1], sys.argv[2], int(sys.argv[3]), sys.argv[4]
 SCHEMA = "busbar.conformance.verdict/1"
 MAX_VERDICT_BYTES = 1024 * 1024
@@ -132,8 +132,17 @@ v["schema"] = SCHEMA
 v["repo"] = repo
 v["commit"] = head
 v["core_pin"] = env["BUSBAR_PIN"]
-url = env["CONF_MCI_URL"].rstrip("/") + "/move?" + urllib.parse.urlencode({"repo": repo, "from": frm, "head": head})
-v["run_id"] = "modernci:" + repo + "@" + head + ":conformance"
+if env.get("CI_SERVER_HOST"):
+    job, pipeline = env.get("CI_JOB_ID", ""), env.get("CI_PIPELINE_ID", "")
+    url = env.get("CI_JOB_URL", "")
+    expected_url = "https://" + env["CI_SERVER_HOST"] + "/" + repo + "/-/jobs/" + job
+    if not all(re.fullmatch(r"[1-9][0-9]*", value) for value in (job, pipeline)) or url != expected_url:
+        print("cannot publish conformance verdict: native CI job identity is missing or inconsistent", file=sys.stderr)
+        sys.exit(1)
+    v["run_id"] = f"gitlab:{repo}@{head}:pipeline:{pipeline}:job:{job}"
+else:
+    url = env["CONF_MCI_URL"].rstrip("/") + "/move?" + urllib.parse.urlencode({"repo": repo, "from": frm, "head": head})
+    v["run_id"] = "modernci:" + repo + "@" + head + ":conformance"
 v["evidence"] = url
 v["generated_at"] = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 try:
@@ -151,7 +160,7 @@ PY
 # Each bounded command owns a process group; argv stays separate from shell syntax.
 run_bounded() {
   python3 -I - "$@" <<'PYTIMEOUT'
-import ctypes, os, signal, subprocess, sys, time
+import ctypes, errno, os, signal, subprocess, sys, time
 budget, label, *command = sys.argv[1:]
 # Linux can adopt and reap orphaned grandchildren after their process group is terminated.
 if sys.platform.startswith("linux"):
@@ -159,6 +168,31 @@ if sys.platform.startswith("linux"):
     if libc.prctl(36, 1, 0, 0, 0) != 0:  # PR_SET_CHILD_SUBREAPER
         raise OSError(ctypes.get_errno(), "cannot supervise command descendants")
 process, pending_signal = None, 0
+
+def signal_owned_group(signum):
+    try:
+        os.killpg(process.pid, signum)
+    except ProcessLookupError:
+        pass
+    except PermissionError as error:
+        # XNU killpg1 excludes SZOMB members and returns EPERM if a retained
+        # group has no signalable members. A reaped leader alone is not proof:
+        # refuse to suppress denied cleanup if any live descendant remains.
+        # https://github.com/apple-oss-distributions/xnu/blob/main/bsd/kern/kern_sig.c
+        if (sys.platform != "darwin" or error.errno != errno.EPERM
+                or process.poll() is None):
+            raise
+        table = subprocess.check_output(
+            ["/bin/ps", "-axo", "pgid=,stat="], text=True, timeout=1)
+        rows = [line.split() for line in table.splitlines() if line.strip()]
+        if not rows:
+            raise RuntimeError("cannot establish completed process-group state")
+        for row in rows:
+            if len(row) != 2 or not row[0].isdigit() or not row[1]:
+                raise RuntimeError("cannot parse process-group state")
+            if int(row[0]) == process.pid and not row[1].startswith("Z"):
+                raise
+
 def interrupted(signum, frame):
     global pending_signal
     pending_signal = signum
@@ -183,18 +217,12 @@ finally:
     signal.signal(signal.SIGTERM, signal.SIG_IGN)
     signal.signal(signal.SIGINT, signal.SIG_IGN)
     if process is not None:
-        try:
-            os.killpg(process.pid, signal.SIGTERM)
-        except ProcessLookupError:
-            pass
+        signal_owned_group(signal.SIGTERM)
         try:
             process.wait(timeout=1)
         except subprocess.TimeoutExpired:
             pass
-        try:
-            os.killpg(process.pid, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
+        signal_owned_group(signal.SIGKILL)
         process.wait(timeout=1)
         deadline = time.monotonic() + 1
         while True:
@@ -228,7 +256,8 @@ def digest(path):
     return hashlib.sha256(path.read_bytes()).hexdigest()
 def inputs():
     required = ("testing/conformance/run.sh", "testing/conformance/tools.sh", "testing/conformance/suites.tsv")
-    optional = (".busbar-ref", "Cargo.toml", "Cargo.lock", "rust-toolchain", "rust-toolchain.toml")
+    optional = (".busbar-ref", "Cargo.toml", "Cargo.lock", "rust-toolchain", "rust-toolchain.toml",
+                "testing/conformance/capabilities.py")
     return {name: digest(root / name) for name in required + optional if name in required or (root / name).is_file()}
 try:
     if phase == "start":
@@ -255,6 +284,7 @@ PYINVOCATION
 }
 
 selftest() (
+  unset CI_SERVER_HOST CI_JOB_ID CI_PIPELINE_ID CI_JOB_URL
   export MODERNCI_REPO=selftest/repo
   local t; t="$(mktemp -d)"; trap 'rm -rf "$t"' EXIT
   export BUSBAR_PIN=0000000000000000000000000000000000000000 CONF_REPO=selftest/repo CONF_HEAD=1111111111111111111111111111111111111111 CONF_MCI_URL="$MCI_URL"
@@ -283,6 +313,12 @@ selftest() (
   judge <(printf '%s' '{"suite":"s1","status":"pass","armed":true}') s1 0 "$t/out.json" >/dev/null
   python3 -I -c 'import json,sys; v=json.load(open(sys.argv[1])); assert v["repo"]=="selftest/repo" and v["core_pin"].startswith("0000") and v["evidence"].endswith("&head=1111111111111111111111111111111111111111"), v' "$t/out.json" \
     && echo "  ok: the stamp names the repo, the commit, the core pin and the move" || { echo "selftest FAILED: the stamp"; ok=1; }
+  export CI_SERVER_HOST=github.com CI_JOB_ID=2371 CI_PIPELINE_ID=1420 CI_JOB_URL=https://github.com/selftest/repo/-/jobs/2371
+  judge <(printf '%s' '{"suite":"s1","status":"pass","armed":true}') s1 0 "$t/out.json" >/dev/null
+  python3 -I -c 'import json,sys; v=json.load(open(sys.argv[1])); assert v["run_id"]=="gitlab:selftest/repo@1111111111111111111111111111111111111111:pipeline:1420:job:2371" and v["evidence"]=="https://github.com/selftest/repo/-/jobs/2371", v' "$t/out.json" \
+    && echo "  ok: native evidence names the actual GitLab job" || { echo "selftest FAILED: native stamp"; ok=1; }
+  unset CI_PIPELINE_ID
+  expect 1 "incomplete native identity cannot claim ModernCI evidence" '{"suite":"s1","status":"pass","armed":true}' 0
   return "$ok"
 )
 
@@ -420,8 +456,10 @@ fi
 
 invocation_receipt start || exit 2
 
-# shellcheck source=testing/conformance/tools.sh
-. testing/conformance/tools.sh "${tools[@]}" || { say "the pinned tools could not be provisioned"; exit 2; }
+if [ -z "${CONFORMANCE_CAPABILITIES+x}" ]; then
+  # shellcheck source=testing/conformance/tools.sh
+  . testing/conformance/tools.sh "${tools[@]}" || { say "the pinned tools could not be provisioned"; exit 2; }
+fi
 
 fail=0; n=0
 while IFS=$'\t' read -r id cmd || [ -n "$id" ]; do
@@ -432,7 +470,13 @@ while IFS=$'\t' read -r id cmd || [ -n "$id" ]; do
   dir="$OUT/$id"; mkdir -p "$dir"
   say "=== $id: $cmd"
   start=$(date +%s); rc=0
-  ( export CONFORMANCE_SUITE="$id" CONFORMANCE_OUT="$dir"; run_suite "$cmd" ) || rc=$?
+  if [ -n "${CONFORMANCE_CAPABILITIES+x}" ] && ! python3 -I testing/conformance/capabilities.py "$id" "$dir/verdict.json"; then
+    # Missing isolated fixtures are required failures, never skips or permission
+    # to expose the host Docker daemon/network to candidate suite commands.
+    rc=1
+  else
+    ( export CONFORMANCE_SUITE="$id" CONFORMANCE_OUT="$dir"; run_suite "$cmd" ) || rc=$?
+  fi
   say "$id: command exit $rc after $(( $(date +%s) - start ))s"
   if res="$(judge "$dir/verdict.json" "$id" "$rc" "$OUT/verdicts/$id.json")"; then
     say "$id: PASS"
