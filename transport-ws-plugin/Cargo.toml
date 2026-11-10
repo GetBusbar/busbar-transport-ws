@@ -36,3 +36,6 @@ busbar-transport-ws = { path = "../transport-ws", features = ["test-seeded"] }
 busbar-contract = { workspace = true, features = ["test-seal"] }
 [lints]
 workspace = true
+
+[package.metadata.busbar.test-artifacts]
+cdylib = ["BUSBAR_TEST_WS_CDYLIB"]
