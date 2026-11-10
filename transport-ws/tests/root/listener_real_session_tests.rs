@@ -83,10 +83,8 @@ async fn real_framer() -> (tokio::sync::MutexGuard<'static, ()>, DataFramer) {
         busbar_kernel::host_services::caller_binding(),
     ));
     assert!(crate::root::inbound::install(&dispatcher));
-    let http = crate::root::test_plugins::linked_transport(
-        busbar_transport_http::door,
-        bind_on(&dispatcher),
-    );
+    let http =
+        crate::root::test_plugins::linked_transport(assembled_http_peer(), bind_on(&dispatcher));
     let ws = crate::root::test_plugins::linked_transport(
         busbar_transport_ws::door,
         bind_on(&dispatcher),

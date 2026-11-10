@@ -1,6 +1,21 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Busbar Inc and contributors
 
+// The peer is supplied by the assembling host through the transport kind declaration.
+fn assembled_http_peer() -> busbar_contract::abi::mechanism::door::DoorFn {
+    crate::dist_root_install::install();
+    let mut peers = crate::LINKED_TRANSPORT_DOORS
+        .iter()
+        .filter_map(|(_, door)| {
+            let facts = crate::root::loader::dispatch::kinds::transport::stated(*door)
+                .expect("assembled transport has a valid kind declaration");
+            facts.claims.contains(&"http").then_some(*door)
+        });
+    let peer = peers.next().expect("the assembly supplies the HTTP peer");
+    assert!(peers.next().is_none(), "the HTTP peer claim is unambiguous");
+    peer
+}
+
 async fn actual_session_framer() -> (
     tokio::sync::MutexGuard<'static, ()>,
     DataFramer,
@@ -15,7 +30,7 @@ async fn actual_session_framer() -> (
     ));
     assert!(crate::root::inbound::install(&dispatcher));
     let http = ObservedDoor::new(actual_transport_on(
-        busbar_transport_http::door,
+        assembled_http_peer(),
         dispatcher.clone(),
     ));
     #[cfg(feature = "transport-ws")]
