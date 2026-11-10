@@ -41,3 +41,6 @@ mod faults_tests;
 
 /// The validated entry and generated registration descriptor.
 pub use door::{door, MACRO_DOOR};
+
+// Source-owned integration tests are compiled only by the assembling host test harness.
+include!(concat!(env!("OUT_DIR"), "/context_test_source.rs"));
