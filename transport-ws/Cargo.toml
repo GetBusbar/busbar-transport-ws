@@ -44,3 +44,7 @@ workspace = true
 jsonschema = { workspace = true }
 serde_json = { workspace = true }
 busbar-contract = { workspace = true, features = ["test-seal"] }
+
+[package.metadata.busbar.test-contexts]
+listener_session = [{ path = "tests/root/listener_session.rs" }]
+boot_session_locate = [{ path = "tests/root/boot_locate.rs" }]
