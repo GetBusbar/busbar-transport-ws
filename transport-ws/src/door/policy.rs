@@ -299,7 +299,10 @@ pub(super) fn ingest(
             inst.framer.forget(input.framing);
             let wire = match refusal_wire(refusal) {
                 Ok(wire) => wire,
-                Err(error) => return Some(out.fail(error)),
+                Err(error) => {
+                    owed.ended = true;
+                    return Some(out.fail(error));
+                }
             };
             owed.push(&wire, false);
             owed.ended = true;
@@ -326,7 +329,10 @@ pub(super) fn ingest(
                     fill(collect.owed, input.field(|x| &x.sink), out);
                     Some(Outcome::Ready)
                 }
-                Err(error) => Some(out.fail(Refusal::failed((INGEST.why)(&error)))),
+                Err(error) => {
+                    collect.owed.ended = true;
+                    Some(out.fail(Refusal::failed((INGEST.why)(&error))))
+                }
             }
         }
         Err(error) => {
@@ -345,7 +351,7 @@ fn refusal_wire(refusal: RefusalCopy) -> Result<Vec<u8>, Refusal> {
     use tungstenite::http::{HeaderName, HeaderValue, StatusCode};
     let status = u16::try_from(refusal.status)
         .ok()
-        .filter(|status| (100..=599).contains(status))
+        .filter(|status| (200..=599).contains(status))
         .and_then(|status| StatusCode::from_u16(status).ok())
         .ok_or_else(|| Refusal::failed("ingest: the host refusal has an invalid status"))?;
     let mut wire = format!(
@@ -366,7 +372,7 @@ fn refusal_wire(refusal: RefusalCopy) -> Result<Vec<u8>, Refusal> {
         wire.extend_from_slice(value.as_bytes());
         wire.extend_from_slice(b"\r\n");
     }
-    if !length {
+    if !length && status.as_u16() != 204 {
         wire.extend_from_slice(format!("content-length: {}\r\n", refusal.body.len()).as_bytes());
     }
     wire.extend_from_slice(b"\r\n");

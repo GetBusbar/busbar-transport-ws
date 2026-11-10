@@ -297,7 +297,7 @@ fn refused_upgrade_status_boundaries_keep_their_existing_classes_and_close_codes
     }
     for (status, close) in [
         (301, 1000),
-        (404, 1000),
+        (404, 1008),
         (401, 1008),
         (403, 1008),
         (413, 1009),

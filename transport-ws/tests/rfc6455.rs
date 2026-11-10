@@ -483,8 +483,8 @@ fn each_close_reason_puts_its_own_code_on_the_wire() {
         (CLOSE_POISONED, 1011),
         (CLOSE_REVOKED, 1008),
         (CLOSE_TIMEOUT, 1013),
-        (CLOSE_TRANSPORT_FAILED, 1002),
-        (CLOSE_CAPACITY_EXHAUSTED, 1009),
+        (CLOSE_TRANSPORT_FAILED, 1011),
+        (CLOSE_CAPACITY_EXHAUSTED, 1013),
     ] {
         let mut h = Host::new();
         let f = h.accept();

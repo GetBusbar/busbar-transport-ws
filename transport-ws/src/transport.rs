@@ -380,8 +380,8 @@ pub(crate) fn close_code_for(reason: CloseReason) -> CloseCode {
         CloseReason::Poisoned => CloseCode::Error,
         CloseReason::Revoked => CloseCode::Policy,
         CloseReason::Timeout => CloseCode::Again,
-        CloseReason::TransportFailed => CloseCode::Protocol,
-        CloseReason::CapacityExhausted => CloseCode::Size,
+        CloseReason::TransportFailed => CloseCode::Error,
+        CloseReason::CapacityExhausted => CloseCode::Again,
     }
 }
 
@@ -923,13 +923,14 @@ fn answered_body(
 
 /// The close code a refusal's neutral status maps to (a neutral status the transport maps to
 /// its wire; RFC 6455 §7.4.1): the caller's credential refused or a policy, `1008`; too big,
-/// `1009`; throttled or unavailable, `1013` (try again later); another server failure, `1011`;
-/// none stated (`0`) or any other, the orderly `1000`.
+/// `1009`; throttled or unavailable, `1013` (try again later); another client fault, `1008`;
+/// a server failure, `1011`; none stated (`0`) or any other, the orderly `1000`.
 pub(crate) fn close_code_of_status(status: u32) -> CloseCode {
     match status {
         401 | 403 => CloseCode::Policy,
         413 => CloseCode::Size,
         429 | 503 => CloseCode::Again,
+        400..=499 => CloseCode::Policy,
         500..=599 => CloseCode::Error,
         _ => CloseCode::Normal,
     }

@@ -627,7 +627,7 @@ const BAD_BODY_MAX: &str =
 /// transport declares, its ceiling a count above 0.
 fn read_settings(bytes: &[u8]) -> Result<usize, Refusal> {
     let object = settings_reading(bytes, &SETTING_ROWS).map_err(|why| {
-        if why.text() == Some("settings: limits.request_body_max_bytes must be a count above 0") {
+        if why.text().is_some_and(|t| t.contains(BODY_MAX_BYTES)) {
             Refusal::failed(BAD_BODY_MAX)
         } else {
             why
