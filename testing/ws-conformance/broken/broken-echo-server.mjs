@@ -12,7 +12,7 @@
 //
 // Prints `BROKEN_PORT=<port>` once bound.
 
-import { WebSocketServer } from 'ws';
+import { WebSocketServer } from '/opt/busbar-conformance/ws/node_modules/ws/wrapper.mjs';
 
 const wss = new WebSocketServer({ port: 0, host: '127.0.0.1' });
 wss.on('listening', () => {

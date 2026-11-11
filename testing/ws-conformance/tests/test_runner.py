@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (C) 2026 Busbar Inc and contributors
 
-"""Run the real driver with controlled compiler/Docker/peer processes; no product grade is forged."""
+"""Run the real driver with controlled compiler/instrument/peer processes; no product grade is forged."""
 
 import json
 import os
@@ -42,20 +42,23 @@ if len(sys.argv) > 1 and sys.argv[1].endswith('broken-echo-server.mjs'):
         signal.pause()
 os.execv(os.environ['REAL_NODE'], [os.environ['REAL_NODE'], *sys.argv[1:]])
 """)
-        self.executable("docker", """
+        self.executable("instrument", """
 import json, os, sys, time
 from pathlib import Path
-Path(os.environ['DOCKER_ARGUMENTS']).write_text(json.dumps(sys.argv[1:]))
-if os.environ.get('BLOCK_DOCKER'):
-    Path(os.environ['DOCKER_STARTED']).touch()
-    while not Path(os.environ['DOCKER_RELEASE']).exists():
+Path(os.environ['INSTRUMENT_ARGUMENTS']).write_text(json.dumps(sys.argv[1:]))
+if os.environ.get('BLOCK_INSTRUMENT'):
+    Path(os.environ['INSTRUMENT_STARTED']).touch()
+    while not Path(os.environ['INSTRUMENT_RELEASE']).exists():
         time.sleep(0.01)
-for index, arg in enumerate(sys.argv):
-    if arg == '-v' and sys.argv[index + 1].endswith(':/reports'):
-        output = Path(sys.argv[index + 1][:-len(':/reports')])
-        output.mkdir(parents=True, exist_ok=True)
-        (output / 'index.json').write_text(os.environ['CONTROL_REPORT'])
+config = json.loads(Path(sys.argv[sys.argv.index('-s') + 1]).read_text())
+output = Path(config['outdir'])
+output.mkdir(parents=True, exist_ok=True)
+(output / 'index.json').write_text(os.environ['CONTROL_REPORT'])
 """)
+        # Relocate only the copied test driver; production uses a fixed controller mount.
+        driver = self.harness / "scripts/run.sh"
+        driver.write_text(driver.read_text().replace(
+            "/opt/busbar-conformance/ws/bin/wstest", str(self.bin / "instrument")))
         target = self.root / "target"
         (target / "debug").mkdir(parents=True)
         subject = target / "debug/ws-conformance-subject"
@@ -68,9 +71,9 @@ for index, arg in enumerate(sys.argv):
             PATH=str(self.bin) + os.pathsep + os.environ["PATH"],
             REAL_NODE=self.real_node,
             PEER_PID=str(self.root / "peer.pid"),
-            DOCKER_ARGUMENTS=str(self.root / "docker.arguments.json"),
-            DOCKER_STARTED=str(self.root / "docker.started"),
-            DOCKER_RELEASE=str(self.root / "docker.release"),
+            INSTRUMENT_ARGUMENTS=str(self.root / "instrument.arguments.json"),
+            INSTRUMENT_STARTED=str(self.root / "instrument.started"),
+            INSTRUMENT_RELEASE=str(self.root / "instrument.release"),
             CONTROL_REPORT=json.dumps({"broken": {"1.1.2": {"behavior": "FAILED"}}}),
             WS_SUBJECT_MANIFEST=str(manifest),
             CARGO_TARGET_DIR=str(target),
@@ -128,19 +131,19 @@ for index, arg in enumerate(sys.argv):
         result = self.run_driver("--negative-control")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
-    def test_autobahn_runs_as_the_host_report_owner(self):
+    def test_autobahn_uses_native_fuzzingclient_without_container_arguments(self):
         result = self.run_driver("--negative-control")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        arguments = json.loads((self.root / "docker.arguments.json").read_text())
-        self.assertIn("--user", arguments, "Docker must not leave root-owned reports in the checkout")
-        self.assertEqual(arguments[arguments.index("--user") + 1], f"{os.getuid()}:{os.getgid()}")
+        arguments = json.loads((self.root / "instrument.arguments.json").read_text())
+        self.assertEqual(arguments[:3], ["-m", "fuzzingclient", "-s"])
+        self.assertEqual(len(arguments), 4)
 
     def owned_peer_is_running(self, pid):
         result = subprocess.run(["ps", "-p", str(pid), "-o", "command="], capture_output=True, text=True, check=False)
         return result.returncode == 0 and str(self.bin / "node") in result.stdout
 
     def test_term_reaps_the_started_peer_and_preserves_the_signal_exit(self):
-        self.environment["BLOCK_DOCKER"] = "1"
+        self.environment["BLOCK_INSTRUMENT"] = "1"
         log = self.root / "driver.log"
         with log.open("w", encoding="utf-8") as output:
             driver = subprocess.Popen(
@@ -150,18 +153,18 @@ for index, arg in enumerate(sys.argv):
         peer = None
         try:
             deadline = time.monotonic() + 10
-            while not (self.root / "docker.started").exists():
+            while not (self.root / "instrument.started").exists():
                 self.assertIsNone(driver.poll(), log.read_text(encoding="utf-8"))
-                self.assertLess(time.monotonic(), deadline, "controlled Docker did not start")
+                self.assertLess(time.monotonic(), deadline, "controlled instrument did not start")
                 time.sleep(0.01)
             peer = int((self.root / "peer.pid").read_text(encoding="utf-8"))
             self.assertTrue(self.owned_peer_is_running(peer))
             driver.terminate()
-            (self.root / "docker.release").touch()
+            (self.root / "instrument.release").touch()
             self.assertEqual(driver.wait(timeout=10), 143, log.read_text(encoding="utf-8"))
             self.assertFalse(self.owned_peer_is_running(peer), "TERM must reap the driver's own peer")
         finally:
-            (self.root / "docker.release").touch()
+            (self.root / "instrument.release").touch()
             if driver.poll() is None:
                 driver.kill()
             driver.wait(timeout=10)

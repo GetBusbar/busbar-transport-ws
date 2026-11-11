@@ -6,19 +6,19 @@
 # connector's own listener (the ws-conformance-subject), following the same control-always + subject-armed-or-red shape as
 # the other protocol suites.
 #
-# DOCKER-LIVE IS CI-ONLY. `--selftest` checks synthetic parser fixtures and builds the subject;
-# it needs Node, Cargo and BUSBAR_CHECKOUT, but no Docker.
+# LIVE PROTOCOL EVALUATION IS CI-ONLY. `--selftest` checks synthetic parser fixtures and builds the subject;
+# it needs Node, Cargo and BUSBAR_CHECKOUT.
 # `--control` / `--negative-control` / `--subject` run the real
-# `crossbario/autobahn-testsuite` `fuzzingclient` image and require Docker; they are what CI runs.
+# digest-pinned Autobahn `fuzzingclient` from the controller-staged offline bundle.
 #
 # MODES
-#   --selftest            check parser fixtures and build the subject (no Docker)
+#   --selftest            check parser fixtures and build the subject (no live protocol evaluation)
 #   --subject-arm          build the ws-conformance-subject bin and report whether it is ARMED
 #   --control               run Autobahn against the known peer: ws-conformance-reference, a strict
 #                           RFC 6455 echo server on the Rust standard library alone, independent of
-#                           busbar's framer (Docker)
-#   --negative-control      run Autobahn against the deliberately broken echo server (Docker); MUST be RED
-#   --subject                run Autobahn against the busbar ws-conformance-subject (Docker); ARMED OR RED
+#                           busbar's framer (native candidate namespace)
+#   --negative-control      run Autobahn against the deliberately broken echo server (native candidate namespace); MUST be RED
+#   --subject                run Autobahn against the busbar ws-conformance-subject (native candidate namespace); ARMED OR RED
 #
 # SCOPE: busbar's ws transport does not negotiate RFC 7692 permessage-deflate, so Autobahn scores
 # every case in groups 12/13 (its permessage-deflate module) `UNIMPLEMENTED` against a peer that
@@ -137,32 +137,31 @@ run_autobahn() {
   mkdir -p "$outdir"
   # The per-tag dir is reused across runs: a stale index.json must never be graded as this run's.
   rm -f "$outdir/index.json"
-  if ! command -v docker >/dev/null 2>&1; then
-    echo "Docker is unavailable in this environment. Docker-live Autobahn runs are CI-only;" >&2
-    echo "this local environment can only prove the parser and the subject's arm state (see --selftest)." >&2
+  local instrument=/opt/busbar-conformance/ws/bin/wstest
+  if [ ! -x "$instrument" ]; then
+    echo "Pinned offline Autobahn instrument is unavailable" >&2
     return 3
   fi
   cfg="$(mktemp)"
-  sed -e "s/__AGENT__/$agent/" -e "s/__PORT__/$port/" \
-    "$ROOT/config/fuzzingclient.json.tmpl" > "$cfg"
-  local docker_rc=0
-  # Bind-mounted reports must stay owned by the runner, including on failed runs, so the
-  # next checkout can clean them without privileged teardown.
-  docker run --rm --network host --user "$(id -u):$(id -g)" \
-    -v "$cfg:/config/fuzzingclient.json:ro" \
-    -v "$outdir:/reports" \
-    crossbario/autobahn-testsuite@sha256:519915fb568b04c9383f70a1c405ae3ff44ab9e35835b085239c258b6fac3074 \
-    wstest -m fuzzingclient -s /config/fuzzingclient.json || docker_rc=$?
+  python3 -I - "$ROOT/config/fuzzingclient.json.tmpl" "$cfg" "$agent" "$port" "$outdir" <<'PYCONFIG'
+import json, sys
+source, target, agent, port, reports = sys.argv[1:]
+config = json.loads(open(source).read().replace("__AGENT__", agent).replace("__PORT__", port))
+config["outdir"] = reports
+with open(target, "w") as stream:
+    json.dump(config, stream)
+PYCONFIG
+  local instrument_rc=0
+  "$instrument" -m fuzzingclient -s "$cfg" || instrument_rc=$?
   rm -f "$cfg"
-  # docker's own status, not rm's: a failed run must not read as a clean one.
-  return "$docker_rc"
+  return "$instrument_rc"
 }
 
 case "$mode" in
   --selftest) selftest ;;
   --subject-arm) subject_arm ;;
   --control)
-    echo "$mode: Docker-live mode; runs in CI (crossbario/autobahn-testsuite vs the ws-conformance-reference echo peer)." >&2
+    echo "$mode: Offline native mode (pinned Autobahn|Testsuite vs the ws-conformance-reference echo peer)." >&2
     # THE KNOWN PEER: ws-conformance-reference (subject/src/reference.rs), a strict RFC 6455 echo
     # server on the standard library alone: no busbar crate and no WebSocket library, so it shares
     # nothing with the framer the subject leg grades. Release, as the subject is built.
@@ -179,7 +178,7 @@ case "$mode" in
     node "$PARSER" --report "$REPORTS_DIR/control/index.json" --armed true --commit "${GITHUB_SHA:-$(git -C "$REPO_ROOT" rev-parse HEAD 2>/dev/null || echo local)}" --out "$REPORTS_DIR/control/verdict.json"
     ;;
   --negative-control)
-    echo "$mode: Docker-live mode; runs in CI (crossbario/autobahn-testsuite vs the deliberately broken peer)." >&2
+    echo "$mode: Offline native mode (pinned Autobahn|Testsuite vs the deliberately broken peer)." >&2
     log="$(mktemp)"; node "$ROOT/broken/broken-echo-server.mjs" >"$log" 2>&1 & pid=$!
     port=""
     for _ in $(seq 1 50); do port="$(sed -n 's/^BROKEN_PORT=//p' "$log")"; [ -n "$port" ] && break; sleep 0.1; done
@@ -187,7 +186,7 @@ case "$mode" in
     rc=0; run_autobahn broken "$port" negative-control || rc=$?
     stop_peer
     [ "$rc" -eq 3 ] && exit 3
-    [ "$rc" -eq 0 ] || { echo "RED: docker exited $rc -- the negative control did not run" >&2; exit "$rc"; }
+    [ "$rc" -eq 0 ] || { echo "RED: Autobahn exited $rc -- the negative control did not run" >&2; exit "$rc"; }
     # This leg is proven correct when the SUITE catches the defect -- i.e. the parser must find
     # it RED over a report it could read. Autobahn exits 0 having produced a report; the defect
     # shows up IN the report. An absent report is the parser's UNREADABLE_REPORT (also red), which
@@ -216,7 +215,7 @@ case "$mode" in
     echo "ok: the negative control was correctly graded red"
     ;;
   --subject)
-    echo "$mode: Docker-live mode; runs in CI (crossbario/autobahn-testsuite vs busbar's ws-conformance-subject)." >&2
+    echo "$mode: Offline native mode (pinned Autobahn|Testsuite vs busbar's ws-conformance-subject)." >&2
     # RELEASE, as busbar ships: the door runs under the dispatcher's watchdog (1 s per crossing), and
     # an unoptimised framer unmasking Autobahn's 16 MiB messages (case 9.1.6) overruns it, which
     # faults the door for every later connection — a statement about a debug build nobody ships.
@@ -237,7 +236,7 @@ case "$mode" in
     # Every path out: a subject that started but never printed its port is killed too.
     stop_peer
     [ "$rc" -eq 3 ] && exit 3
-    [ "$rc" -eq 0 ] || { echo "RED: docker exited $rc -- the subject run did not complete" >&2; exit "$rc"; }
+    [ "$rc" -eq 0 ] || { echo "RED: Autobahn exited $rc -- the subject run did not complete" >&2; exit "$rc"; }
     mkdir -p "$REPORTS_DIR/subject"
     node "$PARSER" --report "$REPORTS_DIR/subject/index.json" --armed "$armed" --commit "${GITHUB_SHA:-$(git -C "$REPO_ROOT" rev-parse HEAD 2>/dev/null || echo local)}" --out "$REPORTS_DIR/subject/verdict.json"
     exit $?

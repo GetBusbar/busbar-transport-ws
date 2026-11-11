@@ -94,7 +94,7 @@ export function buildVerdict({ status, armed, commit, runId, evidence, generated
     suite: 'ws',
     standard: 'RFC 6455 WebSocket Protocol (Autobahn|Testsuite)',
     plan: 'Autobahn|Testsuite fuzzingclient, full default case set',
-    spec_version: 'autobahn-testsuite 0.8.2',
+    spec_version: 'autobahn-testsuite 25.10.1',
     status,
     armed,
     commit: commit ?? null,
