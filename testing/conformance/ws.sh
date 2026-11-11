@@ -27,7 +27,10 @@ tools_rc=0
 [ -x /opt/busbar-conformance/ws/bin/wstest ] && \
   [ -f /opt/busbar-conformance/ws/node_modules/ws/wrapper.mjs ] || tools_rc=1
 
-rm -rf "$H/reports"
+# The checkout is read-only in native qualification. Keep raw reports beside the
+# suite verdict in the controller-assigned writable output directory.
+export WS_REPORTS_DIR="$CONFORMANCE_OUT/reports"
+rm -rf "$WS_REPORTS_DIR"
 c_rc=0; n_rc=0; s_rc=0
 say "=== leg 1: control"; bash "$RUN" --control >&2 || c_rc=$?
 say "=== leg 2: negative control"
@@ -36,7 +39,7 @@ say "=== leg 3: subject"
 if [ -z "$WS_SUBJECT_MANIFEST" ]; then s_rc=1; else bash "$RUN" --subject >&2 || s_rc=$?; fi
 say "legs: control=$c_rc negative-control=$n_rc subject=$s_rc"
 
-python3 -I - "$c_rc" "$n_rc" "$s_rc" "$H/reports" "$CONFORMANCE_OUT/verdict.json" "$tools_rc" <<'PY'
+python3 -I - "$c_rc" "$n_rc" "$s_rc" "$WS_REPORTS_DIR" "$CONFORMANCE_OUT/verdict.json" "$tools_rc" <<'PY'
 import json, sys, os
 c, n, s, reports, out = int(sys.argv[1]), int(sys.argv[2]), int(sys.argv[3]), sys.argv[4], sys.argv[5]
 tools = int(sys.argv[6])

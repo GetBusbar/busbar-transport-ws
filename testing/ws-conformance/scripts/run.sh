@@ -33,7 +33,9 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 REPO_ROOT="$(cd "$ROOT/../.." && pwd)"
 PARSER="$ROOT/bin/parse-autobahn-report.mjs"
 FIXTURES="$ROOT/fixtures"
-REPORTS_DIR="$ROOT/reports"
+# The required-extra entry runs this driver directly, before CONFORMANCE_OUT is
+# assigned. Native qualification supplies a writable task-local TMPDIR there.
+REPORTS_DIR="${WS_REPORTS_DIR:-${CONFORMANCE_OUT:-${TMPDIR:-/tmp}/ws-conformance}/reports}"
 
 mode="${1:---selftest}"
 pid=""; log=""; cfg=""; subject_dir=""; scratch_dir=""
@@ -134,9 +136,11 @@ run_autobahn() {
   # $1: agent name; $2: the port the server-under-test listens on; $3: output tag
   local agent="$1" port="$2" tag="$3"
   local outdir="$REPORTS_DIR/$tag"
-  mkdir -p "$outdir"
+  # This function is called in an `||` list, where Bash disables errexit. Refuse
+  # an unwritable report destination before Autobahn enters its reactor.
+  mkdir -p "$outdir" || return 1
   # The per-tag dir is reused across runs: a stale index.json must never be graded as this run's.
-  rm -f "$outdir/index.json"
+  rm -f "$outdir/index.json" || return 1
   local instrument=/opt/busbar-conformance/ws/bin/wstest
   if [ ! -x "$instrument" ]; then
     echo "Pinned offline Autobahn instrument is unavailable" >&2
