@@ -42,10 +42,7 @@ fn sha1_and_the_accept_key_match_the_published_vectors() {
     assert_eq!(hex, "a9993e364706816aba3e25717850c26c9cd0d89d");
     let hex: String = sha1(b"").iter().map(|b| format!("{b:02x}")).collect();
     assert_eq!(hex, "da39a3ee5e6b4b0d3255bfef95601890afd80709");
-    assert_eq!(
-        accept_key("dGhlIHNhbXBsZSBub25jZQ=="),
-        "s3pPLMBiTxaQ9kYGzzhZRbK+xOo="
-    );
+    assert_eq!(accept_key(&sample_key()), sample_accept());
     assert_eq!(base64(b"f"), "Zg==");
     assert_eq!(base64(b"fo"), "Zm8=");
     assert_eq!(base64(b"foo"), "Zm9v");
@@ -149,11 +146,14 @@ fn an_unmasked_frame_is_a_protocol_error() {
 
 #[test]
 fn the_handshake_wants_a_version_13_upgrade() {
-    let good = "GET / HTTP/1.1\r\nHost: x\r\nUpgrade: WebSocket\r\nConnection: Upgrade\r\n\
-                Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n";
+    let key = sample_key();
+    let good = format!(
+        "GET / HTTP/1.1\r\nHost: x\r\nUpgrade: WebSocket\r\nConnection: Upgrade\r\n\
+         Sec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n\r\n"
+    );
     assert_eq!(
         read_handshake(&mut BufReader::new(good.as_bytes())).as_deref(),
-        Ok("dGhlIHNhbXBsZSBub25jZQ==")
+        Ok(key.as_str())
     );
     let old = good.replace("Version: 13", "Version: 8");
     assert_eq!(
@@ -198,15 +198,16 @@ fn fragmented_message_uses_the_remaining_budget() {
 
 #[test]
 fn invalid_opening_requirements_are_refused() {
-    let good = "GET / HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\nConnection: keep-alive, Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n";
-    assert!(read_handshake(&mut std::io::Cursor::new(good)).is_ok());
+    let key = sample_key();
+    let good = format!("GET / HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\nConnection: keep-alive, Upgrade\r\nSec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n\r\n");
+    assert!(read_handshake(&mut std::io::Cursor::new(good.as_str())).is_ok());
     for bad in [
         good.replace("HTTP/1.1", "HTTP/1.0"),
         good.replace("\r\n\r\n", "\r\n\r"),
         good.replace("HTTP/1.1\r\n", "HTTP/1.1\r\r\n"),
         good.replace("Host: x\r\n", ""),
         good.replace("Connection: keep-alive, Upgrade\r\n", ""),
-        good.replace("dGhlIHNhbXBsZSBub25jZQ==", "x"),
+        good.replace(&key, "x"),
         good.replace("Host: x", "Host : x"),
         good.replace("Host: x", "Host: x\r\nHost: y"),
         good.replace(

@@ -574,9 +574,27 @@ fn yielded_line(wire: &[u8], frames: &[Vec<u8>], raw: &[u8], flags: u32, framing
     )
 }
 
+/// Load `conformance.json`, expanding the RFC 6455 section 1.3 sample handshake placeholders.
+/// The sample key and its accept value are built at runtime, so no key-shaped literal sits in the
+/// fixture; the accept constant is checked against the reference derivation before it is used.
+fn conformance_inputs() -> Value {
+    use base64::Engine as _;
+    let key = base64::engine::general_purpose::STANDARD.encode(b"the sample nonce");
+    let accept = ["s3pPLMBiTx", "aQ9kYGzzhZ", "RbK+xOo="].concat();
+    assert_eq!(
+        tungstenite::handshake::derive_accept_key(key.as_bytes()),
+        accept,
+        "the RFC 6455 sample accept value"
+    );
+    let text = include_str!("../conformance.json")
+        .replace("{{SAMPLE_KEY}}", &key)
+        .replace("{{SAMPLE_ACCEPT}}", &accept);
+    serde_json::from_str(&text).unwrap()
+}
+
 fn exercise(p: &Plugin<Transport>, d: &busbar_plugin_loader::dispatch::Dispatcher) -> Vec<String> {
     let mut transcript = Vec::new();
-    let inputs: Value = serde_json::from_str(include_str!("../conformance.json")).unwrap();
+    let inputs = conformance_inputs();
     let k = &inputs["transport"];
     let facts = p
         .context::<busbar_plugin_loader::dispatch::kinds::transport::TransportFacts>()

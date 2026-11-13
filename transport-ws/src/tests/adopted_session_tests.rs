@@ -9,6 +9,11 @@ use busbar_contract::abi::transport::adopted_session::{
     AdoptedSession, EXT_ADOPTED_SESSION, SUPPORT_ADOPTED_SESSION,
 };
 
+/// A fresh, valid handshake nonce for each request a test builds.
+fn nonce() -> String {
+    tungstenite::handshake::client::generate_key()
+}
+
 fn context(stream: u64) -> AdoptedSession {
     AdoptedSession {
         stream,
@@ -292,7 +297,7 @@ fn accepted_connection_lists_are_combined_without_changing_original_request_byte
         "cOnNeCtIoN: keep-alive, X-Hop\r\nconnection: uPgRaDe\r\n",
         "Connection: keep-alive, Upgrade\r\n",
     ] {
-        let request = format!("GET /echo HTTP/1.1\r\nHost: svc.test\r\nUpgrade: websocket\r\n{connection}Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\nX-Hop: untouched\r\nAuthorization: Bearer original\r\n\r\n").into_bytes();
+        let request = format!("GET /echo HTTP/1.1\r\nHost: svc.test\r\nUpgrade: websocket\r\n{connection}Sec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\nX-Hop: untouched\r\nAuthorization: Bearer original\r\n\r\n", key = nonce()).into_bytes();
         for adopted in [false, true] {
             for split in 0..=request.len() {
                 let p = instance();
@@ -336,7 +341,7 @@ fn combining_accepted_connection_fields_keeps_every_other_validation_and_early_d
     };
     let connection = "Connection: keep-alive\r\nConnection: Upgrade\r\n";
     let upgrade = "Upgrade: websocket\r\n";
-    let key = "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n";
+    let key = &format!("Sec-WebSocket-Key: {}\r\n", nonce());
     let version = "Sec-WebSocket-Version: 13\r\n";
     let mut early = request(connection, upgrade, key, version);
     early.extend_from_slice(&masked(b"too-early"));
@@ -387,7 +392,7 @@ fn combining_accepted_connection_fields_keeps_every_other_validation_and_early_d
 
 #[test]
 fn connection_normalization_preserves_unread_frames_at_the_original_request_read_boundary() {
-    let mut request = b"GET /echo HTTP/1.1\r\nHost: svc.test\r\nUpgrade: websocket\r\nConnection: keep-alive\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\nX-Pad: ".to_vec();
+    let mut request = format!("GET /echo HTTP/1.1\r\nHost: svc.test\r\nUpgrade: websocket\r\nConnection: keep-alive\r\nConnection: Upgrade\r\nSec-WebSocket-Key: {}\r\nSec-WebSocket-Version: 13\r\nX-Pad: ", nonce()).into_bytes();
     request.resize(4096 - 4, b'p');
     request.extend_from_slice(b"\r\n\r\n");
     let payload = b"\xaa\xbb\x81\x82\x00\x00\x00\x00\xff\xff";

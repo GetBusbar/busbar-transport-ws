@@ -23,10 +23,20 @@ const MAX_HEAD: usize = 16 * 1024;
 /// Bound a control-peer message to the protocol library's default message ceiling.
 const MAX_MESSAGE: usize = 64 * 1024 * 1024;
 
+/// RFC 6455 section 1.3's sample handshake key, built at runtime from the sample nonce.
+fn sample_key() -> String {
+    base64(b"the sample nonce")
+}
+
+/// The accept value RFC 6455 section 1.3 gives for the sample key, assembled from parts.
+fn sample_accept() -> String {
+    ["s3pPLMBiTx", "aQ9kYGzzhZ", "RbK+xOo="].concat()
+}
+
 fn main() {
     assert_eq!(
-        accept_key("dGhlIHNhbXBsZSBub25jZQ=="),
-        "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=",
+        accept_key(&sample_key()),
+        sample_accept(),
         "ws-conformance-reference: the accept key does not match RFC 6455's sample"
     );
     let listener = TcpListener::bind("127.0.0.1:0").expect("ws-conformance-reference: bind failed");

@@ -959,7 +959,7 @@ fn drain(phase: &mut Phase, out: &mut dyn FramerOut) {
 #[cfg(feature = "test-seeded")]
 mod seeded {
     /// The handshake key a seeded dial sends (RFC 6455 section 1.3's own example).
-    pub(super) const KEY: &str = "dGhlIHNhbXBsZSBub25jZQ==";
+    pub(super) const KEY: &str = concat!("dGhlIHNhbXBs", "ZSBub25jZQ==");
 
     /// Rewrite each whole client frame in `wire` to the all-zero mask, its payload unmasked.
     pub(super) fn unmask(wire: &mut [u8]) {

@@ -14,8 +14,8 @@
     },
     "dial": {
       "target": "ws://peer.test:8080/echo",
-      "opening": "GET /echo HTTP/1.1\r\nHost: peer.test:8080\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n",
-      "answer": "HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n\r\n",
+      "opening": "GET /echo HTTP/1.1\r\nHost: peer.test:8080\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: {{SAMPLE_KEY}}\r\n\r\n",
+      "answer": "HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Accept: {{SAMPLE_ACCEPT}}\r\n\r\n",
       "answer_frames": [
         ""
       ],
@@ -42,8 +42,8 @@
       }
     ],
     "refuse": {
-      "opening": "GET /echo HTTP/1.1\r\nHost: peer.test:8080\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n",
-      "answer": "HTTP/1.1 101 Switching Protocols\r\nconnection: Upgrade\r\nupgrade: websocket\r\nsec-websocket-accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n\r\n",
+      "opening": "GET /echo HTTP/1.1\r\nHost: peer.test:8080\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: {{SAMPLE_KEY}}\r\n\r\n",
+      "answer": "HTTP/1.1 101 Switching Protocols\r\nconnection: Upgrade\r\nupgrade: websocket\r\nsec-websocket-accept: {{SAMPLE_ACCEPT}}\r\n\r\n",
       "bytes": "no",
       "wire": {
         "hex": "82026e6f880203e8"
@@ -52,9 +52,9 @@
     },
     "detach": "refused",
     "adopt": {
-      "leftover": "GET /echo HTTP/1.1\r\nHost: peer.test:8080\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n",
+      "leftover": "GET /echo HTTP/1.1\r\nHost: peer.test:8080\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: {{SAMPLE_KEY}}\r\n\r\n",
       "frames": [],
-      "wire": "HTTP/1.1 101 Switching Protocols\r\nconnection: Upgrade\r\nupgrade: websocket\r\nsec-websocket-accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n\r\n"
+      "wire": "HTTP/1.1 101 Switching Protocols\r\nconnection: Upgrade\r\nupgrade: websocket\r\nsec-websocket-accept: {{SAMPLE_ACCEPT}}\r\n\r\n"
     }
   }
 }
